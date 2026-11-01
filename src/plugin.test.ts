@@ -76,6 +76,15 @@ describe("plugin wiring", () => {
     }
   });
 
+  it("F9: the manifest requires secret_ref object bindings, never bare strings", async () => {
+    const props = manifest.instanceConfigSchema?.properties as Record<string, any>;
+    for (const key of ["tokenSecretRef", "appPrivateKeySecretRef"]) {
+      expect(props[key].type).toBe("object");
+      expect(props[key].required).toEqual(expect.arrayContaining(["type", "secretId"]));
+      expect(props[key].properties.type).toEqual({ enum: ["secret_ref"] });
+    }
+  });
+
   it("runs the release scan through the registered job and records per-run stats", async () => {
     const harness = await setup({ tokenSecretRef: TOKEN_REF, releaseRepos: ["router-for-me/CLIProxyAPI"] });
     // Seed a prior baseline so the first run sees a *new* tag and creates the card.
