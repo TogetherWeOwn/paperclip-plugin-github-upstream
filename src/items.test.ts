@@ -1221,6 +1221,65 @@ describe("item hardening", () => {
     expect(wakes).toHaveLength(0);
   });
 
+  it("a legacy record with a dismissal on record wakes even when our own comment shares the upgrade tick", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#921`);
+    // Stored shape from before latestReviewState existed: a seven-element
+    // fingerprint and a snapshot with neither the review nor awaiting key.
+    // The upstream review (id 9) has since been dismissed in place.
+    const legacySnapshot = {
+      owner: OWNER,
+      repo: REPO,
+      kind: "pull",
+      number: 921,
+      url: `https://github.com/${OWNER}/${REPO}/pull/921`,
+      title: "pr 921",
+      state: "open",
+      updatedAt: "2026-10-12T00:00:00Z",
+      commentCount: 1,
+      authorLogin: "stranger",
+      headLabel: "TogetherWeOwn:fix-x",
+      reviewCount: 1,
+      checkConclusion: "success",
+      headSha: HEAD_SHA,
+      draft: false,
+    };
+    const legacyFp = JSON.stringify(["open", "2026-10-12T00:00:00Z", 1, 1, "success", HEAD_SHA, false]);
+    await harness.ctx.state.set(stateKey(COMPANY, "items") as never, {
+      [`${OWNER}/${REPO}#921`]: {
+        etags: { issue: '"i921a"', pull: '"p921a"', reviews: '"r921a"', checkRuns: '"c921a"' },
+        resolvedKind: "pull",
+        fingerprint: legacyFp,
+        wokenFingerprint: legacyFp,
+        snapshot: legacySnapshot,
+        cardId: null,
+        checkedAt: "2026-10-12T00:00:00Z",
+      },
+    } as never);
+    // The review is dismissed in place (same id, same count, ruling cleared)
+    // while our comment lands: attribution sees only our actor, but the
+    // dismissal on record means a same-count ruling change could be hiding
+    // behind it, so the card must wake rather than swallow the dismissal.
+    const table: RouteTable = {
+      rest: {
+        ...pullTable(921, "921b"),
+        [issueUrl(921)]: { etag: '"i921b"', body: pullIssueRow(921, { comments: 2, updated_at: "2026-10-13T00:00:00Z" }) },
+        [reviewsUrl(921)]: { etag: '"r921b"', body: [{ id: 9, state: "DISMISSED", user: { login: "maintainer" } }] },
+        [commentsUrl(921)]: { etag: '"m921"', body: [{ id: 1, user: { login: "Rick7C2" } }] },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const config = { operatorLogin: "Rick7C2" };
+
+    const out = await scan(harness, trackerId, stub, config);
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "woke" });
+    expect(out.stats.wakes).toBe(1);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
   it("F6: created cards keep a deterministic title and a sanitized untrusted quote", async () => {
     const evilTitle = `[Evil](http://evil.example) <script>alert(1)</script> ` + "y".repeat(150);
     const table: RouteTable = {

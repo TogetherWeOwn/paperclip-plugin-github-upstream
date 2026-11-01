@@ -478,6 +478,12 @@ async function syncOneItem(
       // `undefined` would read as a ruling change and wake for our own comment
       // or push on the upgrade tick. prevForCompare backfills the field so
       // own-action attribution runs against the true ruling.
+      //
+      // The backfill masks a real concurrent ruling change: a dismissal edits a
+      // review in place (same count), so when the fetched reviews show a
+      // dismissal — or no fresh reviews page was seen and we cannot tell — a
+      // legacy record's unknown prior ruling must decline suppression and wake.
+      const legacyRulingCouldHaveChanged = legacyNoReviewState && fetched.reviewsHaveDismissal !== false;
       const own = await checkOwnAction({
         fetchImpl,
         token,
@@ -486,6 +492,7 @@ async function syncOneItem(
         resolvedKind: fetched.resolvedKind,
         previous: prevForCompare,
         next: snapshot,
+        legacyRulingCouldHaveChanged,
         stats,
         onRateLimited: async (untilMs) => {
           await setBackoff(ctx, companyId, untilMs);
@@ -594,11 +601,13 @@ async function checkOwnAction(params: {
   resolvedKind: "issue" | "pull" | "discussion";
   previous: ItemSnapshot;
   next: ItemSnapshot;
+  /** A legacy record's unknown prior ruling could hide a same-count change. */
+  legacyRulingCouldHaveChanged: boolean;
   stats: RunStats;
   onRateLimited: (untilMs: number) => Promise<void>;
   nowMs: number;
 }): Promise<{ suppressed: boolean; detail: string }> {
-  const { fetchImpl, token, item, config, resolvedKind, previous, next, stats, onRateLimited, nowMs } = params;
+  const { fetchImpl, token, item, config, resolvedKind, previous, next, legacyRulingCouldHaveChanged, stats, onRateLimited, nowMs } = params;
   const wake = (detail: string) => ({ suppressed: false as const, detail });
 
   if (previous.state !== next.state) return wake("state changed, always wakes");
@@ -612,6 +621,12 @@ async function checkOwnAction(params: {
   }
   if (previous.draft !== next.draft) return wake("draft changed, always wakes");
   if (previous.reviewCount !== next.reviewCount) return wake("reviews changed, always wakes");
+  // A legacy record's prior ruling is unknown and the renormalized baseline
+  // masks it with the fetched one. When the fetched reviews show a dismissal
+  // (or no fresh reviews page was seen), a same-count ruling change could be
+  // hiding behind our own comment or push in the same window, so decline
+  // suppression: an unattributable dismissal must wake.
+  if (legacyRulingCouldHaveChanged) return wake("prior review ruling unknown and a dismissal may be on record, always wakes");
   // A ruling can move without a new review (a dismissal edits the review in
   // place, keeping the count). That change has no actor endpoint to attribute,
   // so it always wakes — even when our own comment or push shares the window.
@@ -672,8 +687,16 @@ async function checkOwnAction(params: {
   return { suppressed: true, detail: `own action by @${logins.join(", @")}, no wake (labels/header synced)` };
 }
 
-/** A fetch that hit the rate limit (caller stops the run). */
-type FetchResult = { snapshot: ItemSnapshot; resolvedKind: "issue" | "pull" | "discussion" } | "rate-limited";
+/**
+ * A fetch that hit the rate limit (caller stops the run). `reviewsHaveDismissal`
+ * is true when a fresh reviews page showed a DISMISSED review, false when a
+ * fresh page showed none, and null when no fresh reviews page was seen (304 or
+ * failed fetch) so the caller cannot tell. Only pull snapshots carry a real
+ * value; issue and discussion snapshots report false.
+ */
+type FetchResult =
+  | { snapshot: ItemSnapshot; resolvedKind: "issue" | "pull" | "discussion"; reviewsHaveDismissal: boolean | null }
+  | "rate-limited";
 
 /** Fetch one item's snapshot, reusing stored ETags. Mutates `etags` in place. */
 async function fetchSnapshot(
@@ -691,7 +714,7 @@ async function fetchSnapshot(
   if (kind === "discussion") {
     const snapshot = await fetchDiscussion(fetchImpl, token, item, stats, onRateLimited, nowMs);
     if (!snapshot) return "rate-limited";
-    return { snapshot, resolvedKind: "discussion" };
+    return { snapshot, resolvedKind: "discussion", reviewsHaveDismissal: false };
   }
 
   const issueUrl = `${GITHUB_API_BASE}/repos/${item.owner}/${item.repo}/issues/${item.number}`;
@@ -725,7 +748,7 @@ async function fetchSnapshot(
       draft: false,
       awaiting: null,
     };
-    return { snapshot, resolvedKind: "issue" };
+    return { snapshot, resolvedKind: "issue", reviewsHaveDismissal: false };
   }
 
   // PR path: the issue row carries comments/title, pulls/* carries the rest.
@@ -749,14 +772,14 @@ async function fetchSnapshot(
     draft: previous.snapshot?.draft ?? false,
     awaiting: previous.snapshot?.awaiting ?? null,
   };
-  const snapshot = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs, forceReviews);
-  if (!snapshot) return "rate-limited";
-  if (snapshot === "not-a-pull") {
+  const pullRest = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs, forceReviews);
+  if (!pullRest) return "rate-limited";
+  if (pullRest === "not-a-pull") {
     // The origin ID guessed PR but the item is an issue: self-correct permanently.
     const corrected: ItemSnapshot = { ...base, kind: "issue", reviewCount: 0, latestReviewState: null, checkConclusion: "none", headSha: null, draft: false, headLabel: null };
-    return { snapshot: corrected, resolvedKind: "issue" };
+    return { snapshot: corrected, resolvedKind: "issue", reviewsHaveDismissal: false };
   }
-  return { snapshot, resolvedKind: "pull" };
+  return { snapshot: pullRest.snapshot, resolvedKind: "pull", reviewsHaveDismissal: pullRest.reviewsHaveDismissal };
 }
 
 interface ConditionalData<T> {
@@ -809,7 +832,7 @@ async function fetchPullRest(
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
   forceReviews = false,
-): Promise<ItemSnapshot | "not-a-pull" | null> {
+): Promise<{ snapshot: ItemSnapshot; reviewsHaveDismissal: boolean | null } | "not-a-pull" | null> {
   const rest = `${GITHUB_API_BASE}/repos/${item.owner}/${item.repo}`;
   const pullRes = await conditionalGet<GitHubPull>(fetchImpl, token, `${rest}/pulls/${item.number}`, etags.pull ?? null, stats, onRateLimited, nowMs);
   if (!pullRes) return null;
@@ -838,11 +861,15 @@ async function fetchPullRest(
   // one ETag) instead of GitHub's 30-item default.
   const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews?per_page=100`, forceReviews ? null : (etags.reviews ?? null), stats, onRateLimited, nowMs);
   if (!reviewsRes) return null;
+  // Null until a fresh reviews page is seen: without one the caller cannot
+  // tell whether a dismissal is on record.
+  let reviewsHaveDismissal: boolean | null = null;
   if (!reviewsRes.notModified) {
     etags.reviews = reviewsRes.etag;
     if (Array.isArray(reviewsRes.data)) {
       base.reviewCount = reviewsRes.data.length;
       base.latestReviewState = latestDecisiveReview(reviewsRes.data);
+      reviewsHaveDismissal = reviewsRes.data.some((r) => (r.state ?? "").toUpperCase() === "DISMISSED");
     }
   }
   // Check runs: only while checks are pending (or the head moved, or never checked).
@@ -855,7 +882,7 @@ async function fetchPullRest(
       if (checksRes.status === 200) base.checkConclusion = aggregateChecks(checksRes.data);
     }
   }
-  return { ...base, headSha, headLabel, draft, state };
+  return { snapshot: { ...base, headSha, headLabel, draft, state }, reviewsHaveDismissal };
 }
 
 const DISCUSSION_QUERY = `
