@@ -2,12 +2,13 @@
 
 A [Paperclip](https://github.com/paperclipai/paperclip) plugin that notices upstream GitHub changes **deterministically, with zero LLM calls**, and only then creates or wakes a Paperclip card. It exists so follow-through work on upstream PRs/issues/discussions and release intake happens because the upstream changed, not because an agent went polling.
 
-Two scheduled jobs do all the noticing:
+Three scheduled jobs do all the noticing:
 
 | job | schedule | what it does |
 |---|---|---|
 | `release-scan` | `*/10 * * * *` | `GET /repos/{owner}/{repo}/releases/latest` with `If-None-Match` per configured repo. A `304` means do nothing; a new tag creates exactly one release-intake card (`originKind: plugin:togetherweown.github-upstream:release`, `originId: {owner}/{repo}@{tag}`). |
 | `item-scan` | `*/15 * * * *` | ETag-conditional `GET`s for every tracked upstream issue/PR (`issues/{n}`, plus `pulls/{n}`, `pulls/{n}/reviews` and `commits/{head}/check-runs` while checks are pending) and one GraphQL query per tracked discussion. On a real change the owning follow-through card is woken with a deterministic one-line reason and idempotency key `upstream:{owner}/{repo}#{n}:{fingerprint}`. |
+| `audit-scan` | `11 * * * *` | Hourly upstream-gate audit (see below): deterministic search for recent upstream posts by our account, flagging any post with no approved gate card. This is an audit trail, not a block. |
 
 A real change is one of: `updated_at`, comment count, review count, latest review state, check conclusion, head SHA, `state`/`merged`, draft flag. Labels (`gh:repo/*`, `gh:type/*`, `gh:state/*`, `gh:ci/*`, `gh:awaiting/*`) and a `<!-- github-upstream: … -->` description header are synced on change.
 
@@ -27,9 +28,19 @@ The plugin contributes a `github` page slot ("GitHub") that renders the SDK's na
 
 A `MetricCard` row sits above the list: open PRs, red CI, awaiting maintainer, awaiting us. The counts come from a worker-registered `getData` key (`github-upstream-summary`) computed over the tracked-item snapshots, so the tab needs no extra GitHub reads. Known, accepted gap: last activity and comment counts show in the card header, not as sortable columns — sort by the card's updated time instead.
 
+## Upstream-gate audit (`audit-scan`)
+
+The hourly `audit-scan` job is the audit trail for the upstream gate: it flags any upstream item, comment or review posted from our account that has no approved gate card. It cannot block a post; it makes an ungated post visible within one sync cycle.
+
+Detection, with no LLM: per configured org and watched login it searches `org:<o> is:issue author:<login>`, the `is:pull-request` twin, and the `commenter:` twins, all bounded by `updated:>=<last search>`; authored discussions come from one GraphQL `search(type: DISCUSSION)` per org and login, and `auditRepos` covers posts outside the configured orgs. Each candidate item's comments, PR review comments and reviews are then read (ETag-conditional per item) and filtered to watched logins newer than the per-item cursor. Posts before `2026-11-02T00:00Z` are never flagged: the TWO-809 audit cards (TWO-810…TWO-818) already cover them.
+
+A post counts as gated when a `done` card titled `Upstream gate …` sits under the item's follow-through card with approval (`completedAt`) at or before the post's `created_at`. An ungated post labels the follow-through card `upstream:ungated` (creating the card first when it is missing, so a comment on someone else's item still gets one) and opens one `Ungated upstream post: <owner>/<repo>#<n>` card for the Chief of Staff with the post URL, timestamp and author, woken with idempotency key `ungated:<post-url>`. Repeat runs cannot double-flag: per-item cursors plus the recorded flag keys dedupe.
+
+Known, accepted gaps: the plugin SDK exposes no execution-decision reads, so v1 checks `status == done` plus the parent link (using `completedAt` as the approval time) instead of verifying both review stages — see TWO-819 for the SDK gap note. Discussion comments on untracked threads have no search coverage (the discussion search has no `commenter:` qualifier), so only authored discussions and comments on tracked/candidate discussions are audited. Search reads the first page per query (updated-desc, 100 rows); an overflowing page is recorded as an error, not silently dropped.
+
 ## Rate limits
 
-Every REST read is ETag-conditional: unchanged answers are `304`s that cost no quota. Check-run reads stop once checks settle. The plugin honors `X-RateLimit-Remaining`/`Retry-After`, backs off into plugin state, and records per-run `200`/`304` counts so the operator can see the sync costs nearly nothing. It never calls the CLIProxy management API (the HTTP layer only allows `api.github.com`).
+Every REST read is ETag-conditional: unchanged answers are `304`s that cost no quota. Check-run reads stop once checks settle. Search has no `304` path, so the audit makes a bounded set of search calls per run (orgs × logins × 4, plus one GraphQL discussion search each) and ETag-conditional per-item reads after that. The plugin honors `X-RateLimit-Remaining`/`Retry-After`, backs off into plugin state, and records per-run `200`/`304` counts so the operator can see the sync costs nearly nothing. It never calls the CLIProxy management API (the HTTP layer only allows `api.github.com`).
 
 ## Configuration
 
@@ -47,8 +58,12 @@ Every REST read is ETag-conditional: unchanged answers are `304`s that cost no q
 | `extraTrackedItems` | `[]` | Upstream items to track in addition to the tracker subtree. |
 | `discoveryQueries` | `[]` | Issue-search queries for discovering new ours items (hourly at most). Empty disables discovery. |
 | `compareBases` | `{}` | Per-repo compare base for release cards, keyed by `owner/repo`. A first-seen tag equal to the base is the install baseline: recorded, never carded. Set it to the running versions at install so the first tick creates no intake cards. |
-| `labelIdByName` | `{}` | Paperclip label IDs keyed by name. Only names present here can be synced (there is no labels read API). Include the `gh:awaiting/us` and `gh:awaiting/maintainer` IDs for the awaiting facet and the GitHub-tab metric counts to stay in sync. |
+| `labelIdByName` | `{}` | Paperclip label IDs keyed by name. Only names present here can be synced (there is no labels read API). Include the `gh:awaiting/us` and `gh:awaiting/maintainer` IDs for the awaiting facet and the GitHub-tab metric counts to stay in sync, plus the `upstream:ungated` ID or the audit cannot label follow-through cards. |
 | `dryRun` | `false` | Log intended creates/wakes/updates without making them. |
+| `auditLogins` | `["Rick7C2"]` | GitHub logins the audit watches. `operatorLogin` and `ourLogins` are always included; append the App's bot login here (or to `ourLogins`) once GitHub App auth lands. |
+| `auditOrgs` | `["router-for-me", "paperclipai"]` | Upstream orgs the audit searches per watched login. |
+| `auditRepos` | `[]` | Extra upstream repos (`owner/repo`) searched outside the audit orgs. |
+| `chiefOfStaffAgentId` | Chief of Staff | Owner of the `Ungated upstream post` flag cards. |
 
 ## Capabilities
 
@@ -56,7 +71,7 @@ Every REST read is ETag-conditional: unchanged answers are `304`s that cost no q
 
 ## Dry run
 
-`bin/github-upstream-dryrun.mjs` runs both jobs end to end against the real GitHub API with a file-backed state store and a stub Paperclip client. Nothing is created, woken or updated; the token comes from `GITHUB_TOKEN` or `--token-file`, never from config. Run it twice with the same `--state` file: the second run is mostly `304`s and reports the same intentions.
+`bin/github-upstream-dryrun.mjs` runs all three jobs end to end against the real GitHub API with a file-backed state store and a stub Paperclip client. Nothing is created, woken or updated; the token comes from `GITHUB_TOKEN` or `--token-file`, never from config. Run it twice with the same `--state` file: the second run is mostly `304`s and reports the same intentions (the audit persists no cursors in dry-run, so it re-reports honestly).
 
 ```sh
 GITHUB_TOKEN=$(cat ~/.paperclip/github-upstream-token) \

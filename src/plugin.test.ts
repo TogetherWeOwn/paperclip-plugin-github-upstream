@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
-import manifest, { ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
+import manifest, { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
 import { runItemScan } from "./items.js";
@@ -49,6 +49,7 @@ describe("plugin wiring", () => {
     const jobs = Object.fromEntries((manifest.jobs ?? []).map((j) => [j.jobKey, j.schedule]));
     expect(jobs[RELEASE_JOB_KEY]).toBe("*/10 * * * *");
     expect(jobs[ITEM_JOB_KEY]).toBe("*/15 * * * *");
+    expect(jobs[AUDIT_JOB_KEY]).toBe("11 * * * *");
     for (const key of [
       "tokenSecretRef",
       "releaseRepos",
@@ -63,6 +64,10 @@ describe("plugin wiring", () => {
       "compareBases",
       "labelIdByName",
       "dryRun",
+      "auditLogins",
+      "auditOrgs",
+      "auditRepos",
+      "chiefOfStaffAgentId",
     ]) {
       expect(manifest.instanceConfigSchema?.properties).toHaveProperty(key);
     }
@@ -126,6 +131,32 @@ describe("plugin wiring", () => {
     const runs = getRuns(harness);
     expect(runs).toHaveLength(1);
     expect(runs[0]).toMatchObject({ job: "item-scan", ok200: 1 });
+  });
+
+  it("runs the audit scan through the registered job with no candidates", async () => {
+    const harness = await setup();
+    const tracker = await harness.ctx.issues.create({ companyId: COMPANY, title: "tracker" });
+    harness.setConfig({
+      followThroughTrackerIssueId: tracker.id,
+      auditOrgs: ["paperclipai"],
+      auditLogins: ["Rick7C2"],
+    });
+    harness.ctx.http.fetch = (async (url: string) => {
+      const body =
+        url === "https://api.github.com/graphql"
+          ? { data: { search: { nodes: [] } } }
+          : { total_count: 0, items: [] };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof harness.ctx.http.fetch;
+
+    await harness.runJob(AUDIT_JOB_KEY);
+    const runs = getRuns(harness);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ job: "audit-scan", errors: 0, wakes: 0, creates: 0 });
+    expect(runs[0].ok200).toBeGreaterThan(0);
   });
 
   it("a rate-limited item scan backs off and skips the next run", async () => {

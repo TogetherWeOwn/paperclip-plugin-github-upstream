@@ -23,12 +23,23 @@ export interface UpstreamConfig {
   compareBases: Record<string, string>;
   labelIdByName: Record<string, string>;
   dryRun: boolean;
+  /** GitHub logins the audit watches for ungated posts. The operator and ourLogins identities are always included. */
+  auditLogins: string[];
+  /** Upstream orgs the audit searches per watched login. */
+  auditOrgs: string[];
+  /** Extra upstream repos the audit searches, as owner/repo (outside auditOrgs). */
+  auditRepos: string[];
+  /** Owner of the "Ungated upstream post" flag cards. */
+  chiefOfStaffAgentId: string;
 }
 
 export const DEFAULT_RELEASE_REPOS = ["router-for-me/CLIProxyAPI", "paperclipai/paperclip"];
 export const DEFAULT_RELEASE_INTAKE_ASSIGNEE = "c4bd17fa-72df-43b4-83cd-df59ec7de5d0";
 export const DEFAULT_FOLLOW_THROUGH_ASSIGNEE = "7b8f576c-ebce-447f-a904-dda322df4220";
 export const DEFAULT_HEAD_PREFIXES = ["TogetherWeOwn:"];
+export const DEFAULT_AUDIT_LOGINS = ["Rick7C2"];
+export const DEFAULT_AUDIT_ORGS = ["router-for-me", "paperclipai"];
+export const DEFAULT_CHIEF_OF_STAFF_ASSIGNEE = "ad0e6eaa-51a3-41dd-97d8-af46a84fc5e9";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -87,6 +98,19 @@ export function resolveConfig(raw: Record<string, unknown>): UpstreamConfig {
     compareBases: stringMap(raw.compareBases),
     labelIdByName: stringMap(raw.labelIdByName),
     dryRun: raw.dryRun === true,
+    auditLogins: (() => {
+      const logins = stringArray(raw.auditLogins);
+      return logins.length > 0 ? logins : [...DEFAULT_AUDIT_LOGINS];
+    })(),
+    auditOrgs: (() => {
+      const orgs = stringArray(raw.auditOrgs);
+      return orgs.length > 0 ? orgs : [...DEFAULT_AUDIT_ORGS];
+    })(),
+    auditRepos: stringArray(raw.auditRepos),
+    chiefOfStaffAgentId:
+      typeof raw.chiefOfStaffAgentId === "string" && raw.chiefOfStaffAgentId.length > 0
+        ? raw.chiefOfStaffAgentId
+        : DEFAULT_CHIEF_OF_STAFF_ASSIGNEE,
   };
 }
 

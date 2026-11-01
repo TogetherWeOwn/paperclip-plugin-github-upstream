@@ -1,8 +1,9 @@
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveConfig } from "./config.js";
+import { runAuditScan } from "./audit.js";
 import { runItemScan, type ItemMap } from "./items.js";
-import { ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
+import { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
 import { runReleaseScan } from "./releases.js";
 import { recordRunStats, stateKey, type RunStats } from "./state.js";
 import { EMPTY_SUMMARY, SUMMARY_DATA_KEY, summarizeItems } from "./summary.js";
@@ -15,6 +16,9 @@ const plugin = definePlugin({
     ctx.jobs.register(ITEM_JOB_KEY, async () => {
       await scanAll(ctx, "items");
     });
+    ctx.jobs.register(AUDIT_JOB_KEY, async () => {
+      await scanAll(ctx, "audit");
+    });
     ctx.data.register(SUMMARY_DATA_KEY, async (params) => {
       const companyId = typeof params.companyId === "string" ? params.companyId : "";
       if (!companyId) return { ...EMPTY_SUMMARY };
@@ -24,7 +28,7 @@ const plugin = definePlugin({
   },
 });
 
-async function scanAll(ctx: PluginContext, job: "release" | "items"): Promise<void> {
+async function scanAll(ctx: PluginContext, job: "release" | "items" | "audit"): Promise<void> {
   const companies = await ctx.companies.list();
   for (const company of companies) {
     try {
@@ -32,7 +36,9 @@ async function scanAll(ctx: PluginContext, job: "release" | "items"): Promise<vo
       const fetchImpl: (url: string, init?: RequestInit) => Promise<Response> = (url, init) => ctx.http.fetch(url, init);
       const stats: RunStats = job === "release"
         ? (await runReleaseScan(ctx, company.id, config, { fetchImpl })).stats
-        : (await runItemScan(ctx, company.id, config, { fetchImpl })).stats;
+        : job === "audit"
+          ? (await runAuditScan(ctx, company.id, config, { fetchImpl })).stats
+          : (await runItemScan(ctx, company.id, config, { fetchImpl })).stats;
       await recordRunStats(ctx, company.id, stats);
       ctx.logger.info("github-upstream scan finished", {
         companyId: company.id,

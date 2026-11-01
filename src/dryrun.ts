@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { runAuditScan, type AuditOutcome } from "./audit.js";
 import { resolveConfig, type UpstreamConfig } from "./config.js";
 import { runItemScan, type ItemOutcome } from "./items.js";
 import { runReleaseScan, type ReleaseOutcome } from "./releases.js";
@@ -35,6 +36,7 @@ export interface DryRunResult {
   config: UpstreamConfig;
   releaseOutcomes: ReleaseOutcome[];
   itemOutcomes: ItemOutcome[];
+  auditOutcomes: AuditOutcome[];
   stats: RunStats[];
   /** Every write the run wanted to make but did not. */
   intended: string[];
@@ -117,7 +119,8 @@ export async function runDryRun(options: DryRunOptions): Promise<DryRunResult> {
   const fetchImpl = (url: string, init?: RequestInit) => fetch(url, init);
   const release = await runReleaseScan(ctx, options.companyId, config, { fetchImpl });
   const items = await runItemScan(ctx, options.companyId, config, { fetchImpl });
-  return { config, releaseOutcomes: release.outcomes, itemOutcomes: items.outcomes, stats: [release.stats, items.stats], intended };
+  const audit = await runAuditScan(ctx, options.companyId, config, { fetchImpl });
+  return { config, releaseOutcomes: release.outcomes, itemOutcomes: items.outcomes, auditOutcomes: audit.outcomes, stats: [release.stats, items.stats, audit.stats], intended };
 }
 
 function inferTrackerId(cards: DryRunCard[]): string {

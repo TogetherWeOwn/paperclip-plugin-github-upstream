@@ -4,6 +4,7 @@ export const PLUGIN_ID = "togetherweown.github-upstream";
 export const PLUGIN_VERSION = "0.1.0";
 export const RELEASE_JOB_KEY = "release-scan";
 export const ITEM_JOB_KEY = "item-scan";
+export const AUDIT_JOB_KEY = "audit-scan";
 
 /** Origin kinds written by this plugin. The IssuesList page filters on the shared prefix. */
 export const ORIGIN_KIND_PREFIX = "plugin:togetherweown.github-upstream:";
@@ -62,6 +63,13 @@ const manifest: PaperclipPluginManifestV1 = {
       description:
         "ETag-conditional GETs for each tracked upstream issue/PR/discussion. On a real change (updated_at, comment/review count, check conclusion, head SHA, state/merged) the owning card is woken with a deterministic one-line reason. Our own comments and pushes sync labels/headers but never wake.",
       schedule: "*/15 * * * *",
+    },
+    {
+      jobKey: AUDIT_JOB_KEY,
+      displayName: "Audit upstream posts for gate coverage",
+      description:
+        "Hourly deterministic audit: search for recent upstream issues, PRs, discussions, comments and reviews by our account, and flag any post with no approved gate card by labelling its follow-through card upstream:ungated and opening a card for the Chief of Staff.",
+      schedule: "11 * * * *",
     },
   ],
   instanceConfigSchema: {
@@ -156,6 +164,30 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         default: false,
         description: "Log intended creates/wakes/updates without making them.",
+      },
+      auditLogins: {
+        type: "array",
+        items: { type: "string" },
+        default: ["Rick7C2"],
+        description:
+          "GitHub logins the hourly audit watches for ungated posts. The operator and ourLogins entries are always included; append the App's bot login here (or to ourLogins) once GitHub App auth lands.",
+      },
+      auditOrgs: {
+        type: "array",
+        items: { type: "string" },
+        default: ["router-for-me", "paperclipai"],
+        description: "Upstream orgs the audit searches per watched login (authored and commented issues/PRs, authored discussions).",
+      },
+      auditRepos: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description: "Extra upstream repos the audit searches, as owner/repo, for posts outside the configured audit orgs.",
+      },
+      chiefOfStaffAgentId: {
+        type: "string",
+        default: "ad0e6eaa-51a3-41dd-97d8-af46a84fc5e9",
+        description: "Agent assigned to the Ungated upstream post flag cards (the Chief of Staff).",
       },
     },
   },
