@@ -432,6 +432,9 @@ async function syncOneItem(
       prevForCompare.state !== snapshot.state ||
       prevForCompare.commentCount !== snapshot.commentCount ||
       prevForCompare.reviewCount !== snapshot.reviewCount ||
+      // A ruling cleared or flipped in place (same review count) is material:
+      // an unsettled check transition beside it must still go to the wake path.
+      prevForCompare.latestReviewState !== snapshot.latestReviewState ||
       (prevForCompare.headSha ?? null) !== (snapshot.headSha ?? null) ||
       prevForCompare.draft !== snapshot.draft
     );
@@ -574,9 +577,9 @@ interface GitHubActorCommit {
  * `issues/{n}/comments?since=<prev updatedAt>` when the comment count rose,
  * plus `pulls/{n}/commits` when the head moved. Suppression needs at least one
  * observed actor login and every observed actor ours (`operatorLogin` plus
- * `ourLogins`). State changes, new reviews, removed comments, check drift and
- * discussions (a discussion number is not an issue number, so neither endpoint
- * applies) always wake.
+ * `ourLogins`). State changes, new reviews, review ruling changes, removed
+ * comments, check drift and discussions (a discussion number is not an issue
+ * number, so neither endpoint applies) always wake.
  */
 async function checkOwnAction(params: {
   fetchImpl: FetchLike;
@@ -604,6 +607,10 @@ async function checkOwnAction(params: {
   }
   if (previous.draft !== next.draft) return wake("draft changed, always wakes");
   if (previous.reviewCount !== next.reviewCount) return wake("reviews changed, always wakes");
+  // A ruling can move without a new review (a dismissal edits the review in
+  // place, keeping the count). That change has no actor endpoint to attribute,
+  // so it always wakes — even when our own comment or push shares the window.
+  if (previous.latestReviewState !== next.latestReviewState) return wake("review ruling changed, always wakes");
   if (next.commentCount < previous.commentCount) return wake("comments removed, always wakes");
   if (resolvedKind === "discussion") return wake("discussions have no actor endpoint");
   const commentsRose = next.commentCount > previous.commentCount;

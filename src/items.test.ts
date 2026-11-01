@@ -1077,6 +1077,93 @@ describe("item hardening", () => {
     expect(wakes).toHaveLength(2);
   });
 
+  it("a review ruling change wakes even when the review count is unchanged", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#910`);
+    const table: RouteTable = {
+      rest: {
+        ...pullTable(910, "910a"),
+        [reviewsUrl(910)]: { etag: '"r910a"', body: [{ id: 9, state: "CHANGES_REQUESTED", user: { login: "maintainer" } }] },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+
+    await scan(harness, trackerId, stub);
+    expect(wakes).toHaveLength(0);
+
+    // The review is dismissed in place: same id, same count, ruling cleared,
+    // activity timestamp advanced. The card must wake, not silently consume it.
+    table.rest[issueUrl(910)] = { etag: '"i910b"', body: pullIssueRow(910, { updated_at: "2026-10-13T00:00:00Z" }) };
+    table.rest[reviewsUrl(910)] = { etag: '"r910b"', body: [{ id: 9, state: "DISMISSED", user: { login: "maintainer" } }] };
+    const dismissed = await scan(harness, trackerId, stub);
+    expect(dismissed.outcomes[0].status).toBe("woke");
+    expect(dismissed.outcomes[0].reason).toContain("review ruling cleared");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
+  it("a review ruling change wakes even when our own comment shares the window", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#911`);
+    const table: RouteTable = {
+      rest: {
+        ...pullTable(911, "911a"),
+        [reviewsUrl(911)]: { etag: '"r911a"', body: [{ id: 9, state: "CHANGES_REQUESTED", user: { login: "maintainer" } }] },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const config = { operatorLogin: "Rick7C2" };
+
+    await scan(harness, trackerId, stub, config);
+    expect(wakes).toHaveLength(0);
+
+    // Our comment lands while the review is dismissed in place. Every observed
+    // actor is ours, but the ruling change is unattributable and must still wake.
+    table.rest[issueUrl(911)] = { etag: '"i911b"', body: pullIssueRow(911, { comments: 2, updated_at: "2026-10-13T00:00:00Z" }) };
+    table.rest[reviewsUrl(911)] = { etag: '"r911b"', body: [{ id: 9, state: "DISMISSED", user: { login: "maintainer" } }] };
+    table.rest[commentsUrl(911)] = { etag: '"m911"', body: [{ id: 2, user: { login: "Rick7C2" } }] };
+    const changed = await scan(harness, trackerId, stub, config);
+    expect(changed.outcomes[0].status).toBe("woke");
+    expect(changed.outcomes[0].reason).toContain("review ruling cleared");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
+  it("a review ruling change alongside an unsettled check transition still wakes", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#912`);
+    const pending = { total_count: 1, check_runs: [{ status: "in_progress", conclusion: null, name: "ci" }] };
+    const table: RouteTable = {
+      rest: {
+        ...pullTable(912, "912a"),
+        [reviewsUrl(912)]: { etag: '"r912a"', body: [{ id: 9, state: "CHANGES_REQUESTED", user: { login: "maintainer" } }] },
+        // No check runs yet: conclusion "none", refetched every tick.
+        [checksUrl(HEAD_SHA)]: { etag: '"c912a"', body: { total_count: 0, check_runs: [] } },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+
+    await scan(harness, trackerId, stub);
+    expect(wakes).toHaveLength(0);
+
+    // CI starts (none -> pending) while the review is dismissed in place. The
+    // ruling change is material: the pending transition must not swallow it.
+    table.rest[issueUrl(912)] = { etag: '"i912b"', body: pullIssueRow(912, { updated_at: "2026-10-13T00:00:00Z" }) };
+    table.rest[reviewsUrl(912)] = { etag: '"r912b"', body: [{ id: 9, state: "DISMISSED", user: { login: "maintainer" } }] };
+    table.rest[checksUrl(HEAD_SHA)] = { etag: '"c912b"', body: pending };
+    const changed = await scan(harness, trackerId, stub);
+    expect(changed.outcomes[0].status).toBe("woke");
+    expect(changed.outcomes[0].reason).toContain("review ruling cleared");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
   it("F6: created cards keep a deterministic title and a sanitized untrusted quote", async () => {
     const evilTitle = `[Evil](http://evil.example) <script>alert(1)</script> ` + "y".repeat(150);
     const table: RouteTable = {

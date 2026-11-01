@@ -415,6 +415,25 @@ describe("release hardening", () => {
     expect(wakes[0].issueId).toBe(card.id);
   });
 
+  it("a retried release wake keeps the original previous tag in the card body", async () => {
+    await seedState("v8.0.50", "v8.0.50", '"u1"');
+    await openCard("v8.0.50");
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"u2"', body: releaseBody("v8.0.51") } });
+
+    const capped = await scan(harness, stub, { maxWakesPerTick: 0 });
+    expect(capped.outcomes[0].status).toBe("capped");
+    const moved = (await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND }))[0];
+    expect(moved.description).toContain("previous seen tag was `v8.0.50`");
+
+    // The retry tick must not rewrite the body with the new tag as its own
+    // previous tag: the retitle already happened on the capped tick.
+    const retry = await scan(harness, stub, { maxWakesPerTick: 5 });
+    expect(retry.outcomes[0].status).toBe("updated");
+    const final = (await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND }))[0];
+    expect(final.description).toContain("previous seen tag was `v8.0.50`");
+    expect(final.description).not.toContain("previous seen tag was `v8.0.51`");
+  });
+
   it("mixed-case release state from before the lowercase upgrade still drives the scan", async () => {
     // Pre-upgrade record keyed by configured case; tag v8.0.50 already carded.
     await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "releases" }, {

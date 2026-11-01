@@ -260,7 +260,15 @@ async function ensureReleaseCard(
     if (config.dryRun) {
       return { repo: key, status: "would-update", tag, detail: `would update open card ${open.identifier ?? open.id} to ${tag}` };
     }
-    await updateReleaseCard(ctx, companyId, config, open, owner, repo, tag, body, previousTag);
+    // A capped-wake retry lands here with the retitle already applied (the
+    // open card's originId is already the new tag). Skip the rewrite: it would
+    // record the new tag as its own previous tag in the body. The wake below
+    // still fires exactly once.
+    const alreadyRetitled =
+      typeof open.originId === "string" && open.originId.toLowerCase() === originId.toLowerCase();
+    if (!alreadyRetitled) {
+      await updateReleaseCard(ctx, companyId, config, open, owner, repo, tag, body, previousTag);
+    }
     // The update consumed the tag even when the wake below is capped or
     // fails: waking at most once also means never waking twice. A capped
     // wake is the exception: createdTag stays unset so the next tick retries

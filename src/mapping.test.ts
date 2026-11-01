@@ -9,6 +9,7 @@ import {
   identityUrlsInText,
   isOurLogin,
   isOursItem,
+  isUpdatedAtOnlyChange,
   labelNamesFor,
   parseGitHubUrl,
   safeUpstreamUrl,
@@ -124,6 +125,16 @@ describe("fingerprintOf / describeChange", () => {
     expect(describeChange(a, snapshot({ latestReviewState: "CHANGES_REQUESTED" }))).toBe("reviewer requested changes");
     expect(describeChange(a, snapshot({ latestReviewState: "APPROVED" }))).toBe("reviewer approved");
     expect(describeChange(snapshot({ latestReviewState: "APPROVED" }), snapshot())).toContain("cleared");
+  });
+
+  it("isUpdatedAtOnlyChange is false when the review ruling moves", () => {
+    const a = snapshot({ latestReviewState: "CHANGES_REQUESTED" });
+    // Pure activity (our own title/body/label edits) stays silent.
+    expect(isUpdatedAtOnlyChange(a, snapshot({ latestReviewState: "CHANGES_REQUESTED", updatedAt: "2026-10-13T00:00:00Z" }))).toBe(true);
+    // A ruling cleared in place (same review id, same count) is material: it
+    // must never be consumed as an updatedAt-only change.
+    expect(isUpdatedAtOnlyChange(a, snapshot({ latestReviewState: null, updatedAt: "2026-10-13T00:00:00Z" }))).toBe(false);
+    expect(isUpdatedAtOnlyChange(a, snapshot({ latestReviewState: "APPROVED", updatedAt: "2026-10-13T00:00:00Z" }))).toBe(false);
   });
 });
 

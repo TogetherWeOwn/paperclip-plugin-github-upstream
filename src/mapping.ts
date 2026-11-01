@@ -188,6 +188,9 @@ export function isUpdatedAtOnlyChange(previous: ItemSnapshot, next: ItemSnapshot
     previous.state === next.state &&
     previous.commentCount === next.commentCount &&
     previous.reviewCount === next.reviewCount &&
+    // A ruling can move without a new review (a dismissal edits the review in
+    // place): a changed latestReviewState is material, never activity-only.
+    previous.latestReviewState === next.latestReviewState &&
     previous.checkConclusion === next.checkConclusion &&
     (previous.headSha ?? null) === (next.headSha ?? null) &&
     previous.draft === next.draft
