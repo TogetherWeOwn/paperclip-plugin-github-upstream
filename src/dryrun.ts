@@ -9,6 +9,7 @@ import type { RunStats } from "./state.js";
 export interface DryRunCard {
   id: string;
   identifier?: string | null;
+  title?: string | null;
   parentId?: string | null;
   originKind?: string | null;
   originId?: string | null;
@@ -18,6 +19,7 @@ export interface DryRunCard {
   workProducts?: Array<{ url: string | null }>;
   assigneeAgentId?: string | null;
   status?: string;
+  completedAt?: string | null;
 }
 
 export interface DryRunOptions {
@@ -76,7 +78,29 @@ export async function runDryRun(options: DryRunOptions): Promise<DryRunResult> {
   const saveState = () => writeFileSync(options.statePath, `${JSON.stringify(state, null, 2)}\n`);
   const scopeKey = (input: { stateKey: string }) => `company:${options.companyId}:${input.stateKey}`;
 
-  const children = options.cards.filter((c) => (c.parentId ?? null) === trackerId);
+  // The audit matches gate cards one level below follow-through cards, so the
+  // stub subtree carries every transitive descendant (production getSubtree
+  // does the same); consumers filter to direct children where they need to.
+  const descendants: DryRunCard[] = [];
+  {
+    const byParent = new Map<string, DryRunCard[]>();
+    for (const card of options.cards) {
+      const parent = card.parentId ?? null;
+      if (parent === null) continue;
+      const group = byParent.get(parent) ?? [];
+      group.push(card);
+      byParent.set(parent, group);
+    }
+    const queue = [trackerId];
+    while (queue.length > 0) {
+      const next = byParent.get(queue.shift() as string) ?? [];
+      for (const card of next) {
+        descendants.push(card);
+        queue.push(card.id);
+      }
+    }
+  }
+  const children = descendants;
   const ctx = {
     companies: {
       list: async () => [{ id: options.companyId }],

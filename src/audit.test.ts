@@ -3,7 +3,7 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 import manifest, { ITEM_ORIGIN_KIND } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
-import { AUDIT_CUTOVER_ISO, runAuditScan, SCAN_OVERLAP_MS, ungatedKey, UNGATED_LABEL_NAME } from "./audit.js";
+import { AUDIT_CUTOVER_ISO, runAuditScan, SCAN_OVERLAP_MS, ungatedKey, UNGATED_FLAG_ORIGIN_KIND, UNGATED_LABEL_NAME } from "./audit.js";
 import { stateKey } from "./state.js";
 
 const COMPANY = "c-1";
@@ -202,7 +202,8 @@ describe("audit job", () => {
     expect(await flagCards(harness)).toHaveLength(1);
     expect(wakes).toHaveLength(1);
 
-    // Even forcing a reprocess (fresh ETags, reset cursor) cannot double-flag.
+    // Even forcing a reprocess (fresh ETags, reset cursor) cannot double-flag:
+    // the seen set absorbs the already-flagged post with no outcome at all.
     table.rest[commentsUrl(200)] = { etag: '"m2"', body: [] };
     const auditState = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as { cursors: Record<string, string> });
     auditState.cursors = {};
@@ -212,8 +213,21 @@ describe("audit job", () => {
       body: issueRow(200, { title: "issue 200", user: { login: "Rick7C2" }, created_at: POST_AT }),
     };
     const third = await scan(harness, trackerId, stub);
-    expect(third.outcomes).toHaveLength(1);
-    expect(third.outcomes[0].status).toBe("duplicate");
+    expect(third.outcomes).toHaveLength(0);
+    expect(await flagCards(harness)).toHaveLength(1);
+    expect(wakes).toHaveLength(1);
+
+    // If the seen set is lost but the flag record survives, the reprocessed
+    // post reports "duplicate" instead of flagging twice.
+    const lostSeen = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as {
+      cursors: Record<string, string>; seen: Record<string, Record<string, string>>;
+    });
+    lostSeen.cursors = {};
+    lostSeen.seen = {};
+    await harness.ctx.state.set(stateKey(COMPANY, "audit") as never, lostSeen as never);
+    const fourth = await scan(harness, trackerId, stub);
+    expect(fourth.outcomes).toHaveLength(1);
+    expect(fourth.outcomes[0].status).toBe("duplicate");
     expect(await flagCards(harness)).toHaveLength(1);
     expect(wakes).toHaveLength(1);
   });
@@ -464,6 +478,243 @@ describe("audit job", () => {
     expect(flagged.outcomes).toHaveLength(1);
     expect(flagged.outcomes[0].status).toBe("flagged");
     expect(await flagCards(harness)).toHaveLength(1);
+  });
+
+  it("an approval-only review is discovered through reviewed-by search", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(300)]: {
+          etag: '"i1"',
+          body: { ...issueRow(300), html_url: pullHtml(300), pull_request: {} },
+        },
+        [`https://api.github.com/repos/${OWNER}/${REPO}/pulls/300`]: { etag: '"p1"', body: { number: 300 } },
+        [commentsUrl(300)]: { etag: '"m1"', body: [] },
+        [`https://api.github.com/repos/${OWNER}/${REPO}/pulls/300/comments`]: { etag: '"q1"', body: [] },
+        [reviewsUrl(300)]: {
+          etag: '"r1"',
+          body: [{ id: 7, html_url: `${pullHtml(300)}#pullrequestreview-7`, submitted_at: POST_AT, state: "APPROVED", user: { login: "Rick7C2" } }],
+        },
+      },
+      searchItems: [{ html_url: pullHtml(300) }],
+      graphqlDiscussion: null,
+    };
+    const base = auditStub(table);
+    const stub = (async (url: string, init?: RequestInit) => {
+      // Author/commenter searches see nothing: only the reviewed-by query finds the PR.
+      if (url.startsWith("https://api.github.com/search/issues") && !url.includes("reviewed-by")) {
+        return json({ total_count: 0, items: [] }, null);
+      }
+      return base(url, init);
+    }) as FetchStub;
+    const out = await scan(harness, trackerId, stub);
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ item: `${OWNER}/${REPO}#300`, status: "flagged" });
+    expect(out.outcomes[0].post).toContain("pullrequestreview-7");
+    expect(await flagCards(harness)).toHaveLength(1);
+  });
+
+  it("a full first comment page is re-read unconditionally so page 2 is never hidden", async () => {
+    const strangers = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 1,
+      html_url: `${issueHtml(100)}#issuecomment-${i + 1}`,
+      created_at: POST_AT,
+      updated_at: POST_AT,
+      user: { login: "stranger" },
+    }));
+    const ours = {
+      id: 101,
+      html_url: `${issueHtml(100)}#issuecomment-101`,
+      created_at: POST_AT,
+      updated_at: POST_AT,
+      user: { login: "Rick7C2" },
+    };
+    let page2: unknown[] = [];
+    const unconditionalPage1Reads: string[] = [];
+    const stub = (async (url: string, init?: RequestInit) => {
+      if (url === "https://api.github.com/graphql") return json({ data: { search: { nodes: [] } } }, null);
+      if (url.startsWith("https://api.github.com/search/issues")) {
+        return json({ total_count: 1, items: [{ html_url: issueHtml(100) }] }, null);
+      }
+      if (url === issueUrl(100)) return json(issueRow(100), '"i1"');
+      if (url.startsWith(commentsUrl(100))) {
+        const page = new URL(url).searchParams.get("page") ?? "1";
+        if (page === "1") {
+          if (new Headers(init?.headers).get("If-None-Match")) {
+            return new Response(null, { status: 304, headers: { etag: '"m1"' } });
+          }
+          unconditionalPage1Reads.push(url);
+          return json(strangers, '"m1"');
+        }
+        return json(page === "2" ? page2 : [], '"m2"');
+      }
+      return new Response("not found", { status: 404 });
+    }) as FetchStub;
+
+    // First run: a full first page records the marker; nothing is flagged.
+    const first = await scan(harness, trackerId, stub);
+    expect(first.outcomes).toHaveLength(0);
+    const marked = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as { fullPages: Record<string, true> });
+    expect(marked.fullPages[`${OWNER}/${REPO}#100:issue-comments`]).toBe(true);
+
+    // Second run: our comment lands on page 2. Page 1 must be re-read
+    // unconditionally — a 304 there would hide page 2 forever.
+    page2 = [ours];
+    unconditionalPage1Reads.length = 0;
+    const second = await scan(harness, trackerId, stub);
+    expect(unconditionalPage1Reads).toHaveLength(1);
+    expect(second.outcomes).toHaveLength(1);
+    expect(second.outcomes[0]).toMatchObject({ status: "flagged" });
+    expect(await flagCards(harness)).toHaveLength(1);
+  });
+
+  it("a capped post defers without consuming judged posts", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(200)]: {
+          etag: '"i1"',
+          body: issueRow(200, { title: "issue 200", user: { login: "Rick7C2" }, created_at: POST_AT }),
+        },
+        [commentsUrl(200)]: {
+          etag: '"m1"',
+          body: [{ id: 1, html_url: `${issueHtml(200)}#issuecomment-1`, created_at: POST_AT, updated_at: POST_AT, user: { login: "Rick7C2" } }],
+        },
+      },
+      searchItems: [{ html_url: issueHtml(200) }],
+      graphqlDiscussion: null,
+    };
+    const stub = auditStub(table);
+    const cfg = (extra: Record<string, unknown> = {}) =>
+      resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID }, ...extra });
+
+    // Budget covers the follow-through card plus one flag: the item post
+    // flags while the same-second comment caps. Both posts are judged
+    // distinctly — the shared timestamp does not collapse them.
+    const first = await runAuditScan(harness.ctx, COMPANY, cfg({ maxCreatesPerTick: 2 }), { fetchImpl: stub });
+    expect(first.outcomes).toHaveLength(2);
+    expect(first.outcomes[0]).toMatchObject({ status: "flagged" });
+    expect(first.outcomes[1]).toMatchObject({ status: "capped" });
+    expect(await flagCards(harness)).toHaveLength(1);
+
+    // Next tick with budget flags only the deferred comment: the judged item
+    // post stays consumed via the cursor and seen set, not re-flagged.
+    const second = await runAuditScan(harness.ctx, COMPANY, cfg({}), { fetchImpl: stub });
+    expect(second.outcomes).toHaveLength(1);
+    expect(second.outcomes[0]).toMatchObject({ status: "flagged", post: `${issueHtml(200)}#issuecomment-1` });
+    expect(await flagCards(harness)).toHaveLength(2);
+  });
+
+  it("flagging reserves the wake budget instead of overspending it", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(200)]: {
+          etag: '"i1"',
+          body: issueRow(200, { title: "issue 200", user: { login: "Rick7C2" }, created_at: POST_AT }),
+        },
+        [commentsUrl(200)]: { etag: '"m1"', body: [] },
+      },
+      searchItems: [{ html_url: issueHtml(200) }],
+      graphqlDiscussion: null,
+    };
+    const stub = auditStub(table);
+    const cfg = (extra: Record<string, unknown> = {}) =>
+      resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID }, ...extra });
+
+    // After the follow-through create one wake unit is spent, but flagging
+    // needs two more (card wake + explicit requestWakeup): maxWakesPerTick 2 caps.
+    const capped = await runAuditScan(harness.ctx, COMPANY, cfg({ maxWakesPerTick: 2 }), { fetchImpl: stub });
+    expect(capped.outcomes).toHaveLength(1);
+    expect(capped.outcomes[0].status).toBe("capped");
+    expect(await flagCards(harness)).toHaveLength(0);
+
+    // The card was created but nothing was consumed: cursor held for the retry.
+    const mid = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as {
+      lastSearchAt: string | null; cursors: Record<string, string>;
+    });
+    expect(mid.lastSearchAt).toBeNull();
+    expect(mid.cursors[`${OWNER}/${REPO}#200`]).toBeUndefined();
+
+    const flagged = await runAuditScan(harness.ctx, COMPANY, cfg({}), { fetchImpl: stub });
+    expect(flagged.outcomes).toHaveLength(1);
+    expect(flagged.outcomes[0].status).toBe("flagged");
+    expect(await flagCards(harness)).toHaveLength(1);
+  });
+
+  it("dry-run with an approved gate card reports gated without writing", async () => {
+    const card = await followThrough(harness, trackerId, 100);
+    await gateCard(harness, card.id, GATE_BEFORE);
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(100)]: { etag: '"i1"', body: issueRow(100) },
+        [commentsUrl(100)]: { etag: '"m1"', body: [comment(1, "Rick7C2")] },
+      },
+      searchItems: [{ html_url: issueHtml(100) }],
+      graphqlDiscussion: null,
+    };
+    let writes = 0;
+    for (const method of ["create", "update", "requestWakeup"] as const) {
+      const orig = (harness.ctx.issues[method] as (...args: never[]) => Promise<never>).bind(harness.ctx.issues);
+      (harness.ctx.issues[method] as (...args: never[]) => Promise<never>) = (async (...args: never[]) => {
+        writes += 1;
+        return orig(...args);
+      }) as never;
+    }
+    const out = await scan(harness, trackerId, auditStub(table), { dryRun: true });
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ status: "gated" });
+    expect(writes).toBe(0);
+  });
+
+  it("a post URL outside the item repo falls back to the item URL", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(100)]: { etag: '"i1"', body: issueRow(100) },
+        [commentsUrl(100)]: {
+          etag: '"m1"',
+          body: [{ id: 1, html_url: "https://github.com/evil-org/evil-repo/issues/9#issuecomment-1", created_at: POST_AT, updated_at: POST_AT, user: { login: "Rick7C2" } }],
+        },
+      },
+      searchItems: [{ html_url: issueHtml(100) }],
+      graphqlDiscussion: null,
+    };
+    const out = await scan(harness, trackerId, auditStub(table));
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0].status).toBe("flagged");
+    const flags = await flagCards(harness);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].description).toContain(`Post: ${issueHtml(100)}`);
+    expect(flags[0].description).not.toContain("evil-org");
+  });
+
+  it("a lost flag record does not double-create the flag card", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(200)]: {
+          etag: '"i1"',
+          body: issueRow(200, { title: "issue 200", user: { login: "Rick7C2" }, created_at: POST_AT }),
+        },
+        [commentsUrl(200)]: { etag: '"m1"', body: [] },
+      },
+      searchItems: [{ html_url: issueHtml(200) }],
+      graphqlDiscussion: null,
+    };
+    const stub = auditStub(table);
+    const first = await scan(harness, trackerId, stub);
+    expect(first.outcomes[0].status).toBe("flagged");
+    expect(await flagCards(harness)).toHaveLength(1);
+
+    // Simulate a crash between the flag create and the end-of-run persist:
+    // all in-memory progress is lost, but the flag card exists. The
+    // pre-create origin lookup must find it instead of creating a second.
+    await harness.ctx.state.set(
+      stateKey(COMPANY, "audit") as never,
+      { lastSearchAt: null, cursors: {}, etags: {}, fullPages: {}, flags: {}, seen: {} } as never,
+    );
+    const second = await scan(harness, trackerId, stub);
+    expect(second.outcomes).toHaveLength(1);
+    expect(second.outcomes[0].status).toBe("flagged");
+    const flags = await harness.ctx.issues.list({ companyId: COMPANY, originKind: UNGATED_FLAG_ORIGIN_KIND });
+    expect(flags).toHaveLength(1);
+    expect(second.outcomes[0].detail).toContain(flags[0].id);
   });
 
   it("dry-run reports intended flags without writing", async () => {

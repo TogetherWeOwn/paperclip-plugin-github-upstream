@@ -3,8 +3,8 @@ import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
 import { resolveAuthToken } from "./github-app.js";
 import { backoffDelayMs, GITHUB_API_BASE, githubGet, githubGraphql, type FetchLike } from "./github.js";
 import { capsOf, wakesUsed } from "./items.js";
-import { findCardForItem, parseGitHubUrl, type CardLike } from "./mapping.js";
-import { ITEM_ORIGIN_KIND } from "./manifest.js";
+import { findCardForItem, parseGitHubUrl, safeUpstreamUrl, type CardLike } from "./mapping.js";
+import { ITEM_ORIGIN_KIND, ORIGIN_KIND_PREFIX } from "./manifest.js";
 import { isBackedOff, setBackoff, stateKey, type RunStats } from "./state.js";
 
 /**
@@ -43,6 +43,21 @@ export const UNGATED_LABEL_NAME = "upstream:ungated";
 
 /** Gate cards carry this title prefix (see the `upstream-gate` skill). */
 export const GATE_TITLE_PREFIX = "Upstream gate";
+
+/**
+ * Origin identity for Chief-of-Staff flag cards. This must sit under
+ * ORIGIN_KIND_PREFIX (colon-separated): the SDK rejects any other
+ * `plugin:` namespace at write time, so a dot-separated kind fails closed.
+ * Flag cards therefore share the GitHub tab's item list with the release
+ * intake cards; both are plugin cards, not tracked upstream items.
+ */
+export const UNGATED_FLAG_ORIGIN_KIND = `${ORIGIN_KIND_PREFIX}ungated-flag`;
+
+/** Repo-relative path for an item, used as the safe-URL fallback. */
+function itemPath(item: TrackedItemRef): string {
+  const leaf = item.kind === "pull" ? "pull" : item.kind === "discussion" ? "discussions" : "issues";
+  return `/${leaf}/${item.number}`;
+}
 
 /** Tracker subtree cards as the audit sees them: mapping fields plus gate fields. */
 export type AuditCard = CardLike & {
@@ -92,11 +107,17 @@ export interface AuditState {
   cursors: Record<string, string>;
   /** Per-item ETags for comment/review reads (`${itemKey}:${endpoint}`). */
   etags: Record<string, string | null>;
+  /** ETag keys whose last read ended on a full 100-row page: page 1 may hide
+   * later pages behind a 304, so these reads are never conditional. */
+  fullPages: Record<string, true>;
   /** Flagged posts by post URL (creation + wake dedupe). */
   flags: Record<string, { item: string; cardId: string | null; at: string }>;
+  /** Judged post URLs by item (`postUrl -> createdAt`): same-second posts
+   * share a cursor timestamp, so the timestamp alone cannot dedupe them. */
+  seen: Record<string, Record<string, string>>;
 }
 
-const EMPTY_AUDIT_STATE: AuditState = { lastSearchAt: null, cursors: {}, etags: {}, flags: {} };
+const EMPTY_AUDIT_STATE: AuditState = { lastSearchAt: null, cursors: {}, etags: {}, fullPages: {}, flags: {}, seen: {} };
 
 /** Watched logins: auditLogins plus the operator/bot identities, lowercased. */
 export function watchedLogins(config: UpstreamConfig): Set<string> {
@@ -185,7 +206,9 @@ export async function runAuditScan(
     lastSearchAt: stored.lastSearchAt,
     cursors: { ...stored.cursors },
     etags: { ...stored.etags },
+    fullPages: { ...(stored.fullPages ?? {}) },
     flags: { ...stored.flags },
+    seen: { ...(stored.seen ?? {}) },
   };
 
   if (!config.followThroughTrackerIssueId) {
@@ -234,18 +257,27 @@ export async function runAuditScan(
       aborted = true;
       break;
     }
-    // Snapshot this item's ETags: a failed item must retry with its old ETags,
-    // otherwise a 304 would hide the posts it never finished processing.
+    // Snapshot this item's ETags and full-page markers: a failed item must
+    // retry with its old read positions, otherwise a 304 would hide the posts
+    // it never finished processing.
     const key = itemKey(ref);
     const etagSnapshot: Record<string, string | null> = {};
     for (const k of Object.keys(state.etags)) {
       if (k.startsWith(`${key}:`)) etagSnapshot[k] = state.etags[k];
     }
-    const restoreEtags = (): void => {
+    const fullSnapshot: Record<string, true> = {};
+    for (const k of Object.keys(state.fullPages)) {
+      if (k.startsWith(`${key}:`)) fullSnapshot[k] = true;
+    }
+    const restoreReads = (): void => {
       for (const k of Object.keys(state.etags)) {
         if (k.startsWith(`${key}:`) && !(k in etagSnapshot)) delete state.etags[k];
       }
       for (const [k, v] of Object.entries(etagSnapshot)) state.etags[k] = v;
+      for (const k of Object.keys(state.fullPages)) {
+        if (k.startsWith(`${key}:`) && !(k in fullSnapshot)) delete state.fullPages[k];
+      }
+      for (const k of Object.keys(fullSnapshot)) state.fullPages[k] = true;
     };
     try {
       const itemOutcomes = await processItem(ctx, companyId, config, deps.fetchImpl, token, watched, ref, directChildren, allCards, state, stats,
@@ -255,7 +287,7 @@ export async function runAuditScan(
       // unread or uncapped posts stay in next run's window.
       if (itemOutcomes.some((o) => o.status === "error" || o.status === "capped")) {
         incomplete = true;
-        restoreEtags();
+        restoreReads();
         if (itemOutcomes.some((o) => o.detail === "rate limited")) {
           aborted = true;
           break;
@@ -263,7 +295,7 @@ export async function runAuditScan(
       }
     } catch (err) {
       incomplete = true;
-      restoreEtags();
+      restoreReads();
       stats.errors += 1;
       outcomes.push({ post: "-", item: key, card: null, status: "error", detail: String(err) });
     }
@@ -332,6 +364,12 @@ async function collectCandidates(
           for (const ref of found.refs) keep(ref);
         }
       }
+      // Reviews without comments don't surface as `commenter:`: a watched
+      // approval or changes-requested review is only discoverable this way.
+      const reviewed = await searchIssues(fetchImpl, token, `${scope} is:pull-request reviewed-by:${login} updated:>=${searchCursor}`, stats, onRateLimited, nowMs);
+      if (reviewed === "rate-limited") return "rate-limited";
+      if (reviewed.failed) incomplete = true;
+      for (const ref of reviewed.refs) keep(ref);
       const discussions = await searchDiscussions(fetchImpl, token, `${scope} author:${login}`, stats, onRateLimited, nowMs);
       if (discussions === "rate-limited") return "rate-limited";
       // Discussion search has no updated-since filter and caps at 20 rows, so
@@ -444,8 +482,15 @@ async function processItem(
   }
   if (!meta) return [];
 
+  // Same-second posts share a cursor timestamp, so judged URLs dedupe what the
+  // timestamp cannot. Entries older than the cursor can never reappear.
+  const seenForItem = state.seen[key] ?? {};
+  for (const [u, t] of Object.entries(seenForItem)) {
+    if (t < cursor) delete seenForItem[u];
+  }
+
   const posts: AuditPost[] = [];
-  if (isWatched(watched, meta.authorLogin) && (meta.createdAt ?? "") >= AUDIT_CUTOVER_ISO && (meta.createdAt ?? "") > cursor) {
+  if (isWatched(watched, meta.authorLogin) && (meta.createdAt ?? "") >= AUDIT_CUTOVER_ISO && (meta.createdAt ?? "") >= cursor && !seenForItem[meta.url]) {
     posts.push({ postUrl: meta.url, item: ref, authorLogin: meta.authorLogin, createdAt: meta.createdAt as string, postKind: "item" });
   }
   const thread = ref.kind === "discussion"
@@ -457,7 +502,7 @@ async function processItem(
   if (thread === "failed") {
     return [{ post: "-", item: key, card: null, status: "error", detail: "thread read failed" }];
   }
-  posts.push(...thread);
+  posts.push(...thread.filter((p) => !seenForItem[p.postUrl]));
   posts.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
 
   const outcomes: AuditOutcome[] = [];
@@ -470,12 +515,21 @@ async function processItem(
   }
 
   if (!config.dryRun && posts.length > 0) {
-    // Capped posts are deferred, not consumed: the cursor advances only past
-    // judged posts so a capped post is re-examined next run.
-    const consumed = posts.filter((p, i) => outcomes[i].status !== "capped");
-    if (consumed.length > 0) {
-      state.cursors[key] = consumed[consumed.length - 1].createdAt;
+    // Capped posts are deferred, not consumed: only judged posts join the
+    // seen set, so a capped post is re-yielded (not silently dropped) next tick.
+    for (let i = 0; i < posts.length; i += 1) {
+      if (outcomes[i].status !== "capped") seenForItem[posts[i].postUrl] = posts[i].createdAt;
     }
+    state.seen[key] = seenForItem;
+    // Capped posts are deferred, not consumed: the cursor advances only
+    // through the leading run of judged posts, so a capped post (and
+    // everything after it) is re-examined next run.
+    let lastConsumed: string | null = null;
+    for (let i = 0; i < posts.length; i += 1) {
+      if (outcomes[i].status === "capped") break;
+      lastConsumed = posts[i].createdAt;
+    }
+    if (lastConsumed !== null && lastConsumed > cursor) state.cursors[key] = lastConsumed;
   }
   return outcomes;
 }
@@ -602,14 +656,14 @@ async function fetchDiscussionPosts(
     stats.errors += 1;
   }
   for (const comment of node.comments?.nodes ?? []) {
-    if (isWatched(watched, comment.author?.login) && (comment.createdAt ?? "") > cursor && (comment.createdAt ?? "") >= AUDIT_CUTOVER_ISO && comment.url) {
+    if (isWatched(watched, comment.author?.login) && (comment.createdAt ?? "") >= cursor && (comment.createdAt ?? "") >= AUDIT_CUTOVER_ISO && comment.url) {
       posts.push({ postUrl: comment.url, item: ref, authorLogin: comment.author!.login as string, createdAt: comment.createdAt as string, postKind: "comment" });
     }
     if (typeof comment.replies?.totalCount === "number" && comment.replies.totalCount > (comment.replies.nodes ?? []).length) {
       stats.errors += 1;
     }
     for (const reply of comment.replies?.nodes ?? []) {
-      if (isWatched(watched, reply.author?.login) && (reply.createdAt ?? "") > cursor && (reply.createdAt ?? "") >= AUDIT_CUTOVER_ISO && reply.url) {
+      if (isWatched(watched, reply.author?.login) && (reply.createdAt ?? "") >= cursor && (reply.createdAt ?? "") >= AUDIT_CUTOVER_ISO && reply.url) {
         posts.push({ postUrl: reply.url, item: ref, authorLogin: reply.author!.login as string, createdAt: reply.createdAt as string, postKind: "comment" });
       }
     }
@@ -640,7 +694,7 @@ async function fetchThreadPosts(
   const pages = await fetchCommentPages(fetchImpl, token, `${rest}/issues/${ref.number}/comments`, cursor, state, `${key}:issue-comments`, stats, onRateLimited, nowMs);
   if (pages === "rate-limited" || pages === "failed") return pages;
   for (const comment of pages) {
-    if (isWatched(watched, comment.user?.login) && (comment.created_at ?? "") > cursor && (comment.created_at ?? "") >= AUDIT_CUTOVER_ISO && comment.html_url) {
+    if (isWatched(watched, comment.user?.login) && (comment.created_at ?? "") >= cursor && (comment.created_at ?? "") >= AUDIT_CUTOVER_ISO && comment.html_url) {
       posts.push({ postUrl: comment.html_url, item: ref, authorLogin: comment.user!.login as string, createdAt: comment.created_at as string, postKind: "comment" });
     }
   }
@@ -649,14 +703,14 @@ async function fetchThreadPosts(
     const inline = await fetchCommentPages(fetchImpl, token, `${rest}/pulls/${ref.number}/comments`, cursor, state, `${key}:pr-comments`, stats, onRateLimited, nowMs);
     if (inline === "rate-limited" || inline === "failed") return inline;
     for (const comment of inline) {
-      if (isWatched(watched, comment.user?.login) && (comment.created_at ?? "") > cursor && (comment.created_at ?? "") >= AUDIT_CUTOVER_ISO && comment.html_url) {
+      if (isWatched(watched, comment.user?.login) && (comment.created_at ?? "") >= cursor && (comment.created_at ?? "") >= AUDIT_CUTOVER_ISO && comment.html_url) {
         posts.push({ postUrl: comment.html_url, item: ref, authorLogin: comment.user!.login as string, createdAt: comment.created_at as string, postKind: "comment" });
       }
     }
     const reviews = await fetchReviews(fetchImpl, token, `${rest}/pulls/${ref.number}/reviews`, state, `${key}:reviews`, stats, onRateLimited, nowMs);
     if (reviews === "rate-limited" || reviews === "failed") return reviews;
     for (const review of reviews) {
-      if (isWatched(watched, review.user?.login) && (review.submitted_at ?? "") > cursor && (review.submitted_at ?? "") >= AUDIT_CUTOVER_ISO && review.html_url) {
+      if (isWatched(watched, review.user?.login) && (review.submitted_at ?? "") >= cursor && (review.submitted_at ?? "") >= AUDIT_CUTOVER_ISO && review.html_url) {
         posts.push({ postUrl: review.html_url, item: ref, authorLogin: review.user!.login as string, createdAt: review.submitted_at as string, postKind: "review" });
       }
     }
@@ -679,7 +733,10 @@ async function fetchCommentPages(
   const out: GitHubComment[] = [];
   for (let page = 1; page <= 10; page += 1) {
     const url = `${baseUrl}?since=${encodeURIComponent(cursor)}&per_page=100&page=${page}`;
-    const res = await githubGet<GitHubComment[]>(fetchImpl, token, url, page === 1 ? (state.etags[etagKey] ?? null) : null);
+    // A 304 on a full first page proves nothing about later pages, so a read
+    // that last ended on a full page is never conditional.
+    const conditional = page === 1 && !state.fullPages[etagKey] ? (state.etags[etagKey] ?? null) : null;
+    const res = await githubGet<GitHubComment[]>(fetchImpl, token, url, conditional);
     if (res.rateLimited) {
       await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
       return "rate-limited";
@@ -693,7 +750,11 @@ async function fetchCommentPages(
       return "failed";
     }
     stats.ok200 += 1;
-    if (page === 1) state.etags[etagKey] = res.etag;
+    if (page === 1) {
+      state.etags[etagKey] = res.etag;
+      if (res.data.length === 100) state.fullPages[etagKey] = true;
+      else delete state.fullPages[etagKey];
+    }
     out.push(...res.data);
     if (res.data.length < 100) break;
     if (page === 10) {
@@ -724,7 +785,8 @@ async function fetchReviews(
   const out: GitHubReview[] = [];
   for (let page = 1; page <= 100; page += 1) {
     const url = page === 1 ? `${baseUrl}?per_page=100` : `${baseUrl}?per_page=100&page=${page}`;
-    const res = await githubGet<GitHubReview[]>(fetchImpl, token, url, page === 1 ? (state.etags[etagKey] ?? null) : null);
+    const conditional = page === 1 && !state.fullPages[etagKey] ? (state.etags[etagKey] ?? null) : null;
+    const res = await githubGet<GitHubReview[]>(fetchImpl, token, url, conditional);
     if (res.rateLimited) {
       await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
       return "rate-limited";
@@ -738,7 +800,11 @@ async function fetchReviews(
       return "failed";
     }
     stats.ok200 += 1;
-    if (page === 1) state.etags[etagKey] = res.etag;
+    if (page === 1) {
+      state.etags[etagKey] = res.etag;
+      if (res.data.length === 100) state.fullPages[etagKey] = true;
+      else delete state.fullPages[etagKey];
+    }
     out.push(...res.data);
     if (res.data.length < 100) break;
   }
@@ -774,7 +840,7 @@ async function judgePost(
     }
     // Spend cap: leave the post unconsumed (no card, no bookkeeping) so the
     // next tick picks it up. A create assigns an agent, so it spends both budgets.
-    if (stats.creates >= caps.maxCreates || wakesUsed(stats) >= caps.maxWakes) {
+    if (stats.creates + 1 > caps.maxCreates || wakesUsed(stats) + 1 > caps.maxWakes) {
       stats.capped += 1;
       return { post: post.postUrl, item: key, card: null, status: "capped", reason: `would create follow-through card for ${key}`, detail: "create budget exhausted, deferred to next tick" };
     }
@@ -794,7 +860,7 @@ async function judgePost(
   }
 
   const gates = allCards.filter(
-    (c) => c.parentId === card.id && c.title.startsWith(GATE_TITLE_PREFIX) && c.status === "done",
+    (c) => c.parentId === card.id && (c.title ?? "").startsWith(GATE_TITLE_PREFIX) && c.status === "done",
   );
   const postMs = Date.parse(post.createdAt);
   const approved = gates.find((g) => {
@@ -814,8 +880,10 @@ async function judgePost(
     return { post: post.postUrl, item: key, card: card.id, status: "would-flag", reason: `would flag ${post.postKind} by @${post.authorLogin} with no approved gate card` };
   }
   // Spend cap: leave the flag unwritten (no flag card, no wake, no cursor
-  // advance past this post) so the next tick picks it up.
-  if (stats.creates >= caps.maxCreates || wakesUsed(stats) >= caps.maxWakes) {
+  // advance past this post) so the next tick picks it up. Flagging costs one
+  // create plus two wake units (the assigned card's wake and the explicit
+  // requestWakeup), so both are reserved before either is spent.
+  if (stats.creates + 1 > caps.maxCreates || wakesUsed(stats) + 2 > caps.maxWakes) {
     stats.capped += 1;
     return { post: post.postUrl, item: key, card: card.id, status: "capped", reason: `would flag ${post.postKind} by @${post.authorLogin} with no approved gate card`, detail: "create/wake budget exhausted, deferred to next tick" };
   }
@@ -827,13 +895,23 @@ async function judgePost(
   const reason = gates.length === 0
     ? "no approved gate card"
     : `gate card approved after the post (${gates.map((g) => g.completedAt ?? "?").join(", ")} > ${post.createdAt})`;
-  const flagCard = await ctx.issues.create({
+  // Upstream URLs ride into assigned-card text and wake reasons, both of which
+  // an agent reads as task context. Only the post's own repo path may become
+  // a card link; anything else falls back to the constructed item URL.
+  const postUrl = safeUpstreamUrl(post.postUrl, post.item.owner, post.item.repo, itemPath(post.item));
+  // Crash-safe creation: the in-memory flag keys are only persisted at the
+  // end of the run, so a pre-create lookup by origin identity covers state
+  // loss (same pattern as the release intake cards).
+  const existing = await ctx.issues.list({ companyId, originKind: UNGATED_FLAG_ORIGIN_KIND, originId: ungatedKey(post.postUrl) });
+  const flagCard = existing[0] ?? await ctx.issues.create({
     companyId,
+    originKind: UNGATED_FLAG_ORIGIN_KIND,
+    originId: ungatedKey(post.postUrl),
     title: `Ungated upstream post: ${key}`,
     description: [
       "Flagged by togetherweown.github-upstream audit-scan: upstream post with no approved gate card.",
       "",
-      `Post: ${post.postUrl}`,
+      `Post: ${postUrl}`,
       `Item: https://github.com/${post.item.owner}/${post.item.repo} (${key})`,
       `Author: @${post.authorLogin}`,
       `Posted at: ${post.createdAt}`,
@@ -845,11 +923,11 @@ async function judgePost(
     ].join("\n"),
     assigneeAgentId: config.chiefOfStaffAgentId,
   });
-  stats.creates += 1;
+  if (!existing[0]) stats.creates += 1;
   state.flags[post.postUrl] = { item: key, cardId: flagCard.id, at: new Date(nowMs).toISOString() };
   try {
     await ctx.issues.requestWakeup(flagCard.id, companyId, {
-      reason: `ungated upstream post by @${post.authorLogin}: ${post.postUrl}`,
+      reason: `ungated upstream post by @${post.authorLogin}: ${postUrl}`,
       idempotencyKey: ungatedKey(post.postUrl),
     });
     stats.wakes += 1;
