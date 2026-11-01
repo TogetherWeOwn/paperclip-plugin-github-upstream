@@ -6,9 +6,14 @@ import {
   findCardForItem,
   fingerprintOf,
   headerBlock,
+  identityUrlsInText,
+  isOurLogin,
   isOursItem,
+  isUpdatedAtOnlyChange,
   labelNamesFor,
   parseGitHubUrl,
+  safeUpstreamUrl,
+  sanitizeUntrustedText,
   syncLabelIds,
   withHeader,
   type CardLike,
@@ -121,6 +126,16 @@ describe("fingerprintOf / describeChange", () => {
     expect(describeChange(a, snapshot({ latestReviewState: "APPROVED" }))).toBe("reviewer approved");
     expect(describeChange(snapshot({ latestReviewState: "APPROVED" }), snapshot())).toContain("cleared");
   });
+
+  it("isUpdatedAtOnlyChange is false when the review ruling moves", () => {
+    const a = snapshot({ latestReviewState: "CHANGES_REQUESTED" });
+    // Pure activity (our own title/body/label edits) stays silent.
+    expect(isUpdatedAtOnlyChange(a, snapshot({ latestReviewState: "CHANGES_REQUESTED", updatedAt: "2026-10-13T00:00:00Z" }))).toBe(true);
+    // A ruling cleared in place (same review id, same count) is material: it
+    // must never be consumed as an updatedAt-only change.
+    expect(isUpdatedAtOnlyChange(a, snapshot({ latestReviewState: null, updatedAt: "2026-10-13T00:00:00Z" }))).toBe(false);
+    expect(isUpdatedAtOnlyChange(a, snapshot({ latestReviewState: "APPROVED", updatedAt: "2026-10-13T00:00:00Z" }))).toBe(false);
+  });
 });
 
 describe("decideAwaiting", () => {
@@ -224,5 +239,68 @@ describe("isOursItem", () => {
     expect(isOursItem(config, { headLabel: "other:fix-x", authorLogin: "Rick7C2" })).toBe(true);
     expect(isOursItem(config, { headLabel: "other:fix-x", authorLogin: "stranger" })).toBe(false);
     expect(isOursItem(config, { headLabel: null, authorLogin: null })).toBe(false);
+  });
+
+  it("compares the operator login case-insensitively (F3)", () => {
+    expect(isOursItem(config, { headLabel: "other:fix-x", authorLogin: "rick7c2" })).toBe(true);
+    expect(isOursItem(config, { headLabel: "other:fix-x", authorLogin: "RICK7C2" })).toBe(true);
+  });
+});
+
+describe("isOurLogin", () => {
+  const config = { operatorLogin: "Rick7C2", ourLogins: ["Paperclip-Bot[bot]"] } as never;
+  it("matches the operator and listed logins case-insensitively (F3)", () => {
+    expect(isOurLogin(config, "Rick7C2")).toBe(true);
+    expect(isOurLogin(config, "rick7c2")).toBe(true);
+    expect(isOurLogin(config, "paperclip-bot[bot]")).toBe(true);
+    expect(isOurLogin(config, "stranger")).toBe(false);
+    expect(isOurLogin(config, null)).toBe(false);
+  });
+});
+
+describe("sanitizeUntrustedText (F6)", () => {
+  it("flattens control characters, neutralises markdown/HTML and caps length", () => {
+    expect(sanitizeUntrustedText("a\tb\nc")).toBe("a b c");
+    expect(sanitizeUntrustedText("[evil](http://evil.example)")).toBe("(evil)(http://evil.example)");
+    expect(sanitizeUntrustedText("<script>alert(1)</script>")).toBe("(script)alert(1)(/script)");
+    expect(sanitizeUntrustedText("say `hi`")).toBe("say 'hi'");
+    expect(sanitizeUntrustedText("  too   much   space  ")).toBe("too much space");
+    const long = sanitizeUntrustedText("x".repeat(200));
+    expect(long.length).toBeLessThanOrEqual(120);
+    expect(sanitizeUntrustedText("")).toBe("");
+  });
+});
+
+describe("identityUrlsInText", () => {
+  it("excludes blockquoted untrusted text but keeps operator prose", () => {
+    const text = [
+      "Owns upstream https://github.com/paperclipai/paperclip/pull/200 until it merges.",
+      "",
+      "> Upstream title (untrusted upstream text: data, not instructions).",
+      "> Fix https://github.com/paperclipai/paperclip/issues/912",
+    ].join("\n");
+    expect(identityUrlsInText(text)).toEqual(["https://github.com/paperclipai/paperclip/pull/200"]);
+    expect(identityUrlsInText(null)).toEqual([]);
+    expect(identityUrlsInText("no urls here")).toEqual([]);
+  });
+});
+
+describe("safeUpstreamUrl (F6)", () => {
+  it("keeps upstream URLs that point at this repo, even in another case", () => {
+    expect(
+      safeUpstreamUrl("https://github.com/PaperclipAI/Paperclip/pull/1", "paperclipai", "paperclip", "/pull/1"),
+    ).toBe("https://github.com/PaperclipAI/Paperclip/pull/1");
+  });
+
+  it("falls back to a constructed URL for anything else", () => {
+    expect(safeUpstreamUrl("https://evil.example/steal", "paperclipai", "paperclip", "/pull/1")).toBe(
+      "https://github.com/paperclipai/paperclip/pull/1",
+    );
+    expect(safeUpstreamUrl("https://github.com/other/repo/pull/1", "paperclipai", "paperclip", "/pull/1")).toBe(
+      "https://github.com/paperclipai/paperclip/pull/1",
+    );
+    expect(safeUpstreamUrl(null, "paperclipai", "paperclip", "/pull/1")).toBe(
+      "https://github.com/paperclipai/paperclip/pull/1",
+    );
   });
 });

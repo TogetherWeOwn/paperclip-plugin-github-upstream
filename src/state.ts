@@ -9,6 +9,8 @@ export interface RunStats {
   errors: number;
   wakes: number;
   creates: number;
+  /** Creates/wakes deferred by the per-tick spend caps (F1): left for the next tick. */
+  capped: number;
 }
 
 export const MAX_RUN_HISTORY = 50;

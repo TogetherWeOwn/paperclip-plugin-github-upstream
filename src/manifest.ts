@@ -69,8 +69,35 @@ const manifest: PaperclipPluginManifestV1 = {
     properties: {
       tokenSecretRef: {
         type: "object",
+        properties: {
+          type: { enum: ["secret_ref"] },
+          secretId: { type: "string", minLength: 1 },
+        },
+        required: ["type", "secretId"],
         description:
-          "Company secret binding for a read-only GitHub token (fine-grained PAT, public repos read-only). Never resolved values, only the ref object { type: 'secret_ref', secretId }.",
+          "Company secret binding for a read-only GitHub token (fine-grained PAT, public repos read-only). Must be the shared { type: 'secret_ref', secretId } object binding; anything else (including string refs) fails closed and the scan errors without scanning. Never a resolved value, only the ref object.",
+      },
+      appId: {
+        type: "string",
+        default: "",
+        description:
+          "GitHub App auth (preferred over tokenSecretRef): the numeric App ID, as a string. Set together with installationId and appPrivateKeySecretRef; exactly one auth mode must be set.",
+      },
+      installationId: {
+        type: "string",
+        default: "",
+        description:
+          "GitHub App auth: the numeric installation ID on the owner org, as a string. Digits only; anything else fails closed.",
+      },
+      appPrivateKeySecretRef: {
+        type: "object",
+        properties: {
+          type: { enum: ["secret_ref"] },
+          secretId: { type: "string", minLength: 1 },
+        },
+        required: ["type", "secretId"],
+        description:
+          "Company secret binding for the GitHub App's PEM private key. Must be the shared { type: 'secret_ref', secretId } object binding; resolved at call time only, never persisted or logged.",
       },
       releaseRepos: {
         type: "array",
@@ -156,6 +183,20 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         default: false,
         description: "Log intended creates/wakes/updates without making them.",
+      },
+      maxCreatesPerTick: {
+        type: "integer",
+        minimum: 0,
+        default: 2,
+        description:
+          "Per-scan-run cap on created cards (release intake plus follow-through plus discovery). Overflow is deferred to the next tick, never dropped.",
+      },
+      maxWakesPerTick: {
+        type: "integer",
+        minimum: 0,
+        default: 5,
+        description:
+          "Per-scan-run cap on wakes. A create assigns an agent, so it counts as a wake too. Overflow is deferred to the next tick, never dropped.",
       },
     },
   },
