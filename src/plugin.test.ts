@@ -47,6 +47,7 @@ describe("plugin wiring", () => {
         "secrets.read-ref",
         "plugin.state.read",
         "plugin.state.write",
+        "ui.page.register",
       ]),
     );
     const jobs = Object.fromEntries((manifest.jobs ?? []).map((j) => [j.jobKey, j.schedule]));
@@ -74,6 +75,49 @@ describe("plugin wiring", () => {
     ]) {
       expect(manifest.instanceConfigSchema?.properties).toHaveProperty(key);
     }
+  });
+
+  it("mirrors the host install's manifest/capability consistency check", async () => {
+    // The SDK's pluginManifestV1Schema does not enforce capability ↔ feature
+    // consistency for UI slots, but the host install path does
+    // (server/src/routes/plugins.ts via plugin-capability-validator:
+    // "Missing required capabilities for declared features: ...").
+    // This test replicates that check so CI catches the class of error that
+    // rejected 2ab13e1 for a missing ui.page.register. Keep REQUIRED_CAPS in
+    // sync with the host validator when slot types or capabilities change.
+    const { pluginManifestV1Schema } = await import("@paperclipai/shared");
+    const parsed = pluginManifestV1Schema.safeParse(manifest);
+    expect(parsed.success).toBe(true);
+
+    const REQUIRED_FOR_JOBS = ["jobs.schedule"];
+    const REQUIRED_UI_SLOT_CAPABILITIES: Record<string, string> = {
+      page: "ui.page.register",
+      sidebar: "ui.sidebar.register",
+      routeSidebar: "ui.sidebar.register",
+      sidebarPanel: "ui.sidebar.register",
+      projectSidebarItem: "ui.sidebar.register",
+      detailTab: "ui.detailTab.register",
+      taskDetailView: "ui.detailTab.register",
+      dashboardWidget: "ui.dashboardWidget.register",
+      commentAnnotation: "ui.commentAnnotation.register",
+      commentContextMenuItem: "ui.commentAnnotation.register",
+    };
+    const caps = new Set(manifest.capabilities);
+
+    if ((manifest.jobs ?? []).length > 0) {
+      for (const required of REQUIRED_FOR_JOBS) {
+        expect(caps.has(required as never)).toBe(true);
+      }
+    }
+    for (const slot of manifest.ui?.slots ?? []) {
+      const required = REQUIRED_UI_SLOT_CAPABILITIES[slot.type];
+      expect(required).toBeDefined();
+      expect(caps.has(required as never)).toBe(true);
+    }
+    // The declared GitHub tab is a page slot, so the host requires exactly this.
+    expect(manifest.ui?.slots?.some((s) => s.type === "page")).toBe(true);
+    expect(caps.has("ui.page.register" as never)).toBe(true);
+    expect(manifest.entrypoints.ui).toBeTruthy();
   });
 
   it("F9: the manifest requires secret_ref object bindings, never bare strings", async () => {

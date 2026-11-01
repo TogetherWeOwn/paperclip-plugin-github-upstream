@@ -16,7 +16,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "GitHub Upstream",
   description:
-    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create one release-intake card per tag, and ETag-tracked issue/PR/discussion polls wake the owning follow-through card on real change.",
+    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card for each new tag after the install baseline, and ETag-tracked issue/PR/discussion polls wake the owning follow-through card on real change.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -31,6 +31,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "secrets.read-ref",
     "plugin.state.read",
     "plugin.state.write",
+    "ui.page.register",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -53,7 +54,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: RELEASE_JOB_KEY,
       displayName: "Scan upstream releases",
       description:
-        "GET /repos/{owner}/{repo}/releases/latest with If-None-Match for each configured release repo. A 304 means do nothing; a new tag creates exactly one release-intake card.",
+        "GET /repos/{owner}/{repo}/releases/latest with If-None-Match for each configured release repo. A 304 means do nothing; a new tag after the install baseline creates exactly one release-intake card.",
       schedule: "*/10 * * * *",
     },
     {

@@ -51,6 +51,7 @@
   },
   "devDependencies": {
     "@paperclipai/plugin-sdk": "2026.1023.0",
+    "@paperclipai/shared": "2026.1023.0",
     "@types/node": "24.19.2",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
