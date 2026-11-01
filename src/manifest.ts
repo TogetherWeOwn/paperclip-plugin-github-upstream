@@ -34,6 +34,19 @@ const manifest: PaperclipPluginManifestV1 = {
   ],
   entrypoints: {
     worker: "./dist/worker.js",
+    ui: "./dist/ui",
+  },
+  ui: {
+    slots: [
+      {
+        type: "page",
+        id: "github",
+        displayName: "GitHub",
+        exportName: "GitHubUpstreamPage",
+        routePath: "github",
+        order: 1,
+      },
+    ],
   },
   jobs: [
     {

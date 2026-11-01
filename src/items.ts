@@ -3,6 +3,7 @@ import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
 import { backoffDelayMs, GITHUB_API_BASE, githubGet, githubGraphql, type FetchLike, type GitHubResult } from "./github.js";
 import {
   backfillPatch,
+  decideAwaiting,
   describeChange,
   findCardForItem,
   fingerprintOf,
@@ -86,6 +87,27 @@ interface GitHubPull {
 interface GitHubReview {
   id?: number;
   state?: string | null;
+  submitted_at?: string | null;
+  user?: { login?: string | null } | null;
+}
+
+/**
+ * Latest decisive review (highest id wins). Reads the first page at
+ * `per_page=100`, so the count and the decisive state stay consistent with
+ * each other; PRs past 100 reviews keep the newest-100 view rather than
+ * paying per-page ETag bookkeeping for the tail.
+ */
+export function latestDecisiveReview(
+  reviews: GitHubReview[] | null | undefined,
+): "APPROVED" | "CHANGES_REQUESTED" | null {
+  let latest: { id: number; state: "APPROVED" | "CHANGES_REQUESTED" } | null = null;
+  for (const review of reviews ?? []) {
+    const state = (review.state ?? "").toUpperCase();
+    if (state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
+    const id = typeof review.id === "number" ? review.id : -1;
+    if (!latest || id >= latest.id) latest = { id, state };
+  }
+  return latest?.state ?? null;
 }
 
 interface GitHubCheckRuns {
@@ -166,6 +188,11 @@ export async function runItemScan(
   }
 
   await runDiscovery(ctx, companyId, config, deps, token, children, tracked, outcomes, stats, now());
+  // Drop records for items that are no longer tracked (removed extras,
+  // deleted cards): otherwise the tab metrics count invisible items.
+  for (const key of Object.keys(next)) {
+    if (!tracked.has(key)) delete next[key];
+  }
   await ctx.state.set(stateKey(companyId, "items"), next);
   return { outcomes, stats };
 }
@@ -219,12 +246,26 @@ async function syncOneItem(
   const previous: ItemRecord = next[key] ?? { etags: {}, resolvedKind: null, fingerprint: null, wokenFingerprint: null, snapshot: null, cardId: null, checkedAt: "" };
   const etags = { ...previous.etags };
 
+  // Upgrade path: snapshots stored before latestReviewState existed carry no
+  // such key. Their reviews are refetched unconditionally once (a stored ETag
+  // would 304 forever and the field would never populate), and their stored
+  // seven-element fingerprint is renormalized below so the backfill alone
+  // never wakes the card.
+  const prevSnapshot = previous.snapshot;
+  const legacyNoReviewState =
+    prevSnapshot !== null && previous.fingerprint !== null && lacksReviewState(prevSnapshot);
+  const forceReviews = legacyNoReviewState && previous.resolvedKind !== "issue" && previous.resolvedKind !== "discussion";
+
   const fetched = await fetchSnapshot(fetchImpl, token, item, etags, stats, previous, async (untilMs) => {
     await setBackoff(ctx, companyId, untilMs);
-  }, nowMs);
+  }, nowMs, forceReviews);
   if (fetched === "rate-limited") {
     return { item: key, card: previous.cardId, status: "error", detail: "rate limited" };
   }
+
+  // Awaiting is derived from the fetched fields (never fetched separately),
+  // so it is finalized here before the fingerprint is taken.
+  fetched.snapshot.awaiting = decideAwaiting(config, fetched.snapshot);
 
   const record: ItemRecord = {
     etags,
@@ -275,31 +316,32 @@ async function syncOneItem(
     return { item: key, card: created.id, status: "created", reason: `created follow-through card for ${key}` };
   }
 
-  const changed = previous.fingerprint !== null && previous.fingerprint !== record.fingerprint;
+  // Compare against a renormalized baseline so a legacy backfill of the
+  // review field reads as no change. The normalized copy also keeps the
+  // missing key from producing a bogus "review ruling cleared" line.
+  const prevForCompare: ItemSnapshot =
+    legacyNoReviewState && prevSnapshot
+      ? { ...prevSnapshot, latestReviewState: fetched.snapshot.latestReviewState }
+      : prevSnapshot ?? snapshot;
+  const baselineFingerprint = legacyNoReviewState ? fingerprintOf(prevForCompare) : previous.fingerprint;
+  const changed = previous.fingerprint !== null && baselineFingerprint !== record.fingerprint;
   const firstSeen = previous.fingerprint === null;
-  if (changed || firstSeen) {
-    const patch: Record<string, unknown> = {};
-    const backfill = !config.dryRun ? backfillPatch(card, item) : null;
-    if (backfill) {
-      patch.originKind = backfill.originKind;
-      patch.originId = backfill.originId;
-    }
-    const desiredLabels = labelNamesFor(snapshot);
-    const currentNames = (card.labels ?? []).map((l) => l.name);
-    const { labelIds, changed: labelsChanged } = syncLabelIds(card.labelIds, currentNames, desiredLabels, config.labelIdByName);
-    if (labelsChanged) patch.labelIds = labelIds;
-    const { description, changed: headerChanged } = withHeader(card.description, snapshot);
-    if (headerChanged) patch.description = description;
-    const detail = previous.snapshot ? (describeChange(previous.snapshot, snapshot) ?? "first seen") : "first seen";
+  // A legacy record with no other change still syncs labels/header once (new
+  // awaiting facets for old cards) but never wakes for the backfill itself.
+  const upgradeSync = legacyNoReviewState && !firstSeen;
+  if (changed || firstSeen || upgradeSync) {
+    const patch = buildCardPatch(card, item, snapshot, config, config.dryRun);
+    const changeDetail = prevSnapshot ? describeChange(prevForCompare, snapshot) : null;
+    const detail = changeDetail ?? (firstSeen || !prevSnapshot ? "first seen" : "backfill review state (no upstream change)");
     if (Object.keys(patch).length > 0) {
       if (config.dryRun) {
         return { item: key, card: card.id, status: "would-wake", reason: detail, detail: "would update labels/header" };
       }
       await ctx.issues.update(card.id, patch as never, companyId);
     }
-    if (firstSeen || record.wokenFingerprint === record.fingerprint) {
+    if (firstSeen || record.wokenFingerprint === record.fingerprint || (upgradeSync && !changed)) {
       record.wokenFingerprint = record.fingerprint;
-      return { item: key, card: card.id, status: changed ? "mapped" : "unchanged", reason: detail, detail: "labels/header synced, no wake (first seen or already woken)" };
+      return { item: key, card: card.id, status: changed || upgradeSync ? "mapped" : "unchanged", reason: detail, detail: "labels/header synced, no wake (first seen or already woken)" };
     }
     if (config.dryRun) {
       return { item: key, card: card.id, status: "would-wake", reason: `upstream ${key}: ${detail}` };
@@ -341,11 +383,54 @@ async function syncOneItem(
       return { item: key, card: card.id, status: "wake-failed", reason: detail, detail: String(err) };
     }
   }
+  if (!config.dryRun && prevSnapshot && prevSnapshot.awaiting !== snapshot.awaiting) {
+    // Config or label-map drift flipped awaiting with no upstream change. The
+    // fingerprint covers upstream fields only, so sync the labels/header
+    // quietly: the card and the metric must agree, but nothing woke upstream.
+    const patch = buildCardPatch(card, item, snapshot, config, false);
+    if (Object.keys(patch).length > 0) {
+      await ctx.issues.update(card.id, patch as never, companyId);
+      const from = prevSnapshot.awaiting ?? "none";
+      const to = snapshot.awaiting ?? "none";
+      return { item: key, card: card.id, status: "mapped", reason: `awaiting ${from}->${to} (no upstream change)`, detail: `awaiting ${from}->${to} (no upstream change)` };
+    }
+  }
   if (record.wokenFingerprint === null && previous.snapshot) {
     // State predates wokenFingerprint tracking: adopt without waking.
     record.wokenFingerprint = record.fingerprint;
   }
   return { item: key, card: card?.id ?? previous.cardId, status: "unchanged" };
+}
+
+/** Records stored before latestReviewState existed carry no such key. */
+function lacksReviewState(snapshot: ItemSnapshot): boolean {
+  return (snapshot as unknown as { latestReviewState?: unknown }).latestReviewState === undefined;
+}
+
+/**
+ * Label backfill plus gh:* label and description-header sync for one card.
+ * Pure patch builder: the caller decides dry-run reporting and waking.
+ */
+function buildCardPatch(
+  card: CardLike,
+  item: TrackedItemRef & { kind: "issue" | "pull" | "discussion" },
+  snapshot: ItemSnapshot,
+  config: UpstreamConfig,
+  dryRun: boolean,
+): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const backfill = !dryRun ? backfillPatch(card, item) : null;
+  if (backfill) {
+    patch.originKind = backfill.originKind;
+    patch.originId = backfill.originId;
+  }
+  const desiredLabels = labelNamesFor(snapshot);
+  const currentNames = (card.labels ?? []).map((l) => l.name);
+  const { labelIds, changed: labelsChanged } = syncLabelIds(card.labelIds, currentNames, desiredLabels, config.labelIdByName);
+  if (labelsChanged) patch.labelIds = labelIds;
+  const { description, changed: headerChanged } = withHeader(card.description, snapshot);
+  if (headerChanged) patch.description = description;
+  return patch;
 }
 
 interface GitHubActorComment {
@@ -459,6 +544,7 @@ async function fetchSnapshot(
   previous: ItemRecord,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
+  forceReviews = false,
 ): Promise<FetchResult> {
   const kind = previous.resolvedKind ?? item.kind;
   if (kind === "discussion") {
@@ -489,9 +575,11 @@ async function fetchSnapshot(
       authorLogin: g?.user?.login ?? previous.snapshot?.authorLogin ?? null,
       headLabel: null,
       reviewCount: 0,
+      latestReviewState: null,
       checkConclusion: "none",
       headSha: null,
       draft: false,
+      awaiting: null,
     };
     return { snapshot, resolvedKind: "issue" };
   }
@@ -511,15 +599,17 @@ async function fetchSnapshot(
     authorLogin: issue?.user?.login ?? previous.snapshot?.authorLogin ?? null,
     headLabel: previous.snapshot?.headLabel ?? null,
     reviewCount: previous.snapshot?.reviewCount ?? 0,
+    latestReviewState: previous.snapshot?.latestReviewState ?? null,
     checkConclusion: previous.snapshot?.checkConclusion ?? "none",
     headSha: previous.snapshot?.headSha ?? null,
     draft: previous.snapshot?.draft ?? false,
+    awaiting: previous.snapshot?.awaiting ?? null,
   };
-  const snapshot = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs);
+  const snapshot = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs, forceReviews);
   if (!snapshot) return "rate-limited";
   if (snapshot === "not-a-pull") {
     // The origin ID guessed PR but the item is an issue: self-correct permanently.
-    const corrected: ItemSnapshot = { ...base, kind: "issue", reviewCount: 0, checkConclusion: "none", headSha: null, draft: false, headLabel: null };
+    const corrected: ItemSnapshot = { ...base, kind: "issue", reviewCount: 0, latestReviewState: null, checkConclusion: "none", headSha: null, draft: false, headLabel: null };
     return { snapshot: corrected, resolvedKind: "issue" };
   }
   return { snapshot, resolvedKind: "pull" };
@@ -574,6 +664,7 @@ async function fetchPullRest(
   base: ItemSnapshot,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
+  forceReviews = false,
 ): Promise<ItemSnapshot | "not-a-pull" | null> {
   const rest = `${GITHUB_API_BASE}/repos/${item.owner}/${item.repo}`;
   const pullRes = await conditionalGet<GitHubPull>(fetchImpl, token, `${rest}/pulls/${item.number}`, etags.pull ?? null, stats, onRateLimited, nowMs);
@@ -597,11 +688,18 @@ async function fetchPullRest(
     if (pull.title) base.title = pull.title;
     if (pull.user?.login) base.authorLogin = pull.user.login;
   }
-  const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews`, etags.reviews ?? null, stats, onRateLimited, nowMs);
+  // A forced read skips the stored ETag once (upgrade backfill): the fresh
+  // 200 still refreshes the cache, so later scans are 304s again.
+  // `per_page=100` keeps the count and the decisive state on one page (and
+  // one ETag) instead of GitHub's 30-item default.
+  const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews?per_page=100`, forceReviews ? null : (etags.reviews ?? null), stats, onRateLimited, nowMs);
   if (!reviewsRes) return null;
   if (!reviewsRes.notModified) {
     etags.reviews = reviewsRes.etag;
-    if (Array.isArray(reviewsRes.data)) base.reviewCount = reviewsRes.data.length;
+    if (Array.isArray(reviewsRes.data)) {
+      base.reviewCount = reviewsRes.data.length;
+      base.latestReviewState = latestDecisiveReview(reviewsRes.data);
+    }
   }
   // Check runs: only while checks are pending (or the head moved, or never checked).
   const checksSettled = (base.checkConclusion === "success" || base.checkConclusion === "neutral" || base.checkConclusion === "failure") && headSha === (base.headSha ?? null) && etags.checkRuns;
@@ -664,9 +762,11 @@ async function fetchDiscussion(
     authorLogin: d.author?.login ?? null,
     headLabel: null,
     reviewCount: 0,
+    latestReviewState: null,
     checkConclusion: "none",
     headSha: null,
     draft: false,
+    awaiting: null,
   };
 }
 
