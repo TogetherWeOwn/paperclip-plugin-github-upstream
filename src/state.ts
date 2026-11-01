@@ -3,7 +3,7 @@ import type { PluginContext, ScopeKey } from "@paperclipai/plugin-sdk";
 /** Per-run cost counters, so the operator can show the sync costs zero LLM and nearly zero rate limit. */
 export interface RunStats {
   at: string;
-  job: "release-scan" | "item-scan";
+  job: "release-scan" | "item-scan" | "audit-scan";
   ok200: number;
   notModified304: number;
   errors: number;

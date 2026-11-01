@@ -59,4 +59,7 @@ for (const outcome of result.releaseOutcomes) {
 for (const outcome of result.itemOutcomes) {
   console.log(JSON.stringify({ job: "item-scan", ...outcome }));
 }
+for (const outcome of result.auditOutcomes) {
+  console.log(JSON.stringify({ job: "audit-scan", ...outcome }));
+}
 console.log(JSON.stringify({ job: "stats", runs: result.stats }));

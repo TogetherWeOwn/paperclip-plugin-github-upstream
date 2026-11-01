@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { runAuditScan, type AuditOutcome } from "./audit.js";
 import { resolveConfig, type UpstreamConfig } from "./config.js";
 import { runItemScan, type ItemOutcome } from "./items.js";
 import { runReleaseScan, type ReleaseOutcome } from "./releases.js";
@@ -8,6 +9,7 @@ import type { RunStats } from "./state.js";
 export interface DryRunCard {
   id: string;
   identifier?: string | null;
+  title?: string | null;
   parentId?: string | null;
   originKind?: string | null;
   originId?: string | null;
@@ -17,6 +19,7 @@ export interface DryRunCard {
   workProducts?: Array<{ url: string | null }>;
   assigneeAgentId?: string | null;
   status?: string;
+  completedAt?: string | null;
 }
 
 export interface DryRunOptions {
@@ -35,6 +38,7 @@ export interface DryRunResult {
   config: UpstreamConfig;
   releaseOutcomes: ReleaseOutcome[];
   itemOutcomes: ItemOutcome[];
+  auditOutcomes: AuditOutcome[];
   stats: RunStats[];
   /** Every write the run wanted to make but did not. */
   intended: string[];
@@ -74,7 +78,29 @@ export async function runDryRun(options: DryRunOptions): Promise<DryRunResult> {
   const saveState = () => writeFileSync(options.statePath, `${JSON.stringify(state, null, 2)}\n`);
   const scopeKey = (input: { stateKey: string }) => `company:${options.companyId}:${input.stateKey}`;
 
-  const children = options.cards.filter((c) => (c.parentId ?? null) === trackerId);
+  // The audit matches gate cards one level below follow-through cards, so the
+  // stub subtree carries every transitive descendant (production getSubtree
+  // does the same); consumers filter to direct children where they need to.
+  const descendants: DryRunCard[] = [];
+  {
+    const byParent = new Map<string, DryRunCard[]>();
+    for (const card of options.cards) {
+      const parent = card.parentId ?? null;
+      if (parent === null) continue;
+      const group = byParent.get(parent) ?? [];
+      group.push(card);
+      byParent.set(parent, group);
+    }
+    const queue = [trackerId];
+    while (queue.length > 0) {
+      const next = byParent.get(queue.shift() as string) ?? [];
+      for (const card of next) {
+        descendants.push(card);
+        queue.push(card.id);
+      }
+    }
+  }
+  const children = descendants;
   const ctx = {
     companies: {
       list: async () => [{ id: options.companyId }],
@@ -130,7 +156,8 @@ export async function runDryRun(options: DryRunOptions): Promise<DryRunResult> {
   const fetchImpl = (url: string, init?: RequestInit) => fetch(url, init);
   const release = await runReleaseScan(ctx, options.companyId, config, { fetchImpl });
   const items = await runItemScan(ctx, options.companyId, config, { fetchImpl });
-  return { config, releaseOutcomes: release.outcomes, itemOutcomes: items.outcomes, stats: [release.stats, items.stats], intended };
+  const audit = await runAuditScan(ctx, options.companyId, config, { fetchImpl });
+  return { config, releaseOutcomes: release.outcomes, itemOutcomes: items.outcomes, auditOutcomes: audit.outcomes, stats: [release.stats, items.stats, audit.stats], intended };
 }
 
 function inferTrackerId(cards: DryRunCard[]): string {
