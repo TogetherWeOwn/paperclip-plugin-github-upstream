@@ -37,7 +37,9 @@ function itemStub(table: RouteTable): FetchStub {
     if (url === "https://api.github.com/graphql") {
       return json({ data: { repository: { discussion: table.graphqlDiscussion } } }, null);
     }
-    const entry = table.rest[url];
+    // Actor-lookup GETs carry query params (?since=, ?per_page=): match the
+    // route with the query stripped when there is no exact entry.
+    const entry = table.rest[url] ?? table.rest[url.split("?")[0]];
     if (!entry) return new Response("not found", { status: 404 });
     if (headers.get("If-None-Match") === entry.etag) {
       return new Response(null, { status: 304, headers: { etag: entry.etag } });
@@ -50,6 +52,8 @@ const issueUrl = (n: number) => `https://api.github.com/repos/${OWNER}/${REPO}/i
 const pullUrl = (n: number) => `https://api.github.com/repos/${OWNER}/${REPO}/pulls/${n}`;
 const reviewsUrl = (n: number) => `https://api.github.com/repos/${OWNER}/${REPO}/pulls/${n}/reviews`;
 const checksUrl = (sha: string) => `https://api.github.com/repos/${OWNER}/${REPO}/commits/${sha}/check-runs`;
+const commentsUrl = (n: number) => `https://api.github.com/repos/${OWNER}/${REPO}/issues/${n}/comments`;
+const commitsUrl = (n: number) => `https://api.github.com/repos/${OWNER}/${REPO}/pulls/${n}/commits`;
 
 const HEAD_SHA = "aaea1d47500112233445566778899aabbccddeeff";
 
@@ -384,6 +388,133 @@ describe("item job", () => {
     const steady = await scan(harness, trackerId, stub);
     expect(steady.outcomes[0].status).toBe("unchanged");
     expect(wakes).toHaveLength(1);
+  });
+
+  it("our own comment syncs the header but never wakes; a maintainer comment wakes", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#15158`);
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(15158)]: { etag: '"i1"', body: pullIssueRow(15158) },
+        [pullUrl(15158)]: { etag: '"p1"', body: pullRow(15158) },
+        [reviewsUrl(15158)]: { etag: '"r1"', body: [] },
+        [checksUrl(HEAD_SHA)]: { etag: '"c1"', body: checksSuccess },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const updates = spyUpdates(harness);
+    const config = { operatorLogin: "Rick7C2", ourLogins: ["paperclip-bot[bot]"] };
+
+    await scan(harness, trackerId, stub, config);
+    expect(wakes).toHaveLength(0);
+    const baselineUpdates = updates.length;
+
+    // Our own comment: the count rises, but every new actor is us.
+    table.rest[issueUrl(15158)] = {
+      etag: '"i2"',
+      body: pullIssueRow(15158, { comments: 2, updated_at: "2026-10-13T00:00:00Z" }),
+    };
+    table.rest[commentsUrl(15158)] = { etag: '"m1"', body: [{ id: 1, user: { login: "Rick7C2" } }] };
+    const own = await scan(harness, trackerId, stub, config);
+    expect(own.outcomes[0]).toMatchObject({ card: card.id, status: "mapped" });
+    expect(own.outcomes[0].detail).toContain("Rick7C2");
+    expect(own.stats.wakes).toBe(0);
+    expect(wakes).toHaveLength(0);
+    // The header still syncs: the latest update carries the new comment count.
+    expect(updates.length).toBeGreaterThan(baselineUpdates);
+    const headerPatch = updates[updates.length - 1].patch as { description?: string };
+    expect(headerPatch.description).toContain("2 comments");
+
+    // A comment by the listed bot identity is ours too.
+    table.rest[issueUrl(15158)] = {
+      etag: '"i3"',
+      body: pullIssueRow(15158, { comments: 3, updated_at: "2026-10-14T00:00:00Z" }),
+    };
+    table.rest[commentsUrl(15158)] = {
+      etag: '"m2"',
+      body: [{ id: 1, user: { login: "Rick7C2" } }, { id: 2, user: { login: "paperclip-bot[bot]" } }],
+    };
+    const bot = await scan(harness, trackerId, stub, config);
+    expect(bot.outcomes[0].status).toBe("mapped");
+    expect(wakes).toHaveLength(0);
+
+    // A maintainer comment in the same window wakes exactly once.
+    table.rest[issueUrl(15158)] = {
+      etag: '"i4"',
+      body: pullIssueRow(15158, { comments: 4, updated_at: "2026-10-15T00:00:00Z" }),
+    };
+    table.rest[commentsUrl(15158)] = {
+      etag: '"m3"',
+      body: [
+        { id: 1, user: { login: "Rick7C2" } },
+        { id: 2, user: { login: "paperclip-bot[bot]" } },
+        { id: 3, user: { login: "stranger" } },
+      ],
+    };
+    const external = await scan(harness, trackerId, stub, config);
+    expect(external.outcomes[0].status).toBe("woke");
+    expect(external.outcomes[0].reason).toContain("1 new comment");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
+  it("our own push syncs but never wakes; a stranger push wakes", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#15158`);
+    const NEW_HEAD = "bbbc2e58611223344556677889900aabbccddeeff";
+    const NEWER_HEAD = "cccd3f69722334455667788990011bbccddeeff00";
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(15158)]: { etag: '"i1"', body: pullIssueRow(15158) },
+        [pullUrl(15158)]: { etag: '"p1"', body: pullRow(15158) },
+        [reviewsUrl(15158)]: { etag: '"r1"', body: [] },
+        [checksUrl(HEAD_SHA)]: { etag: '"c1"', body: checksSuccess },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const config = { operatorLogin: "Rick7C2" };
+
+    await scan(harness, trackerId, stub, config);
+    expect(wakes).toHaveLength(0);
+
+    // We push: the head moves and every new commit is authored by us. The older
+    // stranger commit stays in the list but must not block suppression.
+    table.rest[pullUrl(15158)] = {
+      etag: '"p2"',
+      body: pullRow(15158, { head: { sha: NEW_HEAD, label: "TogetherWeOwn:fix-x" }, updated_at: "2026-10-13T00:00:00Z" }),
+    };
+    table.rest[commitsUrl(15158)] = {
+      etag: '"h1"',
+      body: [
+        { sha: HEAD_SHA, author: { login: "stranger" }, committer: { login: "stranger" } },
+        { sha: NEW_HEAD, author: { login: "Rick7C2" }, committer: { login: "Rick7C2" } },
+      ],
+    };
+    const own = await scan(harness, trackerId, stub, config);
+    expect(own.outcomes[0]).toMatchObject({ card: card.id, status: "mapped" });
+    expect(wakes).toHaveLength(0);
+
+    // Someone else pushes on top: the newest commit is theirs, so it wakes.
+    table.rest[pullUrl(15158)] = {
+      etag: '"p3"',
+      body: pullRow(15158, { head: { sha: NEWER_HEAD, label: "TogetherWeOwn:fix-x" }, updated_at: "2026-10-14T00:00:00Z" }),
+    };
+    table.rest[commitsUrl(15158)] = {
+      etag: '"h2"',
+      body: [
+        { sha: HEAD_SHA, author: { login: "stranger" }, committer: { login: "stranger" } },
+        { sha: NEW_HEAD, author: { login: "Rick7C2" }, committer: { login: "Rick7C2" } },
+        { sha: NEWER_HEAD, author: { login: "stranger" }, committer: { login: "stranger" } },
+      ],
+    };
+    const external = await scan(harness, trackerId, stub, config);
+    expect(external.outcomes[0].status).toBe("woke");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
   });
 
   it("dry-run reports intended wakes and creates without calling them", async () => {

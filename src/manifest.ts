@@ -47,7 +47,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: ITEM_JOB_KEY,
       displayName: "Scan tracked upstream items",
       description:
-        "ETag-conditional GETs for each tracked upstream issue/PR/discussion. On a real change (updated_at, comment/review count, check conclusion, head SHA, state/merged) the owning card is woken with a deterministic one-line reason.",
+        "ETag-conditional GETs for each tracked upstream issue/PR/discussion. On a real change (updated_at, comment/review count, check conclusion, head SHA, state/merged) the owning card is woken with a deterministic one-line reason. Our own comments and pushes sync labels/headers but never wake.",
       schedule: "*/15 * * * *",
     },
   ],
@@ -96,6 +96,13 @@ const manifest: PaperclipPluginManifestV1 = {
         default: "",
         description: "GitHub login of the operator; their authored issues/PRs count as ours.",
       },
+      ourLogins: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description:
+          "Extra GitHub logins that count as ours (e.g. the coming bot identity). Our own comments and pushes by these logins sync labels/headers but never wake the card.",
+      },
       extraTrackedItems: {
         type: "array",
         items: {
@@ -123,7 +130,7 @@ const manifest: PaperclipPluginManifestV1 = {
         additionalProperties: { type: "string" },
         default: {},
         description:
-          "Per-repo compare base (tag or ref) for the release card, keyed by owner/repo. Used as the left side of the compare URL.",
+          "Per-repo compare base (tag or ref) for the release card, keyed by owner/repo. Used as the left side of the compare URL. A first-seen tag equal to the base is the install baseline: recorded, never carded.",
       },
       labelIdByName: {
         type: "object",

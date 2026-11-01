@@ -8,6 +8,7 @@ import {
   fingerprintOf,
   githubUrlsInText,
   headerBlock,
+  isOurLogin,
   isOursItem,
   labelNamesFor,
   parseGitHubUrl,
@@ -303,6 +304,29 @@ async function syncOneItem(
     if (config.dryRun) {
       return { item: key, card: card.id, status: "would-wake", reason: `upstream ${key}: ${detail}` };
     }
+    // Our own upstream action (a comment we posted, a head we pushed) must not
+    // wake our own card. Dry runs skip this check (no extra GETs); the live run
+    // still suppresses. Header/label sync above always happens either way.
+    if (changed && !firstSeen && previous.snapshot) {
+      const own = await checkOwnAction({
+        fetchImpl,
+        token,
+        item,
+        config,
+        resolvedKind: fetched.resolvedKind,
+        previous: previous.snapshot,
+        next: snapshot,
+        stats,
+        onRateLimited: async (untilMs) => {
+          await setBackoff(ctx, companyId, untilMs);
+        },
+        nowMs,
+      });
+      if (own.suppressed) {
+        record.wokenFingerprint = record.fingerprint;
+        return { item: key, card: card.id, status: "mapped", reason: detail, detail: own.detail };
+      }
+    }
     try {
       await ctx.issues.requestWakeup(card.id, companyId, {
         reason: `upstream ${key}: ${detail}`,
@@ -322,6 +346,104 @@ async function syncOneItem(
     record.wokenFingerprint = record.fingerprint;
   }
   return { item: key, card: card?.id ?? previous.cardId, status: "unchanged" };
+}
+
+interface GitHubActorComment {
+  id?: number;
+  user?: { login?: string | null } | null;
+}
+
+interface GitHubActorCommit {
+  sha?: string | null;
+  author?: { login?: string | null } | null;
+  committer?: { login?: string | null } | null;
+}
+
+/**
+ * Decide whether a changed fingerprint is entirely our own upstream action (a
+ * comment we posted, a head we pushed). Only positive proof suppresses the
+ * wake: anything unattributable still wakes, so no maintainer signal is ever
+ * swallowed by our own chatter in the same window.
+ *
+ * Runs at most two extra GETs, only on a changed fingerprint (never on a 304):
+ * `issues/{n}/comments?since=<prev updatedAt>` when the comment count rose,
+ * plus `pulls/{n}/commits` when the head moved. Suppression needs at least one
+ * observed actor login and every observed actor ours (`operatorLogin` plus
+ * `ourLogins`). State changes, new reviews, removed comments, check drift and
+ * discussions (a discussion number is not an issue number, so neither endpoint
+ * applies) always wake.
+ */
+async function checkOwnAction(params: {
+  fetchImpl: FetchLike;
+  token: string;
+  item: TrackedItemRef;
+  config: UpstreamConfig;
+  resolvedKind: "issue" | "pull" | "discussion";
+  previous: ItemSnapshot;
+  next: ItemSnapshot;
+  stats: RunStats;
+  onRateLimited: (untilMs: number) => Promise<void>;
+  nowMs: number;
+}): Promise<{ suppressed: boolean; detail: string }> {
+  const { fetchImpl, token, item, config, resolvedKind, previous, next, stats, onRateLimited, nowMs } = params;
+  const wake = (detail: string) => ({ suppressed: false as const, detail });
+
+  if (previous.state !== next.state) return wake("state changed, always wakes");
+  if (previous.reviewCount !== next.reviewCount) return wake("reviews changed, always wakes");
+  if (next.commentCount < previous.commentCount) return wake("comments removed, always wakes");
+  if (resolvedKind === "discussion") return wake("discussions have no actor endpoint");
+  const commentsRose = next.commentCount > previous.commentCount;
+  const headMoved = (previous.headSha ?? null) !== (next.headSha ?? null);
+  if (!commentsRose && !headMoved) return wake("no attributable change");
+
+  const actors = new Map<string, string>();
+  const rest = `${GITHUB_API_BASE}/repos/${item.owner}/${item.repo}`;
+
+  if (commentsRose) {
+    if (!previous.updatedAt) return wake("no previous timestamp for comment attribution");
+    const url = `${rest}/issues/${item.number}/comments?since=${encodeURIComponent(previous.updatedAt)}&per_page=100`;
+    const res = await githubGet<GitHubActorComment[]>(fetchImpl, token, url, null);
+    if (res.rateLimited) {
+      await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
+      return wake("rate limited during actor check");
+    }
+    if (res.status !== 200 || !Array.isArray(res.data)) return wake(`comments lookup HTTP ${res.status}`);
+    stats.ok200 += 1;
+    for (const comment of res.data) {
+      const login = comment.user?.login;
+      if (login) actors.set(login.toLowerCase(), login);
+    }
+    if (actors.size === 0) return wake("new comments have no visible author");
+  }
+
+  if (headMoved) {
+    if (resolvedKind !== "pull" || !next.headSha) return wake("head changed on non-pull");
+    const url = `${rest}/pulls/${item.number}/commits?per_page=100`;
+    const res = await githubGet<GitHubActorCommit[]>(fetchImpl, token, url, null);
+    if (res.rateLimited) {
+      await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
+      return wake("rate limited during actor check");
+    }
+    if (res.status !== 200 || !Array.isArray(res.data)) return wake(`commits lookup HTTP ${res.status}`);
+    stats.ok200 += 1;
+    // Only commits after the previously seen head are new; a force-push that
+    // rewrote history falls back to the whole list.
+    const seenAt = res.data.findIndex((c) => c.sha === previous.headSha);
+    const fresh = seenAt === -1 ? res.data : res.data.slice(seenAt + 1);
+    const before = actors.size;
+    for (const commit of fresh) {
+      for (const login of [commit.author?.login, commit.committer?.login]) {
+        if (login) actors.set(login.toLowerCase(), login);
+      }
+    }
+    if (actors.size === before) return wake("new commits have no visible author");
+  }
+
+  const logins = [...actors.values()];
+  if (logins.length === 0) return wake("no actors observed");
+  const strangers = logins.filter((login) => !isOurLogin(config, login));
+  if (strangers.length > 0) return wake(`also involves @${strangers.join(", @")}`);
+  return { suppressed: true, detail: `own action by @${logins.join(", @")}, no wake (labels/header synced)` };
 }
 
 /** A fetch that hit the rate limit (caller stops the run). */

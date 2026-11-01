@@ -110,6 +110,46 @@ describe("release job", () => {
     expect(result.stats.creates).toBe(0);
   });
 
+  it("first sight at the compare base records the baseline and creates no card", async () => {
+    const backing: Record<string, { etag: string; body: Record<string, unknown> }> = {
+      "router-for-me/CLIProxyAPI": { etag: '"b1"', body: releaseBody("v8.0.51") },
+    };
+    const { stub } = releaseStub(backing);
+    harness.ctx.http.fetch = stub;
+    const base = { compareBases: { "router-for-me/CLIProxyAPI": "v8.0.51" } };
+
+    // A dry run first reports the baseline without recording or carding it.
+    const dry = await scan(harness, stub, { ...base, dryRun: true });
+    expect(dry.outcomes).toEqual([
+      { repo: "router-for-me/CLIProxyAPI", status: "already-created", tag: "v8.0.51", detail: expect.stringContaining("baseline") },
+    ]);
+    expect(dry.stats.creates).toBe(0);
+
+    // The live run records the baseline instead of carding the running version.
+    const first = await scan(harness, stub, base);
+    expect(first.outcomes[0]).toMatchObject({ status: "already-created", tag: "v8.0.51" });
+    expect(first.stats.creates).toBe(0);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND })).toHaveLength(0);
+
+    // Still the baseline on a 304: no late card either.
+    const steady = await scan(harness, stub, base);
+    expect(steady.outcomes).toEqual([{ repo: "router-for-me/CLIProxyAPI", status: "not-modified", tag: "v8.0.51" }]);
+    expect(steady.stats.creates).toBe(0);
+
+    // A newer tag than the base still creates exactly one card.
+    backing["router-for-me/CLIProxyAPI"] = { etag: '"b2"', body: releaseBody("v8.0.52") };
+    const next = await scan(harness, stub, base);
+    expect(next.outcomes).toEqual([{ repo: "router-for-me/CLIProxyAPI", status: "created", tag: "v8.0.52" }]);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND })).toHaveLength(1);
+  });
+
+  it("a first-seen tag newer than the compare base still creates a card", async () => {
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"n1"', body: releaseBody("v8.0.52") } });
+    harness.ctx.http.fetch = stub;
+    const result = await scan(harness, stub, { compareBases: { "router-for-me/CLIProxyAPI": "v8.0.51" } });
+    expect(result.outcomes).toEqual([{ repo: "router-for-me/CLIProxyAPI", status: "created", tag: "v8.0.52" }]);
+  });
+
   it("dry-run logs the intended create without creating, then the real run creates it", async () => {
     const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"v4"', body: releaseBody("v8.0.53") } });
     harness.ctx.http.fetch = stub;

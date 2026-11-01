@@ -142,6 +142,14 @@ async function ensureReleaseCard(
   if (!tag) return { repo: key, status: "error", tag, detail: "no tag recorded" };
   const originId = releaseKey(owner, repo, tag);
   if (record.createdTag === tag) return { repo: key, status: "already-created", tag };
+  // First-install baseline: the tag we already run (compareBases) is not a new
+  // release. Record it as created so neither this run nor the later 304
+  // refetch path ever creates an intake card for it. A newer tag than the base
+  // still creates a card, as before. Dry runs report but never record.
+  if (config.compareBases[key] === tag) {
+    if (!config.dryRun) record.createdTag = tag;
+    return { repo: key, status: "already-created", tag, detail: `baseline ${tag} matches compareBases, no card` };
+  }
   if (config.dryRun) {
     return { repo: key, status: "would-create", tag, detail: `would create card originId ${originId}` };
   }

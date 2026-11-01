@@ -214,3 +214,15 @@ export function isOursItem(
   if (config.operatorLogin && item.authorLogin === config.operatorLogin) return true;
   return false;
 }
+
+/**
+ * A GitHub actor login counts as ours when it is the operator or a listed
+ * `ourLogins` entry (e.g. the coming bot identity). Compared case-insensitively:
+ * GitHub logins are case-preserving but not case-sensitive.
+ */
+export function isOurLogin(config: UpstreamConfig, login: string | null | undefined): boolean {
+  if (!login) return false;
+  const lower = login.toLowerCase();
+  if (config.operatorLogin && config.operatorLogin.toLowerCase() === lower) return true;
+  return config.ourLogins.some((l) => l.toLowerCase() === lower);
+}

@@ -16,6 +16,8 @@ export interface UpstreamConfig {
   followThroughAssigneeAgentId: string;
   ourHeadPrefixes: string[];
   operatorLogin: string;
+  /** Extra GitHub logins that count as ours (e.g. a bot identity). */
+  ourLogins: string[];
   extraTrackedItems: TrackedItemRef[];
   discoveryQueries: string[];
   compareBases: Record<string, string>;
@@ -79,6 +81,7 @@ export function resolveConfig(raw: Record<string, unknown>): UpstreamConfig {
       return prefixes.length > 0 ? prefixes : [...DEFAULT_HEAD_PREFIXES];
     })(),
     operatorLogin: typeof raw.operatorLogin === "string" ? raw.operatorLogin.trim() : "",
+    ourLogins: stringArray(raw.ourLogins),
     extraTrackedItems: extra,
     discoveryQueries: stringArray(raw.discoveryQueries),
     compareBases: stringMap(raw.compareBases),

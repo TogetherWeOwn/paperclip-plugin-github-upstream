@@ -57,6 +57,7 @@ describe("plugin wiring", () => {
       "followThroughAssigneeAgentId",
       "ourHeadPrefixes",
       "operatorLogin",
+      "ourLogins",
       "extraTrackedItems",
       "discoveryQueries",
       "compareBases",

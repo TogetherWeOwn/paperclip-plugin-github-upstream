@@ -11,6 +11,8 @@ Two scheduled jobs do all the noticing:
 
 A real change is one of: `updated_at`, comment count, review count, check conclusion, head SHA, `state`/`merged`, draft flag. Labels (`gh:repo/*`, `gh:type/*`, `gh:state/*`, `gh:ci/*`) and a `<!-- github-upstream: … -->` description header are synced on change.
 
+Our own upstream actions never wake our own card: on a changed fingerprint (never on a `304`) the plugin makes one extra `GET` for the latest actor — `issues/{n}/comments?since=<previous updatedAt>` when the comment count rose, plus `pulls/{n}/commits` when the head moved. If every observed actor is ours (`operatorLogin` plus `ourLogins`), the fingerprint is recorded as woken and the card stays asleep; the header and labels still sync. Anything unattributable still wakes — state changes, new reviews, removed comments, check drift, and discussions (a discussion number is not an issue number, so neither endpoint applies). A check re-run on the same head is not detected while checks are settled; that is acceptable.
+
 ## Card mapping
 
 An upstream item maps to a card by `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL work product, then by a GitHub URL in the description (the shape most existing follow-through cards are in). Cards found by URL get `originKind`/`originId` backfilled. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
@@ -31,9 +33,10 @@ Every REST read is ETag-conditional: unchanged answers are `304`s that cost no q
 | `followThroughAssigneeAgentId` | Software Engineer 1 | Default owner of newly created follow-through cards. |
 | `ourHeadPrefixes` | `["TogetherWeOwn:"]` | PR head labels that count as ours. |
 | `operatorLogin` | `""` | GitHub login of the operator; their authored items count as ours. |
+| `ourLogins` | `[]` | Extra GitHub logins that count as ours (e.g. the coming bot identity). |
 | `extraTrackedItems` | `[]` | Upstream items to track in addition to the tracker subtree. |
 | `discoveryQueries` | `[]` | Issue-search queries for discovering new ours items (hourly at most). Empty disables discovery. |
-| `compareBases` | `{}` | Per-repo compare base for release cards, keyed by `owner/repo`. |
+| `compareBases` | `{}` | Per-repo compare base for release cards, keyed by `owner/repo`. A first-seen tag equal to the base is the install baseline: recorded, never carded. Set it to the running versions at install so the first tick creates no intake cards. |
 | `labelIdByName` | `{}` | Paperclip label IDs keyed by name. Only names present here can be synced (there is no labels read API). |
 | `dryRun` | `false` | Log intended creates/wakes/updates without making them. |
 
