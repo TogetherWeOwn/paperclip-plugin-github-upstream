@@ -3,7 +3,7 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 import manifest, { ITEM_ORIGIN_KIND } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
-import { runItemScan } from "./items.js";
+import { latestDecisiveReview, runItemScan } from "./items.js";
 
 const COMPANY = "c-1";
 const OWNER = "paperclipai";
@@ -517,6 +517,57 @@ describe("item job", () => {
     expect(wakes[0].issueId).toBe(card.id);
   });
 
+  it("a maintainer change request flips awaiting to us, syncs the label, and wakes", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#800`);
+    const ids = {
+      "gh:repo/paperclip": "L-repo",
+      "gh:type/pr": "L-type",
+      "gh:state/open": "L-state",
+      "gh:ci/green": "L-ci",
+      "gh:awaiting/maintainer": "L-wm",
+      "gh:awaiting/us": "L-wu",
+    };
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(800)]: { etag: '"i800"', body: pullIssueRow(800) },
+        [pullUrl(800)]: { etag: '"p800"', body: pullRow(800, { head: { sha: HEAD_SHA, label: "TogetherWeOwn:fix-x" } }) },
+        [reviewsUrl(800)]: { etag: '"r800a"', body: [] },
+        [checksUrl(HEAD_SHA)]: { etag: '"c800"', body: checksSuccess },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const updates = spyUpdates(harness);
+    const config = { labelIdByName: ids };
+
+    await scan(harness, trackerId, stub, config);
+    expect(wakes).toHaveLength(0);
+    // First sight of our unruled PR: awaiting maintainer.
+    const firstPatch = updates[updates.length - 1].patch as { labelIds?: string[] };
+    expect(firstPatch.labelIds).toContain("L-wm");
+    expect(firstPatch.labelIds).not.toContain("L-wu");
+
+    // Maintainer requests changes: same comment count, but the latest review
+    // state flips and the card wakes with a deterministic reason.
+    table.rest[reviewsUrl(800)] = {
+      etag: '"r800b"',
+      body: [{ id: 9, state: "CHANGES_REQUESTED", user: { login: "maintainer" } }],
+    };
+    const changed = await scan(harness, trackerId, stub, config);
+    expect(changed.outcomes[0].status).toBe("woke");
+    expect(changed.outcomes[0].reason).toContain("reviewer requested changes");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+    const patch = updates[updates.length - 1].patch as { labelIds?: string[] };
+    expect(patch.labelIds).toContain("L-wu");
+    expect(patch.labelIds).not.toContain("L-wm");
+
+    const stored = harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }) as Record<string, { snapshot: { awaiting: string } }>;
+    expect(stored[`${OWNER}/${REPO}#800`].snapshot.awaiting).toBe("us");
+  });
+
   it("dry-run reports intended wakes and creates without calling them", async () => {
     const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#15158`);
     const table: RouteTable = {
@@ -572,5 +623,25 @@ describe("item job", () => {
     const live = await scan(harness, trackerId, stub);
     expect(live.outcomes.find((o) => o.item === `${OWNER}/${REPO}#15158`)?.status).toBe("woke");
     expect(wakes).toHaveLength(1);
+  });
+});
+
+describe("latestDecisiveReview", () => {
+  it("picks the newest decisive review and ignores comments", () => {
+    expect(latestDecisiveReview([])).toBeNull();
+    expect(latestDecisiveReview([{ id: 1, state: "COMMENTED" }])).toBeNull();
+    expect(
+      latestDecisiveReview([
+        { id: 1, state: "CHANGES_REQUESTED" },
+        { id: 2, state: "COMMENTED" },
+        { id: 3, state: "approved" },
+      ]),
+    ).toBe("APPROVED");
+    expect(
+      latestDecisiveReview([
+        { id: 5, state: "APPROVED" },
+        { id: 6, state: "changes_requested" },
+      ]),
+    ).toBe("CHANGES_REQUESTED");
   });
 });

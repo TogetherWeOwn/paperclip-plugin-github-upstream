@@ -38,7 +38,9 @@
     "releases"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "npm run build:worker && npm run build:ui",
+    "build:worker": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build:ui": "node scripts/build-ui.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
@@ -50,6 +52,11 @@
   "devDependencies": {
     "@paperclipai/plugin-sdk": "2026.1023.0",
     "@types/node": "24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "5.9.3",
     "vitest": "4.1.12"
   },

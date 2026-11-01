@@ -3,6 +3,7 @@ import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
 import { backoffDelayMs, GITHUB_API_BASE, githubGet, githubGraphql, type FetchLike, type GitHubResult } from "./github.js";
 import {
   backfillPatch,
+  decideAwaiting,
   describeChange,
   findCardForItem,
   fingerprintOf,
@@ -86,6 +87,22 @@ interface GitHubPull {
 interface GitHubReview {
   id?: number;
   state?: string | null;
+  submitted_at?: string | null;
+  user?: { login?: string | null } | null;
+}
+
+/** Latest decisive review (highest id wins; page-local, matching the count source). */
+export function latestDecisiveReview(
+  reviews: GitHubReview[] | null | undefined,
+): "APPROVED" | "CHANGES_REQUESTED" | null {
+  let latest: { id: number; state: "APPROVED" | "CHANGES_REQUESTED" } | null = null;
+  for (const review of reviews ?? []) {
+    const state = (review.state ?? "").toUpperCase();
+    if (state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
+    const id = typeof review.id === "number" ? review.id : -1;
+    if (!latest || id >= latest.id) latest = { id, state };
+  }
+  return latest?.state ?? null;
 }
 
 interface GitHubCheckRuns {
@@ -225,6 +242,10 @@ async function syncOneItem(
   if (fetched === "rate-limited") {
     return { item: key, card: previous.cardId, status: "error", detail: "rate limited" };
   }
+
+  // Awaiting is derived from the fetched fields (never fetched separately),
+  // so it is finalized here before the fingerprint is taken.
+  fetched.snapshot.awaiting = decideAwaiting(config, fetched.snapshot);
 
   const record: ItemRecord = {
     etags,
@@ -489,9 +510,11 @@ async function fetchSnapshot(
       authorLogin: g?.user?.login ?? previous.snapshot?.authorLogin ?? null,
       headLabel: null,
       reviewCount: 0,
+      latestReviewState: null,
       checkConclusion: "none",
       headSha: null,
       draft: false,
+      awaiting: null,
     };
     return { snapshot, resolvedKind: "issue" };
   }
@@ -511,15 +534,17 @@ async function fetchSnapshot(
     authorLogin: issue?.user?.login ?? previous.snapshot?.authorLogin ?? null,
     headLabel: previous.snapshot?.headLabel ?? null,
     reviewCount: previous.snapshot?.reviewCount ?? 0,
+    latestReviewState: previous.snapshot?.latestReviewState ?? null,
     checkConclusion: previous.snapshot?.checkConclusion ?? "none",
     headSha: previous.snapshot?.headSha ?? null,
     draft: previous.snapshot?.draft ?? false,
+    awaiting: previous.snapshot?.awaiting ?? null,
   };
   const snapshot = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs);
   if (!snapshot) return "rate-limited";
   if (snapshot === "not-a-pull") {
     // The origin ID guessed PR but the item is an issue: self-correct permanently.
-    const corrected: ItemSnapshot = { ...base, kind: "issue", reviewCount: 0, checkConclusion: "none", headSha: null, draft: false, headLabel: null };
+    const corrected: ItemSnapshot = { ...base, kind: "issue", reviewCount: 0, latestReviewState: null, checkConclusion: "none", headSha: null, draft: false, headLabel: null };
     return { snapshot: corrected, resolvedKind: "issue" };
   }
   return { snapshot, resolvedKind: "pull" };
@@ -601,7 +626,10 @@ async function fetchPullRest(
   if (!reviewsRes) return null;
   if (!reviewsRes.notModified) {
     etags.reviews = reviewsRes.etag;
-    if (Array.isArray(reviewsRes.data)) base.reviewCount = reviewsRes.data.length;
+    if (Array.isArray(reviewsRes.data)) {
+      base.reviewCount = reviewsRes.data.length;
+      base.latestReviewState = latestDecisiveReview(reviewsRes.data);
+    }
   }
   // Check runs: only while checks are pending (or the head moved, or never checked).
   const checksSettled = (base.checkConclusion === "success" || base.checkConclusion === "neutral" || base.checkConclusion === "failure") && headSha === (base.headSha ?? null) && etags.checkRuns;
@@ -664,9 +692,11 @@ async function fetchDiscussion(
     authorLogin: d.author?.login ?? null,
     headLabel: null,
     reviewCount: 0,
+    latestReviewState: null,
     checkConclusion: "none",
     headSha: null,
     draft: false,
+    awaiting: null,
   };
 }
 
