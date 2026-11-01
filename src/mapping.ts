@@ -1,5 +1,5 @@
 import type { Issue } from "@paperclipai/plugin-sdk";
-import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
+import { isValidOwnerRepo, itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
 import { ITEM_ORIGIN_KIND } from "./manifest.js";
 
 /** Deterministic view of one upstream item, built only from GitHub API fields. */
@@ -40,7 +40,8 @@ export function parseGitHubUrl(url: string): (TrackedItemRef & { kind: "issue" |
   const match = GITHUB_ITEM_RE.exec(url.trim());
   if (!match) return null;
   const [, owner, repo, section, num] = match;
-  if (!owner || !repo || !num) return null;
+  // Segments outside the owner/repo charset never steer an authenticated API call.
+  if (!owner || !repo || !num || !isValidOwnerRepo(owner, repo)) return null;
   const kind = section.toLowerCase() === "pull" ? "pull" : section.toLowerCase() === "issues" ? "issue" : "discussion";
   return { owner, repo, kind, number: Number.parseInt(num, 10) };
 }
@@ -54,9 +55,18 @@ export function githubUrlsInText(text: string): string[] {
   return text.match(URL_RE) ?? [];
 }
 
+/** Case-insensitive owner/repo comparison: GitHub names are case-preserving, not case-sensitive. */
+export const sameItemRef = (
+  a: Pick<TrackedItemRef, "owner" | "repo" | "number">,
+  b: Pick<TrackedItemRef, "owner" | "repo" | "number">,
+): boolean =>
+  a.owner.toLowerCase() === b.owner.toLowerCase() &&
+  a.repo.toLowerCase() === b.repo.toLowerCase() &&
+  a.number === b.number;
+
 const matchesItem = (url: string, item: Pick<TrackedItemRef, "owner" | "repo" | "number">): boolean => {
   const ref = parseGitHubUrl(url);
-  return !!ref && ref.owner === item.owner && ref.repo === item.repo && ref.number === item.number;
+  return !!ref && sameItemRef(ref, item);
 };
 
 /**
@@ -66,8 +76,8 @@ const matchesItem = (url: string, item: Pick<TrackedItemRef, "owner" | "repo" | 
  * item always resolves to the card that caused it to be tracked.
  */
 export function findCardForItem<T extends CardLike>(cards: T[], item: Pick<TrackedItemRef, "owner" | "repo" | "number">): T | null {
-  const originId = itemOriginId(item);
-  const byOrigin = cards.find((c) => c.originKind === ITEM_ORIGIN_KIND && c.originId === originId);
+  const originId = itemOriginId(item).toLowerCase();
+  const byOrigin = cards.find((c) => c.originKind === ITEM_ORIGIN_KIND && (c.originId ?? "").toLowerCase() === originId);
   if (byOrigin) return byOrigin;
   for (const card of cards) {
     for (const wp of card.workProducts ?? []) {
@@ -85,7 +95,7 @@ export function findCardForItem<T extends CardLike>(cards: T[], item: Pick<Track
 /** Patch that backfills originKind/originId on a card found by work product. Null when already set. */
 export function backfillPatch<T extends CardLike>(card: T, item: Pick<TrackedItemRef, "owner" | "repo" | "number">): { originKind: string; originId: string } | null {
   const originId = itemOriginId(item);
-  if (card.originKind === ITEM_ORIGIN_KIND && card.originId === originId) return null;
+  if (card.originKind === ITEM_ORIGIN_KIND && (card.originId ?? "").toLowerCase() === originId.toLowerCase()) return null;
   return { originKind: ITEM_ORIGIN_KIND, originId };
 }
 
@@ -126,6 +136,57 @@ export function describeChange(previous: ItemSnapshot, next: ItemSnapshot): stri
 }
 
 const shortSha = (sha: string | null): string => (sha ? sha.slice(0, 7) : "?");
+
+/**
+ * True when the only fingerprint field that moved is `updatedAt` (upstream
+ * touched the item without any visible change: our own title/body/label edits
+ * do exactly this). The header still syncs, but the card must never wake.
+ */
+export function isUpdatedAtOnlyChange(previous: ItemSnapshot, next: ItemSnapshot): boolean {
+  if ((previous.updatedAt ?? null) === (next.updatedAt ?? null)) return false;
+  return (
+    previous.state === next.state &&
+    previous.commentCount === next.commentCount &&
+    previous.reviewCount === next.reviewCount &&
+    previous.checkConclusion === next.checkConclusion &&
+    (previous.headSha ?? null) === (next.headSha ?? null) &&
+    previous.draft === next.draft
+  );
+}
+
+const CONTROL_OR_DEL = (ch: string): boolean => {
+  const code = ch.charCodeAt(0);
+  return code < 32 || code === 127;
+};
+
+/**
+ * Render untrusted upstream text (PR titles, tags) safe for card bodies:
+ * single-line, no control characters, markdown links/images and inline HTML
+ * neutralised, capped at roughly 120 characters.
+ */
+export function sanitizeUntrustedText(text: string, maxLength = 120): string {
+  const flat = [...text].map((ch) => (CONTROL_OR_DEL(ch) ? " " : ch)).join("");
+  const neutral = flat.replace(/\[/g, "(").replace(/\]/g, ")").replace(/`/g, "'").replace(/</g, "(").replace(/>/g, ")");
+  const collapsed = neutral.replace(/\s+/g, " ").trim();
+  return collapsed.length > maxLength ? collapsed.slice(0, maxLength).trimEnd() : collapsed;
+}
+
+/**
+ * Use an upstream-provided URL only when it points at the expected
+ * `github.com/{owner}/{repo}/` path (compared case-insensitively); otherwise
+ * fall back to a constructed URL. Upstream fields are editable by maintainers
+ * and must never steer card links (or prompt context) elsewhere.
+ */
+export function safeUpstreamUrl(
+  provided: string | null | undefined,
+  owner: string,
+  repo: string,
+  fallbackPath: string,
+): string {
+  const prefix = `https://github.com/${owner.toLowerCase()}/${repo.toLowerCase()}/`;
+  if (typeof provided === "string" && provided.toLowerCase().startsWith(prefix)) return provided;
+  return `https://github.com/${owner}/${repo}${fallbackPath}`;
+}
 
 /** Label names kept in sync on each card. */
 export function labelNamesFor(snapshot: ItemSnapshot): string[] {
@@ -189,12 +250,16 @@ export function headerBlock(snapshot: ItemSnapshot): string {
   ].join("\n");
 }
 
-/** Replace the header block, preserving everything the card owner wrote below it. */
+/**
+ * Replace the header block, preserving everything the card owner wrote below
+ * it. The open marker matches case-insensitively so headers written before
+ * the key-casing fix are replaced, not duplicated.
+ */
 export function withHeader(description: string | null | undefined, snapshot: ItemSnapshot): { description: string; changed: boolean } {
   const block = headerBlock(snapshot);
   const current = description ?? "";
   const open = headerOpenFor(snapshot);
-  const start = current.indexOf(open);
+  const start = current.toLowerCase().indexOf(open.toLowerCase());
   if (start === -1) {
     const next = current.length > 0 ? `${block}\n\n${current}` : `${block}\n`;
     return { description: next, changed: true };
@@ -205,13 +270,17 @@ export function withHeader(description: string | null | undefined, snapshot: Ite
   return { description: next, changed: next !== current };
 }
 
-/** A PR/issue counts as ours when its head or author matches the configured identity. */
+/**
+ * A PR/issue counts as ours when its head or author matches the configured
+ * identity. The author comparison is case-insensitive, like `isOurLogin`:
+ * GitHub logins are case-preserving, not case-sensitive.
+ */
 export function isOursItem(
   config: UpstreamConfig,
   item: { headLabel: string | null; authorLogin: string | null },
 ): boolean {
   if (item.headLabel && config.ourHeadPrefixes.some((p) => item.headLabel!.startsWith(p))) return true;
-  if (config.operatorLogin && item.authorLogin === config.operatorLogin) return true;
+  if (config.operatorLogin && item.authorLogin?.toLowerCase() === config.operatorLogin.toLowerCase()) return true;
   return false;
 }
 

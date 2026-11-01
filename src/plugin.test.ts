@@ -16,6 +16,7 @@ const stats = (extra: Partial<RunStats> = {}): RunStats => ({
   errors: 0,
   wakes: 0,
   creates: 0,
+  capped: 0,
   ...extra,
 });
 
@@ -25,6 +26,8 @@ async function setup(config: Record<string, unknown> = {}) {
   await plugin.definition.setup(harness.ctx);
   return harness;
 }
+
+const TOKEN_REF = { type: "secret_ref", secretId: "test-token" };
 
 const getRuns = (harness: TestHarness) =>
   harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "runs" }) as RunStats[];
@@ -51,6 +54,9 @@ describe("plugin wiring", () => {
     expect(jobs[ITEM_JOB_KEY]).toBe("*/15 * * * *");
     for (const key of [
       "tokenSecretRef",
+      "appId",
+      "installationId",
+      "appPrivateKeySecretRef",
       "releaseRepos",
       "releaseIntakeAssigneeAgentId",
       "followThroughTrackerIssueId",
@@ -63,13 +69,19 @@ describe("plugin wiring", () => {
       "compareBases",
       "labelIdByName",
       "dryRun",
+      "maxCreatesPerTick",
+      "maxWakesPerTick",
     ]) {
       expect(manifest.instanceConfigSchema?.properties).toHaveProperty(key);
     }
   });
 
   it("runs the release scan through the registered job and records per-run stats", async () => {
-    const harness = await setup({ releaseRepos: ["router-for-me/CLIProxyAPI"] });
+    const harness = await setup({ tokenSecretRef: TOKEN_REF, releaseRepos: ["router-for-me/CLIProxyAPI"] });
+    // Seed a prior baseline so the first run sees a *new* tag and creates the card.
+    await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "releases" }, {
+      "router-for-me/cliproxyapi": { etag: '"old"', tag: "v8.0.0", createdTag: "v8.0.0", checkedAt: new Date(0).toISOString() },
+    });
     let etag = '"w1"';
     harness.ctx.http.fetch = (async (url: string, init?: RequestInit) => {
       if (new Headers(init?.headers).get("If-None-Match") === etag) {
@@ -102,7 +114,7 @@ describe("plugin wiring", () => {
       originId: "paperclipai/paperclip#9",
     });
     void card;
-    harness.setConfig({ followThroughTrackerIssueId: tracker.id, dryRun: true });
+    harness.setConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: tracker.id, dryRun: true });
     let calls = 0;
     for (const method of ["create", "update", "requestWakeup"] as const) {
       const orig = (harness.ctx.issues[method] as (...args: never[]) => Promise<never>).bind(harness.ctx.issues);
@@ -132,6 +144,7 @@ describe("plugin wiring", () => {
     const harness = await setup();
     const tracker = await harness.ctx.issues.create({ companyId: COMPANY, title: "tracker" });
     const config = resolveConfig({
+      tokenSecretRef: TOKEN_REF,
       followThroughTrackerIssueId: tracker.id,
       extraTrackedItems: [{ owner: "paperclipai", repo: "paperclip", kind: "issue", number: 11 }],
     });
@@ -155,6 +168,13 @@ describe("plugin wiring", () => {
       { item: "paperclipai/paperclip#11", card: null, status: "skipped-backoff" },
     ]);
     expect(fetched).toBe(false);
+  });
+
+  it("skips companies with no plugin config row (fail closed, no runs recorded)", async () => {
+    const harness = await setup();
+    await harness.runJob(RELEASE_JOB_KEY);
+    await harness.runJob(ITEM_JOB_KEY);
+    expect(getRuns(harness) ?? []).toHaveLength(0);
   });
 
   it("run history is bounded", async () => {

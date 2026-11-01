@@ -25,7 +25,12 @@ export interface GitHubResult<T> {
   rateResetAt: number | null;
   /** Retry-After as milliseconds, if the response says. */
   retryAfterMs: number | null;
-  /** True when the response signals rate limiting (429, or 403 with no budget left). */
+  /**
+   * True when the response signals rate limiting: a 429, a 403 with no budget
+   * left, or a 403 that carries an explicit Retry-After. GitHub sends
+   * `x-ratelimit-used` on every response, so a bare 403 (no access, deleted
+   * repo) must NOT back off the whole company.
+   */
   rateLimited: boolean;
 }
 
@@ -67,7 +72,7 @@ function toResult<T>(res: Response, data: T | null, etag: string | null): GitHub
   const resetAt = toInt(firstHeader(res.headers, "x-ratelimit-reset"));
   const retryAfterSec = toInt(firstHeader(res.headers, "retry-after"));
   const rateLimited =
-    res.status === 429 || (res.status === 403 && (remaining === 0 || firstHeader(res.headers, "x-ratelimit-used") !== null));
+    res.status === 429 || (res.status === 403 && (remaining === 0 || retryAfterSec !== null));
   return {
     status: res.status,
     notModified: res.status === 304,
@@ -82,8 +87,9 @@ function toResult<T>(res: Response, data: T | null, etag: string | null): GitHub
 
 /**
  * ETag-conditional GET. `etag` may be null (unconditional). The token is sent
- * as a Bearer header and never logged. Throws only on network failure or a
- * disallowed URL; HTTP error statuses are returned for the caller to record.
+ * as a Bearer header and never logged. Redirects are refused outright so the
+ * `Authorization` header can never follow one. Throws only on network failure
+ * or a disallowed URL; HTTP error statuses are returned for the caller to record.
  */
 export async function githubGet<T>(
   fetchImpl: FetchLike,
@@ -99,9 +105,20 @@ export async function githubGet<T>(
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (etag) headers["If-None-Match"] = etag;
-  const res = await fetchImpl(url, { method: "GET", headers });
+  const res = await fetchImpl(url, { method: "GET", headers, redirect: "error" });
   if (res.status === 304) return toResult<T>(res, null, etag);
   return toResult<T>(res, await parseJson<T>(res), firstHeader(res.headers, "etag"));
+}
+
+export interface GraphqlError {
+  message: string;
+  /** e.g. "RATE_LIMITED" on a 200 response that hit the secondary limit. */
+  type?: string;
+}
+
+/** True when a GraphQL 200 carries a rate-limit error payload. */
+export function isGraphqlRateLimited(errors: Array<GraphqlError> | null | undefined): boolean {
+  return !!errors?.some((e) => e.type === "RATE_LIMITED");
 }
 
 /** GraphQL POST for discussions (the GraphQL API has no 304 path). */
@@ -110,7 +127,7 @@ export async function githubGraphql<T>(
   token: string,
   query: string,
   variables: Record<string, unknown>,
-): Promise<{ data: T | null; errors: Array<{ message: string }> | null; status: number }> {
+): Promise<{ data: T | null; errors: Array<GraphqlError> | null; status: number }> {
   assertAllowedUrl(`${GITHUB_API_BASE}/graphql`);
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -122,8 +139,9 @@ export async function githubGraphql<T>(
     method: "POST",
     headers,
     body: JSON.stringify({ query, variables }),
+    redirect: "error",
   });
-  const body = await parseJson<{ data?: T | null; errors?: Array<{ message: string }> }>(res);
+  const body = await parseJson<{ data?: T | null; errors?: Array<GraphqlError> }>(res);
   return { data: body?.data ?? null, errors: body?.errors ?? null, status: res.status };
 }
 

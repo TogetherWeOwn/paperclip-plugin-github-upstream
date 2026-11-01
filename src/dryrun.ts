@@ -49,7 +49,15 @@ export interface DryRunResult {
  */
 export async function runDryRun(options: DryRunOptions): Promise<DryRunResult> {
   const trackerId = options.trackerId ?? inferTrackerId(options.cards);
-  const config = resolveConfig({ ...options.config, dryRun: true, followThroughTrackerIssueId: trackerId });
+  // Fail-closed scans require an explicit secret_ref binding; the dry-run CLI
+  // always carries an explicit token, so bind it. The stub resolve() below
+  // returns that token for any ref.
+  const config = resolveConfig({
+    ...options.config,
+    dryRun: true,
+    followThroughTrackerIssueId: trackerId,
+    tokenSecretRef: options.config.tokenSecretRef ?? { type: "secret_ref", secretId: "dry-run" },
+  });
   const intended: string[] = [];
 
   let state: Record<string, unknown> = {};
