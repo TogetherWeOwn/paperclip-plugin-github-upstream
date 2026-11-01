@@ -28,6 +28,14 @@ import { isBackedOff, setBackoff, stateKey, type RunStats } from "./state.js";
 /** Backfill cutover: posts older than this are covered by TWO-810…TWO-818. */
 export const AUDIT_CUTOVER_ISO = "2026-11-02T00:00:00Z";
 
+/**
+ * Search-watermark overlap: the watermark advances to the scan *start* minus
+ * this window, so posts created during the scan (or slow to appear in the
+ * search index) are re-examined next run. Re-examination is safe: per-item
+ * cursors and flag keys make reruns idempotent.
+ */
+export const SCAN_OVERLAP_MS = 5 * 60 * 1000;
+
 /** Label applied to the follow-through card of an ungated post. */
 export const UNGATED_LABEL_NAME = "upstream:ungated";
 
@@ -150,7 +158,8 @@ export async function runAuditScan(
   deps: AuditDeps,
 ): Promise<{ outcomes: AuditOutcome[]; stats: RunStats }> {
   const now = deps.now ?? Date.now;
-  const stats: RunStats = { at: new Date(now()).toISOString(), job: "audit-scan", ok200: 0, notModified304: 0, errors: 0, wakes: 0, creates: 0 };
+  const startMs = now();
+  const stats: RunStats = { at: new Date(startMs).toISOString(), job: "audit-scan", ok200: 0, notModified304: 0, errors: 0, wakes: 0, creates: 0 };
   const outcomes: AuditOutcome[] = [];
   const token = await resolveToken(ctx, companyId, config);
   const watched = watchedLogins(config);
@@ -195,12 +204,17 @@ export async function runAuditScan(
   };
 
   const searchCursor = state.lastSearchAt ?? AUDIT_CUTOVER_ISO;
-  const candidates = await collectCandidates(deps.fetchImpl, token, config, searchCursor, stats,
+  const collected = await collectCandidates(deps.fetchImpl, token, config, searchCursor, stats,
     async (untilMs) => onRateLimited(untilMs), now());
-  if (candidates === "rate-limited") {
+  if (collected === "rate-limited") {
     outcomes.push({ post: "-", item: "-", card: null, status: "error", detail: "rate limited" });
     return { outcomes, stats };
   }
+  // Any failed read makes the run incomplete: the search watermark is held so
+  // unseen posts stay in next run's window. Completed-item progress (cursors,
+  // ETags, flags) is still persisted so processed posts are never double-flagged.
+  let incomplete = collected.incomplete;
+  const candidates = collected.refs;
 
   let aborted = false;
   for (const ref of candidates.values()) {
@@ -209,32 +223,63 @@ export async function runAuditScan(
       aborted = true;
       break;
     }
+    // Snapshot this item's ETags: a failed item must retry with its old ETags,
+    // otherwise a 304 would hide the posts it never finished processing.
+    const key = itemKey(ref);
+    const etagSnapshot: Record<string, string | null> = {};
+    for (const k of Object.keys(state.etags)) {
+      if (k.startsWith(`${key}:`)) etagSnapshot[k] = state.etags[k];
+    }
+    const restoreEtags = (): void => {
+      for (const k of Object.keys(state.etags)) {
+        if (k.startsWith(`${key}:`) && !(k in etagSnapshot)) delete state.etags[k];
+      }
+      for (const [k, v] of Object.entries(etagSnapshot)) state.etags[k] = v;
+    };
     try {
       const itemOutcomes = await processItem(ctx, companyId, config, deps.fetchImpl, token, watched, ref, directChildren, allCards, state, stats,
         async (untilMs) => onRateLimited(untilMs), now());
       outcomes.push(...itemOutcomes);
-      if (itemOutcomes.some((o) => o.status === "error" && o.detail === "rate limited")) {
-        aborted = true;
-        break;
+      if (itemOutcomes.some((o) => o.status === "error")) {
+        incomplete = true;
+        restoreEtags();
+        if (itemOutcomes.some((o) => o.detail === "rate limited")) {
+          aborted = true;
+          break;
+        }
       }
     } catch (err) {
+      incomplete = true;
+      restoreEtags();
       stats.errors += 1;
-      outcomes.push({ post: "-", item: itemKey(ref), card: null, status: "error", detail: String(err) });
+      outcomes.push({ post: "-", item: key, card: null, status: "error", detail: String(err) });
     }
   }
 
-  if (!config.dryRun && !aborted) {
-    state.lastSearchAt = new Date(now()).toISOString();
+  if (!config.dryRun) {
+    if (!aborted && !incomplete) {
+      state.lastSearchAt = new Date(startMs - SCAN_OVERLAP_MS).toISOString();
+    }
     await ctx.state.set(stateKey(companyId, "audit"), state);
   }
   return { outcomes, stats };
+}
+
+/** A read that can fail without rate limiting (5xx, malformed body, …). */
+type ReadResult<T> = T | "rate-limited" | "failed";
+
+interface SearchResult {
+  refs: Array<TrackedItemRef & { kind: "issue" | "pull" | "discussion" }>;
+  /** True when the search errored or overflowed: candidates may be missing. */
+  failed: boolean;
 }
 
 /**
  * Candidate items: recent search hits for authored/commented issues and PRs
  * per configured org and repo, plus authored discussions per org. Search has
  * no pagination here (first page, updated desc): our own posts are rare, and
- * an overflowing page is recorded as an error so it stays visible.
+ * an overflowing or failed page marks the run incomplete (watermark held) so
+ * nothing is silently dropped.
  */
 async function collectCandidates(
   fetchImpl: FetchLike,
@@ -244,8 +289,9 @@ async function collectCandidates(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<Map<string, TrackedItemRef & { kind: "issue" | "pull" | "discussion" }> | "rate-limited"> {
+): Promise<{ refs: Map<string, TrackedItemRef & { kind: "issue" | "pull" | "discussion" }>; incomplete: boolean } | "rate-limited"> {
   const out = new Map<string, TrackedItemRef & { kind: "issue" | "pull" | "discussion" }>();
+  let incomplete = false;
   const logins = [...watchedLogins(config)];
   // Deterministic order: orgs, then repos, then logins.
   const scopes: string[] = [
@@ -269,15 +315,20 @@ async function collectCandidates(
           const query = `${scope} is:${kind} ${role}:${login} updated:>=${searchCursor}`;
           const found = await searchIssues(fetchImpl, token, query, stats, onRateLimited, nowMs);
           if (found === "rate-limited") return "rate-limited";
-          for (const ref of found) keep(ref);
+          if (found.failed) incomplete = true;
+          for (const ref of found.refs) keep(ref);
         }
       }
       const discussions = await searchDiscussions(fetchImpl, token, `${scope} author:${login}`, stats, onRateLimited, nowMs);
       if (discussions === "rate-limited") return "rate-limited";
-      for (const ref of discussions) keep(ref);
+      // Discussion search has no updated-since filter and caps at 20 rows, so
+      // an overflow cannot freeze the watermark (it would wedge it forever);
+      // it is surfaced as an error instead.
+      if (discussions.failed) stats.errors += 1;
+      for (const ref of discussions.refs) keep(ref);
     }
   }
-  return out;
+  return { refs: out, incomplete };
 }
 
 async function searchIssues(
@@ -287,7 +338,7 @@ async function searchIssues(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<Array<TrackedItemRef & { kind: "issue" | "pull" | "discussion" }> | "rate-limited"> {
+): Promise<SearchResult | "rate-limited"> {
   const url = `${GITHUB_API_BASE}/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=100`;
   const res = await githubGet<{ total_count?: number; items?: GitHubSearchItem[] }>(fetchImpl, token, url, null);
   if (res.rateLimited) {
@@ -296,20 +347,20 @@ async function searchIssues(
   }
   if (res.status !== 200 || !res.data) {
     stats.errors += 1;
-    return [];
+    return { refs: [], failed: true };
   }
   stats.ok200 += 1;
-  if (typeof res.data.total_count === "number" && res.data.total_count > (res.data.items ?? []).length) {
-    // First page only by design; record the overflow instead of silently dropping it.
-    stats.errors += 1;
-  }
   const out: Array<TrackedItemRef & { kind: "issue" | "pull" | "discussion" }> = [];
   for (const item of res.data.items ?? []) {
     if (!item.html_url) continue;
     const ref = parseGitHubUrl(item.html_url);
     if (ref) out.push(ref);
   }
-  return out;
+  // First page only by design; an overflow (or any failure) marks the run
+  // incomplete so the watermark is held instead of silently dropping items.
+  const failed = typeof res.data.total_count === "number" && res.data.total_count > (res.data.items ?? []).length;
+  if (failed) stats.errors += 1;
+  return { refs: out, failed };
 }
 
 async function searchDiscussions(
@@ -319,13 +370,13 @@ async function searchDiscussions(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<Array<TrackedItemRef & { kind: "issue" | "pull" | "discussion" }> | "rate-limited"> {
+): Promise<SearchResult | "rate-limited"> {
   const res = await githubGraphql<{
-    search?: { nodes?: Array<{ number?: number; repository?: { nameWithOwner?: string } }> | null } | null;
+    search?: { discussionCount?: number; nodes?: Array<{ number?: number; repository?: { nameWithOwner?: string } }> | null } | null;
   }>(
     fetchImpl,
     token,
-    `query($q: String!) { search(query: $q, type: DISCUSSION, first: 20) { nodes { ... on Discussion { number repository { nameWithOwner } } } } }`,
+    `query($q: String!) { search(query: $q, type: DISCUSSION, first: 20) { discussionCount nodes { ... on Discussion { number repository { nameWithOwner } } } } }`,
     { q: query },
   );
   if (res.status === 429 || res.status === 403) {
@@ -334,7 +385,7 @@ async function searchDiscussions(
   }
   if (res.status !== 200 || !res.data?.search) {
     stats.errors += 1;
-    return [];
+    return { refs: [], failed: true };
   }
   stats.ok200 += 1;
   const out: Array<TrackedItemRef & { kind: "issue" | "pull" | "discussion" }> = [];
@@ -344,7 +395,10 @@ async function searchDiscussions(
     const [owner, repo] = full.split("/");
     if (owner && repo) out.push({ owner, repo, kind: "discussion", number: node.number });
   }
-  return out;
+  // First 20 only by design; the caller surfaces the overflow as an error.
+  const failed = typeof res.data.search.discussionCount === "number" &&
+    res.data.search.discussionCount > (res.data.search.nodes ?? []).length;
+  return { refs: out, failed };
 }
 
 /** Examine one candidate item for watched-login posts newer than its cursor. */
@@ -372,6 +426,9 @@ async function processItem(
   if (meta === "rate-limited") {
     return [{ post: "-", item: key, card: null, status: "error", detail: "rate limited" }];
   }
+  if (meta === "failed") {
+    return [{ post: "-", item: key, card: null, status: "error", detail: "item read failed" }];
+  }
   if (!meta) return [];
 
   const posts: AuditPost[] = [];
@@ -383,6 +440,9 @@ async function processItem(
     : await fetchThreadPosts(fetchImpl, token, ref, watched, cursor, state, key, stats, onRateLimited, nowMs);
   if (thread === "rate-limited") {
     return [{ post: "-", item: key, card: null, status: "error", detail: "rate limited" }];
+  }
+  if (thread === "failed") {
+    return [{ post: "-", item: key, card: null, status: "error", detail: "thread read failed" }];
   }
   posts.push(...thread);
   posts.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
@@ -410,7 +470,7 @@ async function fetchItemMeta(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<CandidateMeta | null | "rate-limited"> {
+): Promise<CandidateMeta | null | ReadResult<never>> {
   const res = await githubGet<GitHubItemRow>(fetchImpl, token, `${GITHUB_API_BASE}/repos/${ref.owner}/${ref.repo}/issues/${ref.number}`, null);
   if (res.rateLimited) {
     await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
@@ -419,7 +479,7 @@ async function fetchItemMeta(
   if (res.status === 404) return null;
   if (res.status !== 200 || !res.data) {
     stats.errors += 1;
-    return null;
+    return "failed";
   }
   stats.ok200 += 1;
   const row = res.data;
@@ -439,7 +499,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       title url createdAt author { login }
       comments(first: 100) {
         totalCount
-        nodes { url createdAt author { login } replies(first: 50) { nodes { url createdAt author { login } } } }
+        nodes { url createdAt author { login } replies(first: 50) { totalCount nodes { url createdAt author { login } } } }
       }
     }
   }
@@ -457,7 +517,8 @@ interface DiscussionNode {
   createdAt?: string;
   author?: { login?: string };
   comments?: {
-    nodes?: Array<DiscussionActor & { replies?: { nodes?: DiscussionActor[] | null } | null }> | null;
+    totalCount?: number;
+    nodes?: Array<DiscussionActor & { replies?: { totalCount?: number; nodes?: DiscussionActor[] | null } | null }> | null;
   };
 }
 
@@ -468,7 +529,7 @@ async function discussionNode(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<DiscussionNode | null | "rate-limited"> {
+): Promise<DiscussionNode | null | ReadResult<never>> {
   const res = await githubGraphql<{ repository?: { discussion?: DiscussionNode | null } | null }>(
     fetchImpl, token, DISCUSSION_META_QUERY, { owner: ref.owner, repo: ref.repo, number: ref.number },
   );
@@ -478,7 +539,7 @@ async function discussionNode(
   }
   if (res.status !== 200 || !res.data?.repository?.discussion) {
     stats.errors += 1;
-    return null;
+    return "failed";
   }
   stats.ok200 += 1;
   return res.data.repository.discussion;
@@ -491,9 +552,9 @@ async function fetchDiscussionMeta(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<CandidateMeta | null | "rate-limited"> {
+): Promise<CandidateMeta | null | ReadResult<never>> {
   const node = await discussionNode(fetchImpl, token, ref, stats, onRateLimited, nowMs);
-  if (node === "rate-limited" || !node) return node;
+  if (node === "rate-limited" || node === "failed" || !node) return node;
   return {
     ref,
     authorLogin: node.author?.login ?? null,
@@ -512,13 +573,22 @@ async function fetchDiscussionPosts(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<AuditPost[] | "rate-limited"> {
+): Promise<AuditPost[] | ReadResult<never>> {
   const node = await discussionNode(fetchImpl, token, ref, stats, onRateLimited, nowMs);
-  if (node === "rate-limited" || !node) return node ?? [];
+  if (node === "rate-limited" || node === "failed") return node;
+  if (!node) return [];
   const posts: AuditPost[] = [];
+  // First 100 comments / 50 replies only; deeper threads are surfaced as an
+  // error (visible in run stats) rather than silently skipped.
+  if (typeof node.comments?.totalCount === "number" && node.comments.totalCount > (node.comments.nodes ?? []).length) {
+    stats.errors += 1;
+  }
   for (const comment of node.comments?.nodes ?? []) {
     if (isWatched(watched, comment.author?.login) && (comment.createdAt ?? "") > cursor && (comment.createdAt ?? "") >= AUDIT_CUTOVER_ISO && comment.url) {
       posts.push({ postUrl: comment.url, item: ref, authorLogin: comment.author!.login as string, createdAt: comment.createdAt as string, postKind: "comment" });
+    }
+    if (typeof comment.replies?.totalCount === "number" && comment.replies.totalCount > (comment.replies.nodes ?? []).length) {
+      stats.errors += 1;
     }
     for (const reply of comment.replies?.nodes ?? []) {
       if (isWatched(watched, reply.author?.login) && (reply.createdAt ?? "") > cursor && (reply.createdAt ?? "") >= AUDIT_CUTOVER_ISO && reply.url) {
@@ -545,12 +615,12 @@ async function fetchThreadPosts(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<AuditPost[] | "rate-limited"> {
+): Promise<AuditPost[] | ReadResult<never>> {
   const posts: AuditPost[] = [];
   const rest = `${GITHUB_API_BASE}/repos/${ref.owner}/${ref.repo}`;
 
   const pages = await fetchCommentPages(fetchImpl, token, `${rest}/issues/${ref.number}/comments`, cursor, state, `${key}:issue-comments`, stats, onRateLimited, nowMs);
-  if (pages === "rate-limited") return "rate-limited";
+  if (pages === "rate-limited" || pages === "failed") return pages;
   for (const comment of pages) {
     if (isWatched(watched, comment.user?.login) && (comment.created_at ?? "") > cursor && (comment.created_at ?? "") >= AUDIT_CUTOVER_ISO && comment.html_url) {
       posts.push({ postUrl: comment.html_url, item: ref, authorLogin: comment.user!.login as string, createdAt: comment.created_at as string, postKind: "comment" });
@@ -559,14 +629,14 @@ async function fetchThreadPosts(
 
   if (ref.kind === "pull") {
     const inline = await fetchCommentPages(fetchImpl, token, `${rest}/pulls/${ref.number}/comments`, cursor, state, `${key}:pr-comments`, stats, onRateLimited, nowMs);
-    if (inline === "rate-limited") return "rate-limited";
+    if (inline === "rate-limited" || inline === "failed") return inline;
     for (const comment of inline) {
       if (isWatched(watched, comment.user?.login) && (comment.created_at ?? "") > cursor && (comment.created_at ?? "") >= AUDIT_CUTOVER_ISO && comment.html_url) {
         posts.push({ postUrl: comment.html_url, item: ref, authorLogin: comment.user!.login as string, createdAt: comment.created_at as string, postKind: "comment" });
       }
     }
     const reviews = await fetchReviews(fetchImpl, token, `${rest}/pulls/${ref.number}/reviews`, state, `${key}:reviews`, stats, onRateLimited, nowMs);
-    if (reviews === "rate-limited") return "rate-limited";
+    if (reviews === "rate-limited" || reviews === "failed") return reviews;
     for (const review of reviews) {
       if (isWatched(watched, review.user?.login) && (review.submitted_at ?? "") > cursor && (review.submitted_at ?? "") >= AUDIT_CUTOVER_ISO && review.html_url) {
         posts.push({ postUrl: review.html_url, item: ref, authorLogin: review.user!.login as string, createdAt: review.submitted_at as string, postKind: "review" });
@@ -587,7 +657,7 @@ async function fetchCommentPages(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<GitHubComment[] | "rate-limited"> {
+): Promise<GitHubComment[] | ReadResult<never>> {
   const out: GitHubComment[] = [];
   for (let page = 1; page <= 10; page += 1) {
     const url = `${baseUrl}?since=${encodeURIComponent(cursor)}&per_page=100&page=${page}`;
@@ -602,17 +672,27 @@ async function fetchCommentPages(
     }
     if (res.status !== 200 || !Array.isArray(res.data)) {
       stats.errors += 1;
-      return out;
+      return "failed";
     }
     stats.ok200 += 1;
     if (page === 1) state.etags[etagKey] = res.etag;
     out.push(...res.data);
     if (res.data.length < 100) break;
+    if (page === 10) {
+      // Hard cap by design (1000 comments); a busier thread is surfaced as an
+      // error rather than silently skipped. Retrying cannot help, so this does
+      // not fail the read — the overflow stays visible in run stats.
+      stats.errors += 1;
+    }
   }
   return out;
 }
 
-/** Latest 100 reviews, ETag-conditional (this endpoint has no `since`). */
+/**
+ * All reviews, oldest first, ETag-conditional on the first page (this endpoint
+ * has no `since`). Later pages are plain GETs; a failure fails the whole read
+ * so the caller retries with the old ETag instead of advancing past unseen rows.
+ */
 async function fetchReviews(
   fetchImpl: FetchLike,
   token: string,
@@ -622,24 +702,29 @@ async function fetchReviews(
   stats: RunStats,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
-): Promise<GitHubReview[] | "rate-limited"> {
-  const url = `${baseUrl}?per_page=100`;
-  const res = await githubGet<GitHubReview[]>(fetchImpl, token, url, state.etags[etagKey] ?? null);
-  if (res.rateLimited) {
-    await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
-    return "rate-limited";
+): Promise<GitHubReview[] | ReadResult<never>> {
+  const out: GitHubReview[] = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const url = page === 1 ? `${baseUrl}?per_page=100` : `${baseUrl}?per_page=100&page=${page}`;
+    const res = await githubGet<GitHubReview[]>(fetchImpl, token, url, page === 1 ? (state.etags[etagKey] ?? null) : null);
+    if (res.rateLimited) {
+      await onRateLimited(nowMs + backoffDelayMs(res, nowMs));
+      return "rate-limited";
+    }
+    if (res.notModified) {
+      stats.notModified304 += 1;
+      return out;
+    }
+    if (res.status !== 200 || !Array.isArray(res.data)) {
+      stats.errors += 1;
+      return "failed";
+    }
+    stats.ok200 += 1;
+    if (page === 1) state.etags[etagKey] = res.etag;
+    out.push(...res.data);
+    if (res.data.length < 100) break;
   }
-  if (res.notModified) {
-    stats.notModified304 += 1;
-    return [];
-  }
-  if (res.status !== 200 || !Array.isArray(res.data)) {
-    stats.errors += 1;
-    return [];
-  }
-  stats.ok200 += 1;
-  state.etags[etagKey] = res.etag;
-  return res.data;
+  return out;
 }
 
 /** Gate match: a `done` gate card under the follow-through card, approved no later than the post. */

@@ -3,7 +3,7 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 import manifest, { ITEM_ORIGIN_KIND } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
-import { AUDIT_CUTOVER_ISO, runAuditScan, ungatedKey, UNGATED_LABEL_NAME } from "./audit.js";
+import { AUDIT_CUTOVER_ISO, runAuditScan, SCAN_OVERLAP_MS, ungatedKey, UNGATED_LABEL_NAME } from "./audit.js";
 import { stateKey } from "./state.js";
 
 const COMPANY = "c-1";
@@ -296,6 +296,136 @@ describe("audit job", () => {
     expect(out.stats).toMatchObject({ wakes: 0, creates: 0 });
     expect(await flagCards(harness)).toHaveLength(0);
     expect(AUDIT_CUTOVER_ISO).toBe("2026-11-02T00:00:00Z");
+  });
+
+  it("an aborted run keeps completed-item progress but holds the watermark", async () => {
+    const base = auditStub({
+      rest: {
+        [issueUrl(200)]: {
+          etag: '"i1"',
+          body: issueRow(200, { user: { login: "Rick7C2" }, created_at: POST_AT }),
+        },
+        [commentsUrl(200)]: { etag: '"m1"', body: [] },
+        [issueUrl(201)]: {
+          etag: '"i2"',
+          body: issueRow(201, { user: { login: "Rick7C2" }, created_at: POST_AT }),
+        },
+        [commentsUrl(201)]: { etag: '"m2"', body: [] },
+      },
+      searchItems: [{ html_url: issueHtml(200) }, { html_url: issueHtml(201) }],
+      graphqlDiscussion: null,
+    });
+    let limit201 = true;
+    const stub = (async (url: string, init?: RequestInit) => {
+      if (url === issueUrl(201) && limit201) return new Response("limited", { status: 429 });
+      return base(url, init);
+    }) as FetchStub;
+    const config = resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
+    const t0 = Date.parse("2026-11-02T13:00:00Z");
+
+    const first = await runAuditScan(harness.ctx, COMPANY, config, { fetchImpl: stub, now: () => t0 });
+    expect(first.outcomes).toHaveLength(2);
+    expect(first.outcomes[0]).toMatchObject({ status: "flagged" });
+    expect(first.outcomes[1]).toMatchObject({ status: "error", detail: "rate limited" });
+
+    // The flag survived, but the watermark did not advance past the unread item.
+    const mid = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as {
+      lastSearchAt: string | null; flags: Record<string, unknown>;
+    });
+    expect(mid.lastSearchAt).toBeNull();
+    expect(Object.keys(mid.flags)).toEqual([issueHtml(200)]);
+    expect(await flagCards(harness)).toHaveLength(1);
+
+    // After the limit lifts the second item flags without re-flagging the first.
+    limit201 = false;
+    const second = await runAuditScan(harness.ctx, COMPANY, config, { fetchImpl: stub, now: () => t0 + 120_000 });
+    expect(second.outcomes.filter((o) => o.status === "flagged")).toHaveLength(1);
+    expect(second.outcomes.filter((o) => o.status === "duplicate")).toHaveLength(0);
+    expect(await flagCards(harness)).toHaveLength(2);
+  });
+
+  it("a failed search holds the watermark instead of skipping posts", async () => {
+    const stub = (async (url: string) => {
+      if (url.startsWith("https://api.github.com/search/issues")) {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as FetchStub;
+    const config = resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
+    const out = await runAuditScan(harness.ctx, COMPANY, config, { fetchImpl: stub });
+    expect(out.stats.errors).toBeGreaterThan(0);
+    const stored = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as { lastSearchAt: string | null });
+    expect(stored.lastSearchAt).toBeNull();
+    expect(await flagCards(harness)).toHaveLength(0);
+  });
+
+  it("a failed item read is an error, not a silent skip", async () => {
+    const stub = (async (url: string, init?: RequestInit) => {
+      if (url === issueUrl(100)) return new Response("boom", { status: 500 });
+      return auditStub({
+        rest: {},
+        searchItems: [{ html_url: issueHtml(100) }],
+        graphqlDiscussion: null,
+      })(url, init);
+    }) as FetchStub;
+    const out = await scan(harness, trackerId, stub);
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ item: `${OWNER}/${REPO}#100`, status: "error", detail: "item read failed" });
+    expect(await flagCards(harness)).toHaveLength(0);
+    const stored = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as { lastSearchAt: string | null });
+    expect(stored.lastSearchAt).toBeNull();
+  });
+
+  it("the watermark advances to scan start minus the overlap window", async () => {
+    const t0 = Date.parse("2026-11-02T13:00:00Z");
+    const config = resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
+    await runAuditScan(harness.ctx, COMPANY, config, {
+      fetchImpl: auditStub({ rest: {}, searchItems: [], graphqlDiscussion: null }),
+      now: () => t0,
+    });
+    const stored = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as { lastSearchAt: string });
+    expect(stored.lastSearchAt).toBe(new Date(t0 - SCAN_OVERLAP_MS).toISOString());
+  });
+
+  it("reviews past the first page are still audited", async () => {
+    const strangers = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 1,
+      html_url: `${pullHtml(300)}#pullrequestreview-${i + 1}`,
+      submitted_at: POST_AT,
+      state: "APPROVED",
+      user: { login: "stranger" },
+    }));
+    const ours = {
+      id: 101,
+      html_url: `${pullHtml(300)}#pullrequestreview-101`,
+      submitted_at: POST_AT,
+      state: "COMMENTED",
+      user: { login: "Rick7C2" },
+    };
+    const base = auditStub({
+      rest: {
+        [issueUrl(300)]: {
+          etag: '"i1"',
+          body: { ...issueRow(300), html_url: pullHtml(300), pull_request: {} },
+        },
+        [commentsUrl(300)]: { etag: '"m1"', body: [] },
+        [`https://api.github.com/repos/${OWNER}/${REPO}/pulls/300/comments`]: { etag: '"q1"', body: [] },
+      },
+      searchItems: [{ html_url: pullHtml(300) }],
+      graphqlDiscussion: null,
+    });
+    const stub = (async (url: string, init?: RequestInit) => {
+      if (url.includes(`/pulls/300/reviews`)) {
+        if (url.includes("page=2")) return json([ours], '"r2"');
+        return json(strangers, '"r1"');
+      }
+      return base(url, init);
+    }) as FetchStub;
+    const out = await scan(harness, trackerId, stub);
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ item: `${OWNER}/${REPO}#300`, status: "flagged" });
+    expect(out.outcomes[0].post).toContain("pullrequestreview-101");
+    expect(await flagCards(harness)).toHaveLength(1);
   });
 
   it("dry-run reports intended flags without writing", async () => {
