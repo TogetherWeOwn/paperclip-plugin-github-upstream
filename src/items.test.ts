@@ -545,6 +545,8 @@ describe("item job", () => {
 
     await scan(harness, trackerId, stub, config);
     expect(wakes).toHaveLength(0);
+    // Reviews are read one page at per_page=100 (count and decisive state consistent, one ETag).
+    expect(table.calls.some((c) => c.includes("/pulls/800/reviews?per_page=100"))).toBe(true);
     // First sight of our unruled PR: awaiting maintainer.
     const firstPatch = updates[updates.length - 1].patch as { labelIds?: string[] };
     expect(firstPatch.labelIds).toContain("L-wm");

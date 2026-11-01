@@ -91,7 +91,12 @@ interface GitHubReview {
   user?: { login?: string | null } | null;
 }
 
-/** Latest decisive review (highest id wins; page-local, matching the count source). */
+/**
+ * Latest decisive review (highest id wins). Reads the first page at
+ * `per_page=100`, so the count and the decisive state stay consistent with
+ * each other; PRs past 100 reviews keep the newest-100 view rather than
+ * paying per-page ETag bookkeeping for the tail.
+ */
 export function latestDecisiveReview(
   reviews: GitHubReview[] | null | undefined,
 ): "APPROVED" | "CHANGES_REQUESTED" | null {
@@ -685,7 +690,9 @@ async function fetchPullRest(
   }
   // A forced read skips the stored ETag once (upgrade backfill): the fresh
   // 200 still refreshes the cache, so later scans are 304s again.
-  const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews`, forceReviews ? null : (etags.reviews ?? null), stats, onRateLimited, nowMs);
+  // `per_page=100` keeps the count and the decisive state on one page (and
+  // one ETag) instead of GitHub's 30-item default.
+  const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews?per_page=100`, forceReviews ? null : (etags.reviews ?? null), stats, onRateLimited, nowMs);
   if (!reviewsRes) return null;
   if (!reviewsRes.notModified) {
     etags.reviews = reviewsRes.etag;
