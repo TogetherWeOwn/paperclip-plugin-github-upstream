@@ -1,0 +1,59 @@
+{
+  "name": "@togetherweown/paperclip-plugin-github-upstream",
+  "version": "0.1.0",
+  "description": "Paperclip plugin that notices upstream GitHub changes deterministically (ETag sync, zero LLM) and wakes the owning Paperclip card.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/TogetherWeOwn/paperclip-plugin-github-upstream",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TogetherWeOwn/paperclip-plugin-github-upstream"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "paperclip-github-upstream-dryrun": "./bin/github-upstream-dryrun.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "github",
+    "upstream",
+    "releases"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1023.0",
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
