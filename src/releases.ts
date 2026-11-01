@@ -263,9 +263,11 @@ async function ensureReleaseCard(
     // A capped-wake retry lands here with the retitle already applied (the
     // open card's originId is already the new tag). Skip the rewrite: it would
     // record the new tag as its own previous tag in the body. The wake below
-    // still fires exactly once.
+    // still fires exactly once. The comparison is case-sensitive on purpose:
+    // tags are case-sensitive, so a case-only change (v8.0.50 -> V8.0.50)
+    // must still retitle the card instead of leaving the old tag and link.
     const alreadyRetitled =
-      typeof open.originId === "string" && open.originId.toLowerCase() === originId.toLowerCase();
+      typeof open.originId === "string" && open.originId === originId;
     if (!alreadyRetitled) {
       await updateReleaseCard(ctx, companyId, config, open, owner, repo, tag, body, previousTag);
     }

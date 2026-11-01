@@ -473,13 +473,18 @@ async function syncOneItem(
     // wake our own card. Dry runs skip this check (no extra GETs); the live run
     // still suppresses. Header/label sync above always happens either way.
     if (changed && !firstSeen && previous.snapshot) {
+      // Pass the renormalized baseline, not the raw stored snapshot: records
+      // stored before latestReviewState existed carry no such key, and the raw
+      // `undefined` would read as a ruling change and wake for our own comment
+      // or push on the upgrade tick. prevForCompare backfills the field so
+      // own-action attribution runs against the true ruling.
       const own = await checkOwnAction({
         fetchImpl,
         token,
         item,
         config,
         resolvedKind: fetched.resolvedKind,
-        previous: previous.snapshot,
+        previous: prevForCompare,
         next: snapshot,
         stats,
         onRateLimited: async (untilMs) => {

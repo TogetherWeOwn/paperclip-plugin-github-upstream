@@ -471,6 +471,25 @@ describe("release hardening", () => {
     expect(clean).toContain("compare/v8.0.50...v8.0.51");
   });
 
+  it("a case-only tag change still retitles the open card (no stale tag or link)", async () => {
+    await seedState("v8.0.50", "v8.0.50", '"u1"');
+    const card = await openCard("v8.0.50");
+    // GitHub tags are case-sensitive: V8.0.50 is a new tag, not the same one.
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"u2"', body: releaseBody("V8.0.50") } });
+    const wakes = spyWakes(harness);
+
+    const result = await scan(harness, stub);
+    expect(result.outcomes).toEqual([
+      { repo: "router-for-me/cliproxyapi", status: "updated", tag: "V8.0.50", detail: expect.stringContaining("updated to V8.0.50") },
+    ]);
+    const cards = await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND });
+    expect(cards).toHaveLength(1);
+    expect(cards[0].id).toBe(card.id);
+    expect(cards[0].originId).toBe("router-for-me/cliproxyapi@V8.0.50");
+    expect(cards[0].title).toContain("V8.0.50");
+    expect(wakes).toHaveLength(1);
+  });
+
   it("F7: a release scan with no auth configured errors without any fetch", async () => {
     let fetched = false;
     const guard = (async () => {

@@ -1164,6 +1164,63 @@ describe("item hardening", () => {
     expect(wakes[0].issueId).toBe(card.id);
   });
 
+  it("a legacy record without review state still suppresses our own comment on the upgrade tick", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#920`);
+    // Stored shape from before latestReviewState existed: a seven-element
+    // fingerprint and a snapshot with neither the review nor awaiting key.
+    const legacySnapshot = {
+      owner: OWNER,
+      repo: REPO,
+      kind: "pull",
+      number: 920,
+      url: `https://github.com/${OWNER}/${REPO}/pull/920`,
+      title: "pr 920",
+      state: "open",
+      updatedAt: "2026-10-12T00:00:00Z",
+      commentCount: 1,
+      authorLogin: "stranger",
+      headLabel: "TogetherWeOwn:fix-x",
+      reviewCount: 0,
+      checkConclusion: "success",
+      headSha: HEAD_SHA,
+      draft: false,
+    };
+    const legacyFp = JSON.stringify(["open", "2026-10-12T00:00:00Z", 1, 0, "success", HEAD_SHA, false]);
+    await harness.ctx.state.set(stateKey(COMPANY, "items") as never, {
+      [`${OWNER}/${REPO}#920`]: {
+        etags: { issue: '"i920a"', pull: '"p920a"', reviews: '"r920a"', checkRuns: '"c920a"' },
+        resolvedKind: "pull",
+        fingerprint: legacyFp,
+        wokenFingerprint: legacyFp,
+        snapshot: legacySnapshot,
+        cardId: null,
+        checkedAt: "2026-10-12T00:00:00Z",
+      },
+    } as never);
+    // Our comment lands on the upgrade tick: the count rises, but every new
+    // actor is us. The missing review key must backfill to null (no ruling
+    // change), so attribution suppresses instead of waking for a phantom
+    // "review ruling changed".
+    const table: RouteTable = {
+      rest: {
+        ...pullTable(920, "920b"),
+        [issueUrl(920)]: { etag: '"i920b"', body: pullIssueRow(920, { comments: 2, updated_at: "2026-10-13T00:00:00Z" }) },
+        [commentsUrl(920)]: { etag: '"m920"', body: [{ id: 1, user: { login: "Rick7C2" } }] },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const config = { operatorLogin: "Rick7C2" };
+
+    const out = await scan(harness, trackerId, stub, config);
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "mapped" });
+    expect(out.outcomes[0].detail).toContain("Rick7C2");
+    expect(out.stats.wakes).toBe(0);
+    expect(wakes).toHaveLength(0);
+  });
+
   it("F6: created cards keep a deterministic title and a sanitized untrusted quote", async () => {
     const evilTitle = `[Evil](http://evil.example) <script>alert(1)</script> ` + "y".repeat(150);
     const table: RouteTable = {
