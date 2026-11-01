@@ -989,6 +989,105 @@ describe("item hardening", () => {
     expect(wakes).toHaveLength(1);
   });
 
+  it("a capped discovery retries on the next tick instead of waiting an hour", async () => {
+    const found = [
+      { number: 920, html_url: `https://github.com/${OWNER}/${REPO}/issues/920`, state: "open", title: "ours", user: { login: "Rick7C2" } },
+    ];
+    let searches = 0;
+    const table: RouteTable = { rest: {}, graphqlDiscussion: null, calls: [] };
+    const rest = itemStub(table);
+    const stub = (async (url: string, init?: RequestInit) => {
+      if (url.startsWith("https://api.github.com/search/issues")) {
+        searches += 1;
+        return json({ items: found }, null);
+      }
+      return rest(url, init);
+    }) as FetchStub;
+    const config = { operatorLogin: "Rick7C2", discoveryQueries: ["repo:paperclipai/paperclip"], maxCreatesPerTick: 0 };
+
+    const first = await scan(harness, trackerId, stub, config);
+    expect(first.outcomes.find((o) => o.item === `${OWNER}/${REPO}#920`)?.status).toBe("capped");
+    expect(searches).toBe(1);
+    // The hourly timestamp must not advance while work is deferred...
+    expect(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "last-discovery-search-at" }) ?? null).toBeNull();
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND })).toHaveLength(0);
+
+    // ...so the next tick searches again and creates the card.
+    const second = await scan(harness, trackerId, stub, { ...config, maxCreatesPerTick: 2 });
+    expect(second.outcomes.find((o) => o.item === `${OWNER}/${REPO}#920`)?.status).toBe("created");
+    expect(searches).toBe(2);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND })).toHaveLength(1);
+  });
+
+  it("mixed-case item state from before the lowercase upgrade still drives the scan", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#921`);
+    const table: RouteTable = { rest: { ...pullTable(921, "921a") }, graphqlDiscussion: null, calls: [] };
+    const stub = itemStub(table);
+    const extras = { extraTrackedItems: [{ owner: OWNER, repo: REPO, kind: "pull", number: 921 }] };
+
+    await scan(harness, trackerId, stub, extras);
+    const stored = harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }) as Record<string, unknown>;
+    const lower = `${OWNER}/${REPO}#921`;
+    expect(stored[lower]).toBeDefined();
+    // Rewrite history under its pre-upgrade mixed-case key.
+    await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }, {
+      [`PaperclipAI/Paperclip#921`]: stored[lower],
+    });
+
+    const wakes = spyWakes(harness);
+    const second = await scan(harness, trackerId, stub, extras);
+    // History survived: steady 304s, no first-sighting wake, keys folded forward.
+    expect(second.outcomes.find((o) => o.item === lower)?.status).toBe("unchanged");
+    expect(wakes).toHaveLength(0);
+    const after = harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }) as Record<string, unknown>;
+    expect(after[lower]).toBeDefined();
+    expect(after[`PaperclipAI/Paperclip#921`]).toBeUndefined();
+    expect(card.id).toBeDefined();
+  });
+
+  it("our own push with pending checks stays suppressed until CI settles", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#922`);
+    const NEW_HEAD = "ddde4c5a76667788990011223344aabbccddeeff";
+    const table: RouteTable = { rest: { ...pullTable(922, "922a") }, graphqlDiscussion: null, calls: [] };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const config = { operatorLogin: "Rick7C2" };
+
+    await scan(harness, trackerId, stub, config);
+    expect(wakes).toHaveLength(0);
+
+    // We push: new head, CI starts pending, every new commit is ours.
+    table.rest[pullUrl(922)] = {
+      etag: '"p922b"',
+      body: pullRow(922, { head: { sha: NEW_HEAD, label: "TogetherWeOwn:fix-x" }, updated_at: "2026-10-13T00:00:00Z" }),
+    };
+    table.rest[checksUrl(NEW_HEAD)] = {
+      etag: '"c922b"',
+      body: { total_count: 1, check_runs: [{ status: "in_progress", conclusion: null, name: "ci" }] },
+    };
+    table.rest[commitsUrl(922)] = {
+      etag: '"h922"',
+      body: [
+        { sha: HEAD_SHA, author: { login: "stranger" }, committer: { login: "stranger" } },
+        { sha: NEW_HEAD, author: { login: "Rick7C2" }, committer: { login: "Rick7C2" } },
+      ],
+    };
+    const pushed = await scan(harness, trackerId, stub, config);
+    expect(pushed.outcomes[0]).toMatchObject({ card: card.id, status: "mapped" });
+    expect(wakes).toHaveLength(0);
+
+    // CI settles (failure): the same head now wakes, and our push never swallowed it.
+    table.rest[checksUrl(NEW_HEAD)] = {
+      etag: '"c922c"',
+      body: { total_count: 1, check_runs: [{ status: "completed", conclusion: "failure", name: "ci" }] },
+    };
+    const settled = await scan(harness, trackerId, stub, config);
+    expect(settled.outcomes[0].status).toBe("woke");
+    expect(settled.outcomes[0].reason).toContain("checks pending->failure");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
   it("a reopened issue is tracked again instead of staying skipped-closed", async () => {
     const table: RouteTable = {
       rest: {

@@ -51,12 +51,17 @@ export async function runDryRun(options: DryRunOptions): Promise<DryRunResult> {
   const trackerId = options.trackerId ?? inferTrackerId(options.cards);
   // Fail-closed scans require an explicit secret_ref binding; the dry-run CLI
   // always carries an explicit token, so bind it. The stub resolve() below
-  // returns that token for any ref.
+  // returns that token for any ref. A production config using GitHub App auth
+  // would otherwise trip the exactly-one-mode guard: when the CLI token is
+  // injected (no explicit tokenSecretRef in config), the App triple is cleared
+  // so the token-backed dry run can proceed.
+  const injectsCliToken = options.config.tokenSecretRef === undefined;
   const config = resolveConfig({
     ...options.config,
     dryRun: true,
     followThroughTrackerIssueId: trackerId,
     tokenSecretRef: options.config.tokenSecretRef ?? { type: "secret_ref", secretId: "dry-run" },
+    ...(injectsCliToken ? { appId: "", installationId: "", appPrivateKeySecretRef: null } : {}),
   });
   const intended: string[] = [];
 

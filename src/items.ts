@@ -150,7 +150,21 @@ export async function runItemScan(
     return { outcomes, stats };
   }
 
-  const stored = (await ctx.state.get(stateKey(companyId, "items")) as ItemMap | null) ?? {};
+  const storedRaw = (await ctx.state.get(stateKey(companyId, "items")) as ItemMap | null) ?? {};
+  // Upgrade migration: item keys used to use the configured case
+  // ("Router-For-Me/CLIProxyAPI#7152"); keys are now always lowercase. Fold old
+  // records forward so tracked history (ETags, fingerprints, snapshots)
+  // survives the upgrade instead of becoming first sightings that lose their
+  // wake. Collisions keep the newest record; ties keep the first in sorted
+  // order (deterministic).
+  const stored: ItemMap = {};
+  for (const k of Object.keys(storedRaw).sort()) {
+    const hash = k.lastIndexOf("#");
+    const norm = hash === -1 ? k.toLowerCase() : `${k.slice(0, hash).toLowerCase()}#${k.slice(hash + 1)}`;
+    const rec = storedRaw[k];
+    const existing = stored[norm];
+    if (!existing || (rec.checkedAt ?? "") > (existing.checkedAt ?? "")) stored[norm] = rec;
+  }
   const next: ItemMap = { ...stored };
 
   if (!config.followThroughTrackerIssueId) {
@@ -499,9 +513,14 @@ async function checkOwnAction(params: {
   const wake = (detail: string) => ({ suppressed: false as const, detail });
 
   if (previous.state !== next.state) return wake("state changed, always wakes");
-  // A CI conclusion or draft flip in the same window must wake even when every
-  // observed actor is ours: our own push must never swallow a CI failure.
-  if (previous.checkConclusion !== next.checkConclusion) return wake("check conclusion changed, always wakes");
+  // A settled CI conclusion or draft flip in the same window must wake even
+  // when every observed actor is ours: our own push must never swallow a CI
+  // failure. A bare move into an unsettled state (pending/none) alongside our
+  // own push or comment is attributable below and stays suppressed while CI
+  // runs; any maintainer involvement there still wakes via attribution.
+  if (previous.checkConclusion !== next.checkConclusion && next.checkConclusion !== "pending" && next.checkConclusion !== "none") {
+    return wake("check conclusion changed, always wakes");
+  }
   if (previous.draft !== next.draft) return wake("draft changed, always wakes");
   if (previous.reviewCount !== next.reviewCount) return wake("reviews changed, always wakes");
   if (next.commentCount < previous.commentCount) return wake("comments removed, always wakes");
@@ -812,7 +831,11 @@ async function runDiscovery(
   if (config.discoveryQueries.length === 0 || config.dryRun) return;
   const lastRaw = (await ctx.state.get(stateKey(companyId, "last-discovery-search-at")) as string | null) ?? null;
   if (lastRaw && nowMs - Date.parse(lastRaw) < DISCOVERY_SEARCH_INTERVAL_MS) return;
-  await ctx.state.set(stateKey(companyId, "last-discovery-search-at"), new Date(nowMs).toISOString());
+  // A capped discovery is not tracked and leaves no pending queue: writing the
+  // hourly timestamp before knowing the outcome would park the overflow for an
+  // hour (and newer results could page it out). Only advance the timestamp
+  // when nothing was deferred, so the next tick retries the search.
+  let cappedDiscovery = false;
 
   for (const query of config.discoveryQueries.slice(0, 5)) {
     if (await isBackedOff(ctx, companyId, (deps.now ?? Date.now)())) break;
@@ -872,6 +895,7 @@ async function runDiscovery(
         // Spend cap: leave the item untracked so the next tick discovers it again.
         if (stats.creates >= caps.maxCreates || wakesUsed(stats) >= caps.maxWakes) {
           stats.capped += 1;
+          cappedDiscovery = true;
           ctx.logger.info("github-upstream tick cap: deferring discovery create", { companyId, item: itemKey(ref), creates: stats.creates, wakes: wakesUsed(stats) });
           outcomes.push({ item: itemKey(ref), card: null, status: "capped", reason: "discovered ours item via search", detail: "create budget exhausted, deferred to next tick" });
           continue;
@@ -897,6 +921,9 @@ async function runDiscovery(
       stats.errors += 1;
       outcomes.push({ item: `search:${query}`, card: null, status: "error", detail: String(err) });
     }
+  }
+  if (!cappedDiscovery) {
+    await ctx.state.set(stateKey(companyId, "last-discovery-search-at"), new Date(nowMs).toISOString());
   }
 }
 

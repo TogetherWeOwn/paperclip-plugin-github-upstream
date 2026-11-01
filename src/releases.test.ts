@@ -3,7 +3,7 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 import manifest, { RELEASE_JOB_KEY, RELEASE_ORIGIN_KIND } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
-import { runReleaseScan } from "./releases.js";
+import { releaseCardBody, runReleaseScan } from "./releases.js";
 
 const COMPANY = "c-1";
 
@@ -369,6 +369,87 @@ describe("release hardening", () => {
     // The next tick with wake budget creates the card.
     const second = await scan(harness, stub, { ...config, maxWakesPerTick: 5 });
     expect(second.outcomes).toEqual([{ repo: "router-for-me/cliproxyapi", status: "created", tag: "v8.0.55" }]);
+  });
+
+  it("a new release updates the existing open intake instead of baselining (state loss, no compareBases)", async () => {
+    // Open v8.0.50 intake exists but plugin state was lost: no record at all.
+    // Latest is v8.0.51 with no compare base configured. The tag must update
+    // the open card, never vanish as an install baseline.
+    const card = await openCard("v8.0.50");
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"c1"', body: releaseBody("v8.0.51") } });
+    const wakes = spyWakes(harness);
+
+    const result = await scan(harness, stub);
+    expect(result.outcomes).toEqual([
+      { repo: "router-for-me/cliproxyapi", status: "updated", tag: "v8.0.51", detail: expect.stringContaining("updated to v8.0.51") },
+    ]);
+    const cards = await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND });
+    expect(cards).toHaveLength(1);
+    expect(cards[0].id).toBe(card.id);
+    expect(cards[0].originId).toBe("router-for-me/cliproxyapi@v8.0.51");
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("a capped release wake retitles now and wakes on the next tick with budget", async () => {
+    await seedState("v8.0.50", "v8.0.50", '"u1"');
+    const card = await openCard("v8.0.50");
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"u2"', body: releaseBody("v8.0.51") } });
+    const wakes = spyWakes(harness);
+
+    const capped = await scan(harness, stub, { maxWakesPerTick: 0 });
+    expect(capped.outcomes).toEqual([
+      { repo: "router-for-me/cliproxyapi", status: "capped", tag: "v8.0.51", detail: expect.stringContaining("wake deferred") },
+    ]);
+    expect(wakes).toHaveLength(0);
+    // The card already moved to the new tag...
+    const moved = await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND });
+    expect(moved).toHaveLength(1);
+    expect(moved[0].originId).toBe("router-for-me/cliproxyapi@v8.0.51");
+
+    // ...and the retry tick wakes exactly once instead of going already-created.
+    const retry = await scan(harness, stub, { maxWakesPerTick: 5 });
+    expect(retry.outcomes).toEqual([
+      { repo: "router-for-me/cliproxyapi", status: "updated", tag: "v8.0.51", detail: expect.stringContaining("updated to v8.0.51") },
+    ]);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].issueId).toBe(card.id);
+  });
+
+  it("mixed-case release state from before the lowercase upgrade still drives the scan", async () => {
+    // Pre-upgrade record keyed by configured case; tag v8.0.50 already carded.
+    await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "releases" }, {
+      "router-for-me/CLIProxyAPI": { etag: '"old"', tag: "v8.0.50", createdTag: "v8.0.50", checkedAt: new Date(0).toISOString() },
+    });
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"u2"', body: releaseBody("v8.0.51") } });
+    const result = await scan(harness, stub);
+    // History survived: v8.0.51 is a new release, not a first-seen baseline.
+    expect(result.outcomes).toEqual([{ repo: "router-for-me/cliproxyapi", status: "created", tag: "v8.0.51" }]);
+  });
+
+  it("a crafted compare base never enters the intake card", async () => {
+    const evil = "v8.0.50](https://evil.example) [injected";
+    const body = releaseCardBody({
+      owner: "router-for-me",
+      repo: "CLIProxyAPI",
+      tag: "v8.0.51",
+      releaseUrl: "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.51",
+      publishedAt: "2026-11-01T00:00:00Z",
+      compareBase: evil,
+      previousTag: "v8.0.50",
+    });
+    expect(body).not.toContain(evil);
+    expect(body).not.toContain("evil.example");
+    expect(body).toContain("no recorded base yet");
+    const clean = releaseCardBody({
+      owner: "router-for-me",
+      repo: "CLIProxyAPI",
+      tag: "v8.0.51",
+      releaseUrl: "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.51",
+      publishedAt: "2026-11-01T00:00:00Z",
+      compareBase: "v8.0.50",
+      previousTag: null,
+    });
+    expect(clean).toContain("compare/v8.0.50...v8.0.51");
   });
 
   it("F7: a release scan with no auth configured errors without any fetch", async () => {

@@ -1,5 +1,9 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createVerify, generateKeyPairSync } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { runDryRun } from "./dryrun.js";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest, { ITEM_ORIGIN_KIND, RELEASE_ORIGIN_KIND } from "./manifest.js";
 import plugin from "./plugin.js";
@@ -225,6 +229,18 @@ describe("getInstallationToken cache", () => {
     await getInstallationToken(fetchImpl, identity({ privateKeyPem: otherPrivateKeyPem }), nowMs);
     expect(calls).toHaveLength(2);
   });
+
+  it("scopes the cache by company: the same identity under another company re-mints", async () => {
+    const calls: MintCall[] = [];
+    const nowMs = Date.now();
+    const fetchImpl = mintStub("shared-identity", expiresAt(nowMs), calls);
+    expect(await getInstallationToken(fetchImpl, identity(), nowMs, "c-1")).toBe("shared-identity");
+    expect(await getInstallationToken(fetchImpl, identity(), nowMs + 60_000, "c-1")).toBe("shared-identity");
+    expect(calls).toHaveLength(1);
+    // Another company never reuses c-1's minted token, even for the same App identity.
+    expect(await getInstallationToken(fetchImpl, identity(), nowMs + 60_000, "c-2")).toBe("shared-identity");
+    expect(calls).toHaveLength(2);
+  });
 });
 
 describe("resolveAuthToken + scans in App mode", () => {
@@ -391,6 +407,40 @@ describe("resolveAuthToken + scans in App mode", () => {
     expect(outcomes[0].status).toBe("error");
     expect(outcomes[0].detail).toMatch(/refusing unauthenticated scan/);
     expect(fetched).toBe(false);
+  });
+
+  it("a token-backed dry run works with an App-auth production config", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "upstream-dryrun-"));
+    const realFetch = globalThis.fetch;
+    (globalThis.fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>) = (async (url: string) => {
+      if (url.includes("/releases/latest")) {
+        return json(
+          { tag_name: "v8.0.51", name: "v8.0.51", html_url: "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.51", published_at: "2026-11-01T00:00:00Z" },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+    try {
+      const result = await runDryRun({
+        companyId: COMPANY,
+        token: "cli-token",
+        config: {
+          appId: APP_ID,
+          installationId: INSTALLATION_ID,
+          appPrivateKeySecretRef: KEY_REF,
+          releaseRepos: ["router-for-me/CLIProxyAPI"],
+          compareBases: { "router-for-me/CLIProxyAPI": "v8.0.50" },
+        },
+        cards: [],
+        statePath: path.join(dir, "state.json"),
+      });
+      // The CLI token wins: no exactly-one-mode auth error, the new tag reports.
+      expect(result.releaseOutcomes).toEqual([
+        { repo: "router-for-me/cliproxyapi", status: "would-create", tag: "v8.0.51", detail: expect.stringContaining("would create") },
+      ]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("PAT mode still resolves through the secrets stub", async () => {

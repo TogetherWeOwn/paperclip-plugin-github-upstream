@@ -112,9 +112,11 @@ export async function mintInstallationToken(
 /** Refresh 5 minutes before expiry, so a slow tick never runs on a dead token. */
 export const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
-const cacheKeyOf = (identity: AppIdentity): string => {
+const cacheKeyOf = (identity: AppIdentity, companyId: string): string => {
   const keyHash = createHash("sha256").update(identity.privateKeyPem, "utf8").digest("hex").slice(0, 16);
-  return `${identity.appId}:${identity.installationId}:${keyHash}`;
+  // Company-scoped: two companies sharing an App identity must never share one
+  // company's minted token with the other's scans.
+  return `${companyId}:${identity.appId}:${identity.installationId}:${keyHash}`;
 };
 
 /** Process-memory-only token cache. Never persisted, never logged. */
@@ -133,8 +135,9 @@ export async function getInstallationToken(
   fetchImpl: FetchLike,
   identity: AppIdentity,
   nowMs = Date.now(),
+  companyId = "",
 ): Promise<string> {
-  const key = cacheKeyOf(identity);
+  const key = cacheKeyOf(identity, companyId);
   const cached = tokenCache.get(key);
   if (cached && nowMs < cached.expiresAtMs - TOKEN_REFRESH_SKEW_MS) return cached.token;
   const fresh = await mintInstallationToken(fetchImpl, identity, nowMs);
@@ -186,5 +189,5 @@ export async function resolveAuthToken(
     appId: config.appId,
     installationId: config.installationId,
     privateKeyPem,
-  }, nowMs);
+  }, nowMs, companyId);
 }
