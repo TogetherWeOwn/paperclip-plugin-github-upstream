@@ -20,7 +20,7 @@ Our own upstream actions never wake our own card: on a changed fingerprint (neve
 
 ## Card mapping
 
-An upstream item maps to a card by `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL work product, then by a GitHub URL in the description (the shape most existing follow-through cards are in). Cards found by URL get `originKind`/`originId` backfilled. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
+An upstream item maps to a card by `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL work product, then by a GitHub URL in the description (the shape most existing follow-through cards are in). Blockquoted lines are never identity: the plugin quotes the upstream title as untrusted text, and titles can carry arbitrary URLs. Cards found by URL get `originKind`/`originId` backfilled, but a card that already owns another item never matches by URL. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
 
 ## GitHub tab
 
@@ -42,11 +42,21 @@ Known, accepted gaps: the plugin SDK exposes no execution-decision reads, so v1 
 
 Every REST read is ETag-conditional: unchanged answers are `304`s that cost no quota. Check-run reads stop once checks settle. Search has no `304` path, so the audit makes a bounded set of search calls per run (orgs × logins × 4, plus one GraphQL discussion search each) and ETag-conditional per-item reads after that. The plugin honors `X-RateLimit-Remaining`/`Retry-After`, backs off into plugin state, and records per-run `200`/`304` counts so the operator can see the sync costs nearly nothing. It never calls the CLIProxy management API (the HTTP layer only allows `api.github.com`).
 
+## Authentication
+
+Exactly one auth mode must be configured; anything else fails the scan closed (no anonymous reads, ever):
+
+- **GitHub App (preferred):** set `appId`, `installationId` and `appPrivateKeySecretRef`. Each scan signs a short RS256 JWT from the private key (resolved at call time, never logged or persisted), exchanges it for a 1-hour installation token with an empty permissions subset, and uses that token for every REST/GraphQL read. Tokens live in process memory only and refresh 5 minutes before `expires_at`. The only outbound host is `api.github.com`.
+- **Personal token:** set `tokenSecretRef` to the `{ type: "secret_ref", secretId }` binding of a read-only token. Only the ref is stored; the token value is never logged.
+
 ## Configuration
 
 | key | default | meaning |
 |---|---|---|
-| `tokenSecretRef` | `null` | Company secret binding for a read-only GitHub token. Only the ref is stored; the token value is never logged. |
+| `tokenSecretRef` | `null` | Company secret binding for a read-only GitHub token (PAT auth mode). Only the ref is stored; the token value is never logged. |
+| `appId` | `""` | GitHub App auth mode: the numeric App ID, as a string. |
+| `installationId` | `""` | GitHub App auth mode: the numeric installation ID, as a string. |
+| `appPrivateKeySecretRef` | `null` | GitHub App auth mode: company secret binding for the App's PEM private key. Resolved at call time only, never logged or persisted. |
 | `releaseRepos` | `["router-for-me/CLIProxyAPI", "paperclipai/paperclip"]` | Upstream repos whose latest release is tracked. |
 | `releaseIntakeAssigneeAgentId` | Release Manager | Owner of release-intake cards. |
 | `releaseIntakeProjectId` | `""` | Project for release-intake cards. Empty means no project. |
@@ -60,10 +70,12 @@ Every REST read is ETag-conditional: unchanged answers are `304`s that cost no q
 | `compareBases` | `{}` | Per-repo compare base for release cards, keyed by `owner/repo`. A first-seen tag equal to the base is the install baseline: recorded, never carded. Set it to the running versions at install so the first tick creates no intake cards. |
 | `labelIdByName` | `{}` | Paperclip label IDs keyed by name. Only names present here can be synced (there is no labels read API). Include the `gh:awaiting/us` and `gh:awaiting/maintainer` IDs for the awaiting facet and the GitHub-tab metric counts to stay in sync, plus the `upstream:ungated` ID or the audit cannot label follow-through cards. |
 | `dryRun` | `false` | Log intended creates/wakes/updates without making them. |
-| `auditLogins` | `["Rick7C2"]` | GitHub logins the audit watches. `operatorLogin` and `ourLogins` are always included; append the App's bot login here (or to `ourLogins`) once GitHub App auth lands. |
+| `auditLogins` | `["Rick7C2"]` | GitHub logins the audit watches. `operatorLogin` and `ourLogins` are always included; append the App's bot login here (or to `ourLogins`). |
 | `auditOrgs` | `["router-for-me", "paperclipai"]` | Upstream orgs the audit searches per watched login. |
 | `auditRepos` | `[]` | Extra upstream repos (`owner/repo`) searched outside the audit orgs. |
 | `chiefOfStaffAgentId` | Chief of Staff | Owner of the `Ungated upstream post` flag cards. |
+| `maxCreatesPerTick` | `2` | Per-scan-run cap on created cards. Overflow is deferred to the next tick, never dropped. |
+| `maxWakesPerTick` | `5` | Per-scan-run cap on wakes (a create counts as a wake too). Overflow is deferred to the next tick, never dropped. |
 
 ## Capabilities
 

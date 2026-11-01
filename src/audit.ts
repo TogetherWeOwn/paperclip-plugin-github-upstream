@@ -1,6 +1,8 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
+import { resolveAuthToken } from "./github-app.js";
 import { backoffDelayMs, GITHUB_API_BASE, githubGet, githubGraphql, type FetchLike } from "./github.js";
+import { capsOf, wakesUsed } from "./items.js";
 import { findCardForItem, parseGitHubUrl, type CardLike } from "./mapping.js";
 import { ITEM_ORIGIN_KIND } from "./manifest.js";
 import { isBackedOff, setBackoff, stateKey, type RunStats } from "./state.js";
@@ -70,6 +72,7 @@ export interface AuditOutcome {
     | "flagged"
     | "would-flag"
     | "duplicate"
+    | "capped"
     | "skipped-cutover"
     | "skipped-no-tracker"
     | "skipped-backoff"
@@ -159,9 +162,17 @@ export async function runAuditScan(
 ): Promise<{ outcomes: AuditOutcome[]; stats: RunStats }> {
   const now = deps.now ?? Date.now;
   const startMs = now();
-  const stats: RunStats = { at: new Date(startMs).toISOString(), job: "audit-scan", ok200: 0, notModified304: 0, errors: 0, wakes: 0, creates: 0 };
+  const stats: RunStats = { at: new Date(startMs).toISOString(), job: "audit-scan", ok200: 0, notModified304: 0, errors: 0, wakes: 0, creates: 0, capped: 0 };
   const outcomes: AuditOutcome[] = [];
-  const token = await resolveToken(ctx, companyId, config);
+  let token: string;
+  try {
+    token = await resolveAuthToken(ctx, companyId, config, deps.fetchImpl, startMs);
+  } catch (err) {
+    // Fail closed: no token, no unauthenticated scan.
+    stats.errors += 1;
+    outcomes.push({ post: "-", item: "-", card: null, status: "error", detail: `refusing unauthenticated scan: ${String(err)}` });
+    return { outcomes, stats };
+  }
   const watched = watchedLogins(config);
 
   if (watched.size === 0) {
@@ -240,7 +251,9 @@ export async function runAuditScan(
       const itemOutcomes = await processItem(ctx, companyId, config, deps.fetchImpl, token, watched, ref, directChildren, allCards, state, stats,
         async (untilMs) => onRateLimited(untilMs), now());
       outcomes.push(...itemOutcomes);
-      if (itemOutcomes.some((o) => o.status === "error")) {
+      // Errors and budget deferrals both hold the search watermark: the
+      // unread or uncapped posts stay in next run's window.
+      if (itemOutcomes.some((o) => o.status === "error" || o.status === "capped")) {
         incomplete = true;
         restoreEtags();
         if (itemOutcomes.some((o) => o.detail === "rate limited")) {
@@ -457,7 +470,12 @@ async function processItem(
   }
 
   if (!config.dryRun && posts.length > 0) {
-    state.cursors[key] = posts[posts.length - 1].createdAt;
+    // Capped posts are deferred, not consumed: the cursor advances only past
+    // judged posts so a capped post is re-examined next run.
+    const consumed = posts.filter((p, i) => outcomes[i].status !== "capped");
+    if (consumed.length > 0) {
+      state.cursors[key] = consumed[consumed.length - 1].createdAt;
+    }
   }
   return outcomes;
 }
@@ -748,10 +766,17 @@ async function judgePost(
   nowMs: number,
 ): Promise<AuditOutcome> {
   const key = itemKey(post.item);
+  const caps = capsOf(config);
   let card = findCardForItem(directChildren, post.item);
   if (!card) {
     if (config.dryRun) {
       return { post: post.postUrl, item: key, card: null, status: "would-flag", reason: `would create follow-through card for ${key} and flag ${post.postKind} by @${post.authorLogin}` };
+    }
+    // Spend cap: leave the post unconsumed (no card, no bookkeeping) so the
+    // next tick picks it up. A create assigns an agent, so it spends both budgets.
+    if (stats.creates >= caps.maxCreates || wakesUsed(stats) >= caps.maxWakes) {
+      stats.capped += 1;
+      return { post: post.postUrl, item: key, card: null, status: "capped", reason: `would create follow-through card for ${key}`, detail: "create budget exhausted, deferred to next tick" };
     }
     const created = await ctx.issues.create({
       companyId,
@@ -787,6 +812,12 @@ async function judgePost(
   }
   if (config.dryRun) {
     return { post: post.postUrl, item: key, card: card.id, status: "would-flag", reason: `would flag ${post.postKind} by @${post.authorLogin} with no approved gate card` };
+  }
+  // Spend cap: leave the flag unwritten (no flag card, no wake, no cursor
+  // advance past this post) so the next tick picks it up.
+  if (stats.creates >= caps.maxCreates || wakesUsed(stats) >= caps.maxWakes) {
+    stats.capped += 1;
+    return { post: post.postUrl, item: key, card: card.id, status: "capped", reason: `would flag ${post.postKind} by @${post.authorLogin} with no approved gate card`, detail: "create/wake budget exhausted, deferred to next tick" };
   }
 
   const ungatedId = config.labelIdByName[UNGATED_LABEL_NAME];
@@ -829,9 +860,3 @@ async function judgePost(
   return { post: post.postUrl, item: key, card: card.id, status: "flagged", reason, detail: `flag card ${flagCard.id}` };
 }
 
-async function resolveToken(ctx: PluginContext, companyId: string, config: UpstreamConfig): Promise<string> {
-  // TODO(TWO-805): migrate to the shared App-auth token helper once the
-  // in-flight hardening/App-auth PR lands; tokenSecretRef stays until then.
-  if (!config.tokenSecretRef) return "";
-  return ctx.secrets.resolve(config.tokenSecretRef as string, { companyId });
-}

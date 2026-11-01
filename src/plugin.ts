@@ -32,7 +32,14 @@ async function scanAll(ctx: PluginContext, job: "release" | "items" | "audit"): 
   const companies = await ctx.companies.list();
   for (const company of companies) {
     try {
-      const config = resolveConfig(await ctx.config.get(company.id));
+      const raw = await ctx.config.get(company.id);
+      // Fail closed: a company with no explicit config row gets nothing —
+      // neither the default repos nor the default agent assignees.
+      if (!raw || Object.keys(raw).length === 0) {
+        ctx.logger.info("github-upstream scan skipped: no plugin config for company", { companyId: company.id, job });
+        continue;
+      }
+      const config = resolveConfig(raw);
       const fetchImpl: (url: string, init?: RequestInit) => Promise<Response> = (url, init) => ctx.http.fetch(url, init);
       const stats: RunStats = job === "release"
         ? (await runReleaseScan(ctx, company.id, config, { fetchImpl })).stats
@@ -48,6 +55,7 @@ async function scanAll(ctx: PluginContext, job: "release" | "items" | "audit"): 
         errors: stats.errors,
         wakes: stats.wakes,
         creates: stats.creates,
+        capped: stats.capped,
         dryRun: config.dryRun,
       });
     } catch (err) {

@@ -89,11 +89,13 @@ async function setup() {
   return { harness, trackerId: tracker.id };
 }
 
+const TOKEN_REF = { type: "secret_ref", secretId: "test-token" };
+
 const scan = (harness: TestHarness, trackerId: string, stub: FetchStub, config: Record<string, unknown> = {}) =>
   runAuditScan(
     harness.ctx,
     COMPANY,
-    resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID }, ...config }),
+    resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID }, ...config }),
     { fetchImpl: stub },
   );
 
@@ -320,7 +322,7 @@ describe("audit job", () => {
       if (url === issueUrl(201) && limit201) return new Response("limited", { status: 429 });
       return base(url, init);
     }) as FetchStub;
-    const config = resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
+    const config = resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
     const t0 = Date.parse("2026-11-02T13:00:00Z");
 
     const first = await runAuditScan(harness.ctx, COMPANY, config, { fetchImpl: stub, now: () => t0 });
@@ -351,7 +353,7 @@ describe("audit job", () => {
       }
       return new Response("not found", { status: 404 });
     }) as FetchStub;
-    const config = resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
+    const config = resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
     const out = await runAuditScan(harness.ctx, COMPANY, config, { fetchImpl: stub });
     expect(out.stats.errors).toBeGreaterThan(0);
     const stored = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as { lastSearchAt: string | null });
@@ -378,7 +380,7 @@ describe("audit job", () => {
 
   it("the watermark advances to scan start minus the overlap window", async () => {
     const t0 = Date.parse("2026-11-02T13:00:00Z");
-    const config = resolveConfig({ followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
+    const config = resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID } });
     await runAuditScan(harness.ctx, COMPANY, config, {
       fetchImpl: auditStub({ rest: {}, searchItems: [], graphqlDiscussion: null }),
       now: () => t0,
@@ -425,6 +427,42 @@ describe("audit job", () => {
     expect(out.outcomes).toHaveLength(1);
     expect(out.outcomes[0]).toMatchObject({ item: `${OWNER}/${REPO}#300`, status: "flagged" });
     expect(out.outcomes[0].post).toContain("pullrequestreview-101");
+    expect(await flagCards(harness)).toHaveLength(1);
+  });
+
+  it("an exhausted spend budget defers the flag to the next tick", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(200)]: {
+          etag: '"i1"',
+          body: issueRow(200, { title: "issue 200", user: { login: "Rick7C2" }, created_at: POST_AT }),
+        },
+        [commentsUrl(200)]: { etag: '"m1"', body: [] },
+      },
+      searchItems: [{ html_url: issueHtml(200) }],
+      graphqlDiscussion: null,
+    };
+    const stub = auditStub(table);
+    const config = (extra: Record<string, unknown> = {}) =>
+      resolveConfig({ tokenSecretRef: TOKEN_REF, followThroughTrackerIssueId: trackerId, labelIdByName: { [UNGATED_LABEL_NAME]: UNGATED_ID }, ...extra });
+
+    const capped = await runAuditScan(harness.ctx, COMPANY, config({ maxCreatesPerTick: 0 }), { fetchImpl: stub });
+    expect(capped.outcomes).toHaveLength(1);
+    expect(capped.outcomes[0].status).toBe("capped");
+    expect(capped.stats.capped).toBe(1);
+    expect(await flagCards(harness)).toHaveLength(0);
+
+    // Nothing was consumed: the watermark and cursor are held for the retry.
+    const mid = (await harness.ctx.state.get(stateKey(COMPANY, "audit") as never) as {
+      lastSearchAt: string | null; cursors: Record<string, string>;
+    });
+    expect(mid.lastSearchAt).toBeNull();
+    expect(mid.cursors[`${OWNER}/${REPO}#200`]).toBeUndefined();
+
+    // Next tick with budget flags the post exactly once.
+    const flagged = await runAuditScan(harness.ctx, COMPANY, config({}), { fetchImpl: stub });
+    expect(flagged.outcomes).toHaveLength(1);
+    expect(flagged.outcomes[0].status).toBe("flagged");
     expect(await flagCards(harness)).toHaveLength(1);
   });
 
