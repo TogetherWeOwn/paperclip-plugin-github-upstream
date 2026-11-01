@@ -29,13 +29,16 @@ export const EMPTY_SUMMARY: UpstreamSummary = {
 
 /**
  * Aggregate stored item snapshots into tab counts. Reads only the plugin
- * state the item scan already keeps — no GitHub calls, no LLM.
+ * state the item scan already keeps — no GitHub calls, no LLM. Records
+ * without a card (not-ours extras, not-yet-created items) are invisible in
+ * the origin-kind-filtered list, so they are skipped to keep the metrics
+ * and the list in agreement.
  */
 export function summarizeItems(items: ItemMap): UpstreamSummary {
   const summary: UpstreamSummary = { ...EMPTY_SUMMARY };
   for (const record of Object.values(items)) {
     const snapshot = record.snapshot;
-    if (!snapshot) continue;
+    if (!snapshot || !record.cardId) continue;
     summary.trackedItems += 1;
     if (record.checkedAt && (!summary.lastScanAt || record.checkedAt > summary.lastScanAt)) {
       summary.lastScanAt = record.checkedAt;

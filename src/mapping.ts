@@ -176,14 +176,17 @@ export function decideAwaiting(
 ): "us" | "maintainer" | null {
   if (snapshot.state !== "open") return null;
   const ours = isOursItem(config, { headLabel: snapshot.headLabel, authorLogin: snapshot.authorLogin });
+  // Someone else's item is never our court, whatever its review or CI state:
+  // the tab only tracks actionability for ours items.
+  if (!ours) return null;
   if (snapshot.kind === "pull") {
     if (snapshot.draft) return "us";
     if (snapshot.checkConclusion === "failure") return "us";
     if (snapshot.latestReviewState === "CHANGES_REQUESTED") return "us";
     if (snapshot.latestReviewState === "APPROVED") return "maintainer";
-    return ours ? "maintainer" : null;
+    return "maintainer";
   }
-  return ours ? "maintainer" : null;
+  return "maintainer";
 }
 
 /**

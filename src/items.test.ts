@@ -4,6 +4,7 @@ import manifest, { ITEM_ORIGIN_KIND } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
 import { latestDecisiveReview, runItemScan } from "./items.js";
+import { stateKey } from "./state.js";
 
 const COMPANY = "c-1";
 const OWNER = "paperclipai";
@@ -566,6 +567,214 @@ describe("item job", () => {
 
     const stored = harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }) as Record<string, { snapshot: { awaiting: string } }>;
     expect(stored[`${OWNER}/${REPO}#800`].snapshot.awaiting).toBe("us");
+  });
+
+  it("upgrade backfills review state without waking: silent label sync only", async () => {
+    const card800 = await child(harness, trackerId, {}, `${OWNER}/${REPO}#800`);
+    const card801 = await child(harness, trackerId, {}, `${OWNER}/${REPO}#801`);
+    const ids = {
+      "gh:repo/paperclip": "L-repo",
+      "gh:type/pr": "L-type",
+      "gh:state/open": "L-state",
+      "gh:ci/green": "L-ci",
+      "gh:awaiting/maintainer": "L-wm",
+      "gh:awaiting/us": "L-wu",
+    };
+    // Stored shape from before latestReviewState existed: a seven-element
+    // fingerprint and a snapshot with neither the review nor awaiting key.
+    const legacyFp = (comments: number, reviews: number) =>
+      JSON.stringify(["open", "2026-10-12T00:00:00Z", comments, reviews, "success", HEAD_SHA, false]);
+    const legacyRecord = (n: number, comments: number, reviews: number, etag: string) => {
+      const { latestReviewState: _dropReview, awaiting: _dropAwaiting, ...rest } = {
+        owner: OWNER,
+        repo: REPO,
+        kind: "pull",
+        number: n,
+        url: `https://github.com/${OWNER}/${REPO}/pull/${n}`,
+        title: `pr ${n}`,
+        state: "open",
+        updatedAt: "2026-10-12T00:00:00Z",
+        commentCount: comments,
+        authorLogin: "stranger",
+        headLabel: "TogetherWeOwn:fix-x",
+        reviewCount: reviews,
+        latestReviewState: null,
+        checkConclusion: "success",
+        headSha: HEAD_SHA,
+        draft: false,
+        awaiting: null,
+      };
+      void _dropReview;
+      void _dropAwaiting;
+      const fp = legacyFp(comments, reviews);
+      return {
+        etags: { issue: `"i${etag}"`, pull: `"p${etag}"`, reviews: `"r${etag}"`, checkRuns: `"c${etag}"` },
+        resolvedKind: "pull",
+        fingerprint: fp,
+        wokenFingerprint: fp,
+        snapshot: rest,
+        cardId: null,
+        checkedAt: "2026-10-12T00:00:00Z",
+      };
+    };
+    await harness.ctx.state.set(stateKey(COMPANY, "items") as never, {
+      [`${OWNER}/${REPO}#800`]: legacyRecord(800, 1, 0, "800l"),
+      [`${OWNER}/${REPO}#801`]: legacyRecord(801, 1, 1, "801l"),
+    } as never);
+    // #801's change request predates the upgrade (stored reviewCount already
+    // counts it); the forced backfill must learn it, not wake for it.
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(800)]: { etag: '"i800l"', body: pullIssueRow(800) },
+        [pullUrl(800)]: { etag: '"p800l"', body: pullRow(800, { head: { sha: HEAD_SHA, label: "TogetherWeOwn:fix-x" } }) },
+        [reviewsUrl(800)]: { etag: '"r800l"', body: [] },
+        [issueUrl(801)]: { etag: '"i801l"', body: pullIssueRow(801) },
+        [pullUrl(801)]: { etag: '"p801l"', body: pullRow(801, { head: { sha: HEAD_SHA, label: "TogetherWeOwn:fix-x" } }) },
+        [reviewsUrl(801)]: {
+          etag: '"r801l"',
+          body: [{ id: 9, state: "CHANGES_REQUESTED", user: { login: "maintainer" } }],
+        },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const updates = spyUpdates(harness);
+
+    const out = await scan(harness, trackerId, stub, { labelIdByName: ids });
+    expect(wakes).toHaveLength(0);
+    expect(out.outcomes).toHaveLength(2);
+    for (const o of out.outcomes) {
+      expect(o.status).toBe("mapped");
+      expect(o.reason ?? "").not.toContain("review ruling cleared");
+      expect(o.reason ?? "").not.toContain("first seen");
+    }
+    expect(out.outcomes.find((o) => o.item === `${OWNER}/${REPO}#800`)?.reason).toContain("backfill review state");
+    // Unruled ours PR: awaiting maintainer, no wake.
+    const patch800 = updates.map((u) => u.patch).find((p) => (p as { labelIds?: string[] }).labelIds?.includes("L-wm")) as { labelIds?: string[] };
+    expect(patch800?.labelIds).toContain("L-wm");
+    // Pre-existing change request: silently flips to awaiting us.
+    const patch801 = updates.map((u) => u.patch).find((p) => (p as { labelIds?: string[] }).labelIds?.includes("L-wu")) as { labelIds?: string[] };
+    expect(patch801?.labelIds).toContain("L-wu");
+    expect(patch801?.labelIds).not.toContain("L-wm");
+    // The second scan is pure 304s (backfilled ETag cached): fully quiet.
+    const quiet = await scan(harness, trackerId, stub, { labelIdByName: ids });
+    expect(quiet.outcomes.every((o) => o.status === "unchanged")).toBe(true);
+    expect(wakes).toHaveLength(0);
+    const stored = harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }) as Record<string, { snapshot: { awaiting: string } }>;
+    expect(stored[`${OWNER}/${REPO}#800`].snapshot.awaiting).toBe("maintainer");
+    expect(stored[`${OWNER}/${REPO}#801`].snapshot.awaiting).toBe("us");
+    expect(card800.id).toBeTruthy();
+    expect(card801.id).toBeTruthy();
+  });
+
+  it("a foreign red PR gets no awaiting labels", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#902`);
+    const ids = {
+      "gh:repo/paperclip": "L-repo",
+      "gh:type/pr": "L-type",
+      "gh:state/open": "L-state",
+      "gh:ci/red": "L-cired",
+      "gh:awaiting/maintainer": "L-wm",
+      "gh:awaiting/us": "L-wu",
+    };
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(902)]: { etag: '"i902"', body: pullIssueRow(902) },
+        [pullUrl(902)]: { etag: '"p902"', body: pullRow(902, { head: { sha: HEAD_SHA, label: "other:fix-x" } }) },
+        [reviewsUrl(902)]: { etag: '"r902"', body: [] },
+        [checksUrl(HEAD_SHA)]: {
+          etag: '"c902"',
+          body: { total_count: 1, check_runs: [{ status: "completed", conclusion: "failure", name: "ci" }] },
+        },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const updates = spyUpdates(harness);
+
+    const out = await scan(harness, trackerId, stub, { labelIdByName: ids });
+    // First sight syncs labels/header without waking: "unchanged", not "mapped".
+    expect(out.outcomes[0].status).toBe("unchanged");
+    expect(wakes).toHaveLength(0);
+    const patch = updates[updates.length - 1].patch as { labelIds?: string[] };
+    expect(patch.labelIds).toContain("L-cired");
+    expect(patch.labelIds).not.toContain("L-wu");
+    expect(patch.labelIds).not.toContain("L-wm");
+    const stored = harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "items" }) as Record<string, { snapshot: { awaiting: string | null } }>;
+    expect(stored[`${OWNER}/${REPO}#902`].snapshot.awaiting).toBeNull();
+    expect(card.id).toBeTruthy();
+  });
+
+  it("a config-driven awaiting flip syncs labels without waking", async () => {
+    const card = await child(harness, trackerId, {}, `${OWNER}/${REPO}#903`);
+    const ids = {
+      "gh:repo/paperclip": "L-repo",
+      "gh:type/pr": "L-type",
+      "gh:state/open": "L-state",
+      "gh:ci/red": "L-cired",
+      "gh:awaiting/maintainer": "L-wm",
+      "gh:awaiting/us": "L-wu",
+    };
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(903)]: { etag: '"i903"', body: pullIssueRow(903) },
+        [pullUrl(903)]: { etag: '"p903"', body: pullRow(903, { head: { sha: HEAD_SHA, label: "other:fix-x" } }) },
+        [reviewsUrl(903)]: { etag: '"r903"', body: [] },
+        [checksUrl(HEAD_SHA)]: {
+          etag: '"c903"',
+          body: { total_count: 1, check_runs: [{ status: "completed", conclusion: "failure", name: "ci" }] },
+        },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const updates = spyUpdates(harness);
+
+    const foreign = await scan(harness, trackerId, stub, { labelIdByName: ids });
+    expect(foreign.outcomes[0].status).toBe("unchanged");
+    const firstPatch = updates[updates.length - 1].patch as { labelIds?: string[] };
+    expect(firstPatch.labelIds).not.toContain("L-wu");
+    expect(firstPatch.labelIds).not.toContain("L-wm");
+
+    // The operator adopts the fork: same upstream bytes, but now ours and red.
+    const adopted = await scan(harness, trackerId, stub, { labelIdByName: ids, operatorLogin: "stranger" });
+    expect(adopted.outcomes[0].status).toBe("mapped");
+    expect(adopted.outcomes[0].reason).toContain("awaiting none->us (no upstream change)");
+    expect(wakes).toHaveLength(0);
+    const patch = updates[updates.length - 1].patch as { labelIds?: string[] };
+    expect(patch.labelIds).toContain("L-wu");
+    expect(patch.labelIds).not.toContain("L-wm");
+    expect(card.id).toBeTruthy();
+  });
+
+  it("drops state for items that are no longer tracked", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(901)]: { etag: '"i901"', body: pullIssueRow(901) },
+        [pullUrl(901)]: { etag: '"p901"', body: pullRow(901) },
+        [reviewsUrl(901)]: { etag: '"r901"', body: [] },
+        [checksUrl(HEAD_SHA)]: { etag: '"c901"', body: checksSuccess },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const extra = [{ owner: OWNER, repo: REPO, kind: "pull", number: 901 }] as const;
+
+    const first = await scan(harness, trackerId, stub, { extraTrackedItems: [...extra] });
+    expect(first.outcomes[0].status).toBe("not-ours");
+    const stateKeyInput = { scopeKind: "company", scopeId: COMPANY, stateKey: "items" } as const;
+    expect(Object.keys(harness.getState(stateKeyInput) as Record<string, unknown>)).toEqual([`${OWNER}/${REPO}#901`]);
+
+    const second = await scan(harness, trackerId, stub, {});
+    expect(second.outcomes).toHaveLength(0);
+    expect(harness.getState(stateKeyInput)).toEqual({});
   });
 
   it("dry-run reports intended wakes and creates without calling them", async () => {

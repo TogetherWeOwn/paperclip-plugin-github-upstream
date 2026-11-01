@@ -39,7 +39,7 @@ describe("summarizeItems", () => {
     expect(summarizeItems({})).toEqual(EMPTY_SUMMARY);
   });
 
-  it("counts open items only, skipping records without snapshots", () => {
+  it("counts open items only, skipping records without snapshots or cards", () => {
     const items: ItemMap = {
       "paperclipai/paperclip#1": record(snapshot({ number: 1, awaiting: "maintainer" }), "2026-11-01T01:00:00Z"),
       "paperclipai/paperclip#2": record(snapshot({ number: 2, awaiting: "us", checkConclusion: "failure" }), "2026-11-01T02:00:00Z"),
@@ -47,6 +47,8 @@ describe("summarizeItems", () => {
       "paperclipai/paperclip#4": record(snapshot({ number: 4, state: "merged", awaiting: null })),
       "paperclipai/paperclip#5": record(snapshot({ number: 5, state: "closed", awaiting: null })),
       "paperclipai/paperclip#6": record(null),
+      // A card-less record (not-ours extra) is invisible in the tab: skipped.
+      "paperclipai/paperclip#7": { ...record(snapshot({ number: 7 })), cardId: null },
     };
     expect(summarizeItems(items)).toEqual({
       openPRs: 2,

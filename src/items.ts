@@ -183,6 +183,11 @@ export async function runItemScan(
   }
 
   await runDiscovery(ctx, companyId, config, deps, token, children, tracked, outcomes, stats, now());
+  // Drop records for items that are no longer tracked (removed extras,
+  // deleted cards): otherwise the tab metrics count invisible items.
+  for (const key of Object.keys(next)) {
+    if (!tracked.has(key)) delete next[key];
+  }
   await ctx.state.set(stateKey(companyId, "items"), next);
   return { outcomes, stats };
 }
@@ -236,9 +241,19 @@ async function syncOneItem(
   const previous: ItemRecord = next[key] ?? { etags: {}, resolvedKind: null, fingerprint: null, wokenFingerprint: null, snapshot: null, cardId: null, checkedAt: "" };
   const etags = { ...previous.etags };
 
+  // Upgrade path: snapshots stored before latestReviewState existed carry no
+  // such key. Their reviews are refetched unconditionally once (a stored ETag
+  // would 304 forever and the field would never populate), and their stored
+  // seven-element fingerprint is renormalized below so the backfill alone
+  // never wakes the card.
+  const prevSnapshot = previous.snapshot;
+  const legacyNoReviewState =
+    prevSnapshot !== null && previous.fingerprint !== null && lacksReviewState(prevSnapshot);
+  const forceReviews = legacyNoReviewState && previous.resolvedKind !== "issue" && previous.resolvedKind !== "discussion";
+
   const fetched = await fetchSnapshot(fetchImpl, token, item, etags, stats, previous, async (untilMs) => {
     await setBackoff(ctx, companyId, untilMs);
-  }, nowMs);
+  }, nowMs, forceReviews);
   if (fetched === "rate-limited") {
     return { item: key, card: previous.cardId, status: "error", detail: "rate limited" };
   }
@@ -296,31 +311,32 @@ async function syncOneItem(
     return { item: key, card: created.id, status: "created", reason: `created follow-through card for ${key}` };
   }
 
-  const changed = previous.fingerprint !== null && previous.fingerprint !== record.fingerprint;
+  // Compare against a renormalized baseline so a legacy backfill of the
+  // review field reads as no change. The normalized copy also keeps the
+  // missing key from producing a bogus "review ruling cleared" line.
+  const prevForCompare: ItemSnapshot =
+    legacyNoReviewState && prevSnapshot
+      ? { ...prevSnapshot, latestReviewState: fetched.snapshot.latestReviewState }
+      : prevSnapshot ?? snapshot;
+  const baselineFingerprint = legacyNoReviewState ? fingerprintOf(prevForCompare) : previous.fingerprint;
+  const changed = previous.fingerprint !== null && baselineFingerprint !== record.fingerprint;
   const firstSeen = previous.fingerprint === null;
-  if (changed || firstSeen) {
-    const patch: Record<string, unknown> = {};
-    const backfill = !config.dryRun ? backfillPatch(card, item) : null;
-    if (backfill) {
-      patch.originKind = backfill.originKind;
-      patch.originId = backfill.originId;
-    }
-    const desiredLabels = labelNamesFor(snapshot);
-    const currentNames = (card.labels ?? []).map((l) => l.name);
-    const { labelIds, changed: labelsChanged } = syncLabelIds(card.labelIds, currentNames, desiredLabels, config.labelIdByName);
-    if (labelsChanged) patch.labelIds = labelIds;
-    const { description, changed: headerChanged } = withHeader(card.description, snapshot);
-    if (headerChanged) patch.description = description;
-    const detail = previous.snapshot ? (describeChange(previous.snapshot, snapshot) ?? "first seen") : "first seen";
+  // A legacy record with no other change still syncs labels/header once (new
+  // awaiting facets for old cards) but never wakes for the backfill itself.
+  const upgradeSync = legacyNoReviewState && !firstSeen;
+  if (changed || firstSeen || upgradeSync) {
+    const patch = buildCardPatch(card, item, snapshot, config, config.dryRun);
+    const changeDetail = prevSnapshot ? describeChange(prevForCompare, snapshot) : null;
+    const detail = changeDetail ?? (firstSeen || !prevSnapshot ? "first seen" : "backfill review state (no upstream change)");
     if (Object.keys(patch).length > 0) {
       if (config.dryRun) {
         return { item: key, card: card.id, status: "would-wake", reason: detail, detail: "would update labels/header" };
       }
       await ctx.issues.update(card.id, patch as never, companyId);
     }
-    if (firstSeen || record.wokenFingerprint === record.fingerprint) {
+    if (firstSeen || record.wokenFingerprint === record.fingerprint || (upgradeSync && !changed)) {
       record.wokenFingerprint = record.fingerprint;
-      return { item: key, card: card.id, status: changed ? "mapped" : "unchanged", reason: detail, detail: "labels/header synced, no wake (first seen or already woken)" };
+      return { item: key, card: card.id, status: changed || upgradeSync ? "mapped" : "unchanged", reason: detail, detail: "labels/header synced, no wake (first seen or already woken)" };
     }
     if (config.dryRun) {
       return { item: key, card: card.id, status: "would-wake", reason: `upstream ${key}: ${detail}` };
@@ -362,11 +378,54 @@ async function syncOneItem(
       return { item: key, card: card.id, status: "wake-failed", reason: detail, detail: String(err) };
     }
   }
+  if (!config.dryRun && prevSnapshot && prevSnapshot.awaiting !== snapshot.awaiting) {
+    // Config or label-map drift flipped awaiting with no upstream change. The
+    // fingerprint covers upstream fields only, so sync the labels/header
+    // quietly: the card and the metric must agree, but nothing woke upstream.
+    const patch = buildCardPatch(card, item, snapshot, config, false);
+    if (Object.keys(patch).length > 0) {
+      await ctx.issues.update(card.id, patch as never, companyId);
+      const from = prevSnapshot.awaiting ?? "none";
+      const to = snapshot.awaiting ?? "none";
+      return { item: key, card: card.id, status: "mapped", reason: `awaiting ${from}->${to} (no upstream change)`, detail: `awaiting ${from}->${to} (no upstream change)` };
+    }
+  }
   if (record.wokenFingerprint === null && previous.snapshot) {
     // State predates wokenFingerprint tracking: adopt without waking.
     record.wokenFingerprint = record.fingerprint;
   }
   return { item: key, card: card?.id ?? previous.cardId, status: "unchanged" };
+}
+
+/** Records stored before latestReviewState existed carry no such key. */
+function lacksReviewState(snapshot: ItemSnapshot): boolean {
+  return (snapshot as unknown as { latestReviewState?: unknown }).latestReviewState === undefined;
+}
+
+/**
+ * Label backfill plus gh:* label and description-header sync for one card.
+ * Pure patch builder: the caller decides dry-run reporting and waking.
+ */
+function buildCardPatch(
+  card: CardLike,
+  item: TrackedItemRef & { kind: "issue" | "pull" | "discussion" },
+  snapshot: ItemSnapshot,
+  config: UpstreamConfig,
+  dryRun: boolean,
+): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const backfill = !dryRun ? backfillPatch(card, item) : null;
+  if (backfill) {
+    patch.originKind = backfill.originKind;
+    patch.originId = backfill.originId;
+  }
+  const desiredLabels = labelNamesFor(snapshot);
+  const currentNames = (card.labels ?? []).map((l) => l.name);
+  const { labelIds, changed: labelsChanged } = syncLabelIds(card.labelIds, currentNames, desiredLabels, config.labelIdByName);
+  if (labelsChanged) patch.labelIds = labelIds;
+  const { description, changed: headerChanged } = withHeader(card.description, snapshot);
+  if (headerChanged) patch.description = description;
+  return patch;
 }
 
 interface GitHubActorComment {
@@ -480,6 +539,7 @@ async function fetchSnapshot(
   previous: ItemRecord,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
+  forceReviews = false,
 ): Promise<FetchResult> {
   const kind = previous.resolvedKind ?? item.kind;
   if (kind === "discussion") {
@@ -540,7 +600,7 @@ async function fetchSnapshot(
     draft: previous.snapshot?.draft ?? false,
     awaiting: previous.snapshot?.awaiting ?? null,
   };
-  const snapshot = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs);
+  const snapshot = await fetchPullRest(fetchImpl, token, item, etags, stats, base, onRateLimited, nowMs, forceReviews);
   if (!snapshot) return "rate-limited";
   if (snapshot === "not-a-pull") {
     // The origin ID guessed PR but the item is an issue: self-correct permanently.
@@ -599,6 +659,7 @@ async function fetchPullRest(
   base: ItemSnapshot,
   onRateLimited: (untilMs: number) => Promise<void>,
   nowMs: number,
+  forceReviews = false,
 ): Promise<ItemSnapshot | "not-a-pull" | null> {
   const rest = `${GITHUB_API_BASE}/repos/${item.owner}/${item.repo}`;
   const pullRes = await conditionalGet<GitHubPull>(fetchImpl, token, `${rest}/pulls/${item.number}`, etags.pull ?? null, stats, onRateLimited, nowMs);
@@ -622,7 +683,9 @@ async function fetchPullRest(
     if (pull.title) base.title = pull.title;
     if (pull.user?.login) base.authorLogin = pull.user.login;
   }
-  const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews`, etags.reviews ?? null, stats, onRateLimited, nowMs);
+  // A forced read skips the stored ETag once (upgrade backfill): the fresh
+  // 200 still refreshes the cache, so later scans are 304s again.
+  const reviewsRes = await conditionalGet<GitHubReview[]>(fetchImpl, token, `${rest}/pulls/${item.number}/reviews`, forceReviews ? null : (etags.reviews ?? null), stats, onRateLimited, nowMs);
   if (!reviewsRes) return null;
   if (!reviewsRes.notModified) {
     etags.reviews = reviewsRes.etag;

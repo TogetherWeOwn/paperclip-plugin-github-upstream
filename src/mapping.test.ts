@@ -144,6 +144,14 @@ describe("decideAwaiting", () => {
     expect(decideAwaiting(config, { ...ours, state: "open", draft: false, checkConclusion: "success", latestReviewState: "APPROVED" })).toBe("maintainer");
   });
 
+  it("foreign PRs get no label whatever their review or CI state", () => {
+    const open = { ...theirs, state: "open" } as const;
+    expect(decideAwaiting(config, { ...open, draft: true, checkConclusion: "success", latestReviewState: null })).toBeNull();
+    expect(decideAwaiting(config, { ...open, draft: false, checkConclusion: "failure", latestReviewState: null })).toBeNull();
+    expect(decideAwaiting(config, { ...open, draft: false, checkConclusion: "success", latestReviewState: "CHANGES_REQUESTED" })).toBeNull();
+    expect(decideAwaiting(config, { ...open, draft: false, checkConclusion: "success", latestReviewState: "APPROVED" })).toBeNull();
+  });
+
   it("unruled ours PRs and ours issues wait on the maintainer; non-ours items get no label", () => {
     expect(decideAwaiting(config, { ...ours, state: "open", draft: false, checkConclusion: "success", latestReviewState: null })).toBe("maintainer");
     expect(decideAwaiting(config, { ...theirs, state: "open", draft: false, checkConclusion: "success", latestReviewState: null })).toBeNull();
