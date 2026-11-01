@@ -1,10 +1,11 @@
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveConfig } from "./config.js";
-import { runItemScan } from "./items.js";
+import { runItemScan, type ItemMap } from "./items.js";
 import { ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
 import { runReleaseScan } from "./releases.js";
-import { recordRunStats, type RunStats } from "./state.js";
+import { recordRunStats, stateKey, type RunStats } from "./state.js";
+import { EMPTY_SUMMARY, SUMMARY_DATA_KEY, summarizeItems } from "./summary.js";
 
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
@@ -13,6 +14,12 @@ const plugin = definePlugin({
     });
     ctx.jobs.register(ITEM_JOB_KEY, async () => {
       await scanAll(ctx, "items");
+    });
+    ctx.data.register(SUMMARY_DATA_KEY, async (params) => {
+      const companyId = typeof params.companyId === "string" ? params.companyId : "";
+      if (!companyId) return { ...EMPTY_SUMMARY };
+      const stored = (await ctx.state.get(stateKey(companyId, "items")) as ItemMap | null) ?? {};
+      return summarizeItems(stored);
     });
   },
 });

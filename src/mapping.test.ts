@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   backfillPatch,
+  decideAwaiting,
   describeChange,
   findCardForItem,
   fingerprintOf,
@@ -32,9 +33,11 @@ const snapshot = (extra: Partial<ItemSnapshot> = {}): ItemSnapshot => ({
   authorLogin: "Rick7C2",
   headLabel: "TogetherWeOwn:fix-backup-tier",
   reviewCount: 3,
+  latestReviewState: null,
   checkConclusion: "success",
   headSha: "aaea1d47500112233445566778899aabbccddeeff",
   draft: false,
+  awaiting: null,
   ...extra,
 });
 
@@ -118,11 +121,51 @@ describe("fingerprintOf / describeChange", () => {
     expect(describeChange(a, snapshot({ headSha: "bbc1d47500112233445566778899aabbccddeeff" }))).toBe("head aaea1d4->bbc1d47");
     expect(describeChange(a, snapshot({ state: "merged" }))).toBe("state open->merged");
     expect(describeChange(a, snapshot({ draft: true }))).toBe("marked draft");
+    expect(describeChange(a, snapshot({ latestReviewState: "CHANGES_REQUESTED" }))).toBe("reviewer requested changes");
+    expect(describeChange(a, snapshot({ latestReviewState: "APPROVED" }))).toBe("reviewer approved");
+    expect(describeChange(snapshot({ latestReviewState: "APPROVED" }), snapshot())).toContain("cleared");
+  });
+});
+
+describe("decideAwaiting", () => {
+  const config = { ourHeadPrefixes: ["TogetherWeOwn:"], operatorLogin: "Rick7C2" } as never;
+  const ours = { kind: "pull", headLabel: "TogetherWeOwn:fix-x", authorLogin: "stranger" } as const;
+  const theirs = { kind: "pull", headLabel: "other:fix-x", authorLogin: "stranger" } as const;
+
+  it("closed and merged items need nobody", () => {
+    expect(decideAwaiting(config, { ...ours, state: "closed", draft: false, checkConclusion: "success", latestReviewState: null })).toBeNull();
+    expect(decideAwaiting(config, { ...ours, state: "merged", draft: false, checkConclusion: "success", latestReviewState: "APPROVED" })).toBeNull();
+  });
+
+  it("drafts, red CI and change requests need us", () => {
+    const base = { ...ours, state: "open", draft: false, checkConclusion: "success", latestReviewState: null } as const;
+    expect(decideAwaiting(config, { ...base, draft: true })).toBe("us");
+    expect(decideAwaiting(config, { ...base, checkConclusion: "failure" })).toBe("us");
+    expect(decideAwaiting(config, { ...base, latestReviewState: "CHANGES_REQUESTED" })).toBe("us");
+  });
+
+  it("approved PRs wait on the maintainer", () => {
+    expect(decideAwaiting(config, { ...ours, state: "open", draft: false, checkConclusion: "success", latestReviewState: "APPROVED" })).toBe("maintainer");
+  });
+
+  it("foreign PRs get no label whatever their review or CI state", () => {
+    const open = { ...theirs, state: "open" } as const;
+    expect(decideAwaiting(config, { ...open, draft: true, checkConclusion: "success", latestReviewState: null })).toBeNull();
+    expect(decideAwaiting(config, { ...open, draft: false, checkConclusion: "failure", latestReviewState: null })).toBeNull();
+    expect(decideAwaiting(config, { ...open, draft: false, checkConclusion: "success", latestReviewState: "CHANGES_REQUESTED" })).toBeNull();
+    expect(decideAwaiting(config, { ...open, draft: false, checkConclusion: "success", latestReviewState: "APPROVED" })).toBeNull();
+  });
+
+  it("unruled ours PRs and ours issues wait on the maintainer; non-ours items get no label", () => {
+    expect(decideAwaiting(config, { ...ours, state: "open", draft: false, checkConclusion: "success", latestReviewState: null })).toBe("maintainer");
+    expect(decideAwaiting(config, { ...theirs, state: "open", draft: false, checkConclusion: "success", latestReviewState: null })).toBeNull();
+    expect(decideAwaiting(config, { kind: "issue", state: "open", draft: false, checkConclusion: "none", latestReviewState: null, headLabel: null, authorLogin: "Rick7C2" })).toBe("maintainer");
+    expect(decideAwaiting(config, { kind: "discussion", state: "open", draft: false, checkConclusion: "none", latestReviewState: null, headLabel: null, authorLogin: "stranger" })).toBeNull();
   });
 });
 
 describe("labelNamesFor / syncLabelIds", () => {
-  it("computes the four labels and merges them without touching others", () => {
+  it("computes the facet labels and merges them without touching others", () => {
     expect(labelNamesFor(snapshot())).toEqual(["gh:repo/paperclip", "gh:type/pr", "gh:state/open", "gh:ci/green"]);
     expect(labelNamesFor(snapshot({ kind: "issue", state: "closed", checkConclusion: "pending" }))).toEqual([
       "gh:repo/paperclip",
@@ -130,6 +173,8 @@ describe("labelNamesFor / syncLabelIds", () => {
       "gh:state/closed",
       "gh:ci/pending",
     ]);
+    expect(labelNamesFor(snapshot({ awaiting: "us" }))).toContain("gh:awaiting/us");
+    expect(labelNamesFor(snapshot({ awaiting: "maintainer" }))).toContain("gh:awaiting/maintainer");
     const ids = { "gh:repo/paperclip": "L1", "gh:type/pr": "L2", "gh:state/open": "L3", "gh:ci/green": "L4", "gh:ci/red": "L5" };
     // Adds missing, drops stale gh:*, keeps priority labels without an ID mapping.
     const { labelIds, changed } = syncLabelIds(["L5", "L9"], ["gh:ci/red", "priority:high"], ["gh:repo/paperclip", "gh:type/pr", "gh:state/open", "gh:ci/green"], ids);
@@ -141,6 +186,10 @@ describe("labelNamesFor / syncLabelIds", () => {
     // Names without an ID mapping are skipped, not faked.
     const skipped = syncLabelIds([], [], ["gh:repo/paperclip"], {});
     expect(skipped).toEqual({ labelIds: [], changed: false });
+    // Stale gh:* IDs are swept even when the card carries no label names.
+    const nameless = syncLabelIds(["L1", "L2", "L3", "L4", "L5"], [], ["gh:repo/paperclip", "gh:type/pr", "gh:state/open", "gh:ci/red"], ids);
+    expect(new Set(nameless.labelIds)).toEqual(new Set(["L1", "L2", "L3", "L5"]));
+    expect(nameless.changed).toBe(true);
   });
 });
 

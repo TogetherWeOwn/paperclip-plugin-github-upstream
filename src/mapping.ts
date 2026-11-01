@@ -23,6 +23,15 @@ export interface ItemSnapshot {
   checkConclusion: "success" | "failure" | "pending" | "neutral" | "none";
   headSha: string | null;
   draft: boolean;
+  /** Latest decisive review state (APPROVED / CHANGES_REQUESTED), or null when no reviewer has ruled. */
+  latestReviewState: "APPROVED" | "CHANGES_REQUESTED" | null;
+  /**
+   * Whose court the ball is in. Derived deterministically from the fields
+   * above (never fetched separately): closed/merged items need nobody, open
+   * PRs needing our action are "us", everything open that waits on upstream
+   * is "maintainer".
+   */
+  awaiting: "us" | "maintainer" | null;
 }
 
 export type CardLike = Pick<Issue, "id" | "originKind" | "originId"> & {
@@ -127,6 +136,7 @@ export function fingerprintOf(snapshot: ItemSnapshot): string {
     snapshot.updatedAt,
     snapshot.commentCount,
     snapshot.reviewCount,
+    snapshot.latestReviewState,
     snapshot.checkConclusion,
     snapshot.headSha,
     snapshot.draft,
@@ -146,6 +156,15 @@ export function describeChange(previous: ItemSnapshot, next: ItemSnapshot): stri
     parts.push(delta > 0 ? `${delta} new review${delta === 1 ? "" : "s"}` : `reviews ${previous.reviewCount}->${next.reviewCount}`);
   }
   if (previous.checkConclusion !== next.checkConclusion) parts.push(`checks ${previous.checkConclusion}->${next.checkConclusion}`);
+  if (previous.latestReviewState !== next.latestReviewState) {
+    parts.push(
+      next.latestReviewState === "CHANGES_REQUESTED"
+        ? "reviewer requested changes"
+        : next.latestReviewState === "APPROVED"
+          ? "reviewer approved"
+          : `review ruling cleared (${previous.latestReviewState ?? "none"}->none)`,
+    );
+  }
   if ((previous.headSha ?? null) !== (next.headSha ?? null)) {
     parts.push(`head ${shortSha(previous.headSha)}->${shortSha(next.headSha)}`);
   }
@@ -212,18 +231,53 @@ export function safeUpstreamUrl(
 /** Label names kept in sync on each card. */
 export function labelNamesFor(snapshot: ItemSnapshot): string[] {
   const ci = snapshot.checkConclusion === "success" || snapshot.checkConclusion === "neutral" ? "green" : snapshot.checkConclusion === "failure" ? "red" : "pending";
-  return [
+  const labels = [
     `gh:repo/${snapshot.repo}`,
     `gh:type/${snapshot.kind === "pull" ? "pr" : snapshot.kind}`,
     `gh:state/${snapshot.state}`,
     `gh:ci/${ci}`,
   ];
+  if (snapshot.awaiting === "us") labels.push("gh:awaiting/us");
+  if (snapshot.awaiting === "maintainer") labels.push("gh:awaiting/maintainer");
+  return labels;
+}
+
+/**
+ * Decide whose court the ball is in. Heuristic, documented in the README:
+ * closed/merged items need nobody; an open PR that is a draft, has red
+ * checks, or has a maintainer requesting changes needs us; an approved open
+ * PR waits on the maintainer to merge; any other open ours item waits on the
+ * maintainer to respond. Non-ours items never get an awaiting label.
+ */
+export function decideAwaiting(
+  config: UpstreamConfig,
+  snapshot: Pick<
+    ItemSnapshot,
+    "kind" | "state" | "draft" | "checkConclusion" | "latestReviewState" | "headLabel" | "authorLogin"
+  >,
+): "us" | "maintainer" | null {
+  if (snapshot.state !== "open") return null;
+  const ours = isOursItem(config, { headLabel: snapshot.headLabel, authorLogin: snapshot.authorLogin });
+  // Someone else's item is never our court, whatever its review or CI state:
+  // the tab only tracks actionability for ours items.
+  if (!ours) return null;
+  if (snapshot.kind === "pull") {
+    if (snapshot.draft) return "us";
+    if (snapshot.checkConclusion === "failure") return "us";
+    if (snapshot.latestReviewState === "CHANGES_REQUESTED") return "us";
+    if (snapshot.latestReviewState === "APPROVED") return "maintainer";
+    return "maintainer";
+  }
+  return "maintainer";
 }
 
 /**
  * Merge desired gh:* labels into the card's label set. Names without an ID in
  * `labelIdByName` are skipped (the plugin has no labels read API). Stale gh:*
- * labels are removed; every other label is preserved.
+ * labels are removed; every other label is preserved. Stale IDs are also swept
+ * by reverse lookup so read paths that return IDs without names cannot
+ * accumulate replaced gh:* labels (e.g. gh:awaiting/maintainer after a flip to
+ * gh:awaiting/us).
  */
 export function syncLabelIds(
   currentIds: string[] | undefined,
@@ -239,6 +293,24 @@ export function syncLabelIds(
       names.delete(name);
       const id = labelIdByName[name];
       if (id) ids.delete(id);
+    }
+  }
+  // Some read paths return label IDs without names; drop IDs that only ever
+  // name stale gh:* labels so a replaced facet cannot linger.
+  const namesById = new Map<string, string[]>();
+  for (const [name, id] of Object.entries(labelIdByName)) {
+    const list = namesById.get(id) ?? [];
+    list.push(name);
+    namesById.set(id, list);
+  }
+  for (const id of [...ids]) {
+    const mapped = namesById.get(id) ?? [];
+    if (
+      mapped.length > 0 &&
+      mapped.every((n) => n.startsWith("gh:")) &&
+      !mapped.some((n) => desiredNames.includes(n))
+    ) {
+      ids.delete(id);
     }
   }
   for (const name of desiredNames) {
