@@ -161,7 +161,13 @@ export async function resolveAuthToken(
   if (invalid) throw new Error(invalid);
   if (config.tokenSecretRef) {
     try {
-      return await ctx.secrets.resolve(config.tokenSecretRef, { companyId });
+      const token = await ctx.secrets.resolve(config.tokenSecretRef, { companyId });
+      // An empty credential must fail closed: the HTTP layer omits
+      // Authorization for falsy tokens, which would silently scan anonymously.
+      if (!token || token.trim().length === 0) {
+        throw new Error("tokenSecretRef resolved to an empty credential: refusing unauthenticated scan");
+      }
+      return token;
     } catch (err) {
       throw new Error(`tokenSecretRef does not resolve: ${String(err)}`);
     }
@@ -172,6 +178,9 @@ export async function resolveAuthToken(
     privateKeyPem = await ctx.secrets.resolve(config.appPrivateKeySecretRef, { companyId });
   } catch (err) {
     throw new Error(`appPrivateKeySecretRef does not resolve: ${String(err)}`);
+  }
+  if (!privateKeyPem || privateKeyPem.trim().length === 0) {
+    throw new Error("appPrivateKeySecretRef resolved to an empty credential: refusing unauthenticated scan");
   }
   return getInstallationToken(fetchImpl, {
     appId: config.appId,

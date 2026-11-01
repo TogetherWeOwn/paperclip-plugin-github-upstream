@@ -7,8 +7,8 @@ import {
   describeChange,
   findCardForItem,
   fingerprintOf,
-  githubUrlsInText,
   headerBlock,
+  identityUrlsInText,
   isOurLogin,
   isOursItem,
   isUpdatedAtOnlyChange,
@@ -214,7 +214,7 @@ function refFromCard(card: CardLike & { description?: string | null }): (Tracked
     const ref = parseGitHubUrl(wp.url);
     if (ref) return ref;
   }
-  for (const url of githubUrlsInText(card.description ?? "")) {
+  for (const url of identityUrlsInText(card.description)) {
     const ref = parseGitHubUrl(url);
     if (ref) return ref;
   }
@@ -224,7 +224,7 @@ function refFromCard(card: CardLike & { description?: string | null }): (Tracked
 function kindFromCard(card: CardLike): "issue" | "pull" | "discussion" {
   const urls: string[] = [];
   for (const wp of card.workProducts ?? []) if (wp.url) urls.push(wp.url);
-  if (typeof card.description === "string") urls.push(...githubUrlsInText(card.description));
+  if (typeof card.description === "string") urls.push(...identityUrlsInText(card.description));
   for (const url of urls) {
     const ref = parseGitHubUrl(url);
     if (ref) return ref.kind;
@@ -355,12 +355,28 @@ async function syncOneItem(
     const checksUnsettled = !firstSeen && previous.snapshot !== null &&
       previous.snapshot.checkConclusion !== snapshot.checkConclusion &&
       (snapshot.checkConclusion === "pending" || snapshot.checkConclusion === "none");
-    const silentSync = activityOnly || checksUnsettled;
+    // An unsettled transition is silent only when nothing else material moved
+    // with it: a review, state/draft change, new comments or a new head in the
+    // same window still goes through the wake path (a bare CI re-run must not
+    // swallow a maintainer's review into a consumed fingerprint).
+    const materialChange = previous.snapshot !== null && (
+      previous.snapshot.state !== snapshot.state ||
+      previous.snapshot.commentCount !== snapshot.commentCount ||
+      previous.snapshot.reviewCount !== snapshot.reviewCount ||
+      (previous.snapshot.headSha ?? null) !== (snapshot.headSha ?? null) ||
+      previous.snapshot.draft !== snapshot.draft
+    );
+    const silentSync = activityOnly || (checksUnsettled && !materialChange);
     const silentDetail = activityOnly
       ? "updatedAt-only change: header/labels synced, no wake"
       : `checks ${previous.snapshot?.checkConclusion}->${snapshot.checkConclusion}: not settled, no wake`;
     const patch: Record<string, unknown> = {};
-    const backfill = !config.dryRun ? backfillPatch(card, item) : null;
+    // Backfill only onto cards with no explicit item origin: findCardForItem
+    // already prefers exact origins, and an explicit origin for another item
+    // must never be overwritten by URL proximity.
+    const backfill = !config.dryRun && (card.originKind !== ITEM_ORIGIN_KIND || !card.originId)
+      ? backfillPatch(card, item)
+      : null;
     if (backfill) {
       patch.originKind = backfill.originKind;
       patch.originId = backfill.originId;
@@ -581,7 +597,10 @@ async function fetchSnapshot(
       number: item.number,
       url: safeUpstreamUrl(g?.html_url ?? previous.snapshot?.url ?? null, item.owner, item.repo, `/issues/${item.number}`),
       title: g?.title ?? previous.snapshot?.title ?? null,
-      state: g?.state === "closed" ? "closed" : (previous.snapshot?.state ?? "open"),
+      // A fresh issue response is authoritative for lifecycle state: falling
+      // back to a stored "closed" would skip a reopened item forever. The
+      // previous state is reused only when this run saw no fresh body (304).
+      state: g?.state === "open" || g?.state === "closed" ? g.state : (previous.snapshot?.state ?? "open"),
       updatedAt: g?.updated_at ?? previous.snapshot?.updatedAt ?? null,
       commentCount: g?.comments ?? previous.snapshot?.commentCount ?? 0,
       authorLogin: g?.user?.login ?? previous.snapshot?.authorLogin ?? null,

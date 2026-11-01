@@ -758,9 +758,9 @@ describe("item hardening", () => {
     const pending = { total_count: 1, check_runs: [{ status: "in_progress", conclusion: null, name: "ci" }] };
     const table: RouteTable = {
       rest: {
-        [issueUrl(906)]: { etag: '"i906a"', body: pullIssueRow(906) },
-        [pullUrl(906)]: { etag: '"p906a"', body: pullRow(906, { head: { sha: null, label: "TogetherWeOwn:x" } }) },
-        [reviewsUrl(906)]: { etag: '"r906a"', body: [] as unknown[] },
+        ...pullTable(906, "906a"),
+        // No check runs yet: conclusion "none".
+        [checksUrl(HEAD_SHA)]: { etag: '"c906a"', body: { total_count: 0, check_runs: [] } },
       },
       graphqlDiscussion: null,
       calls: [],
@@ -768,14 +768,13 @@ describe("item hardening", () => {
     const stub = itemStub(table);
     const wakes = spyWakes(harness);
 
-    // No head SHA yet: no check-runs fetch, conclusion "none".
     const first = await scan(harness, trackerId, stub);
     expect(first.outcomes[0].status).toBe("unchanged");
     expect(wakes).toHaveLength(0);
 
-    // The head lands and CI starts: none -> pending is not a wake.
-    table.rest[pullUrl(906)] = { etag: '"p906b"', body: pullRow(906, { head: { sha: HEAD_SHA, label: "TogetherWeOwn:x" } }) };
-    table.rest[checksUrl(HEAD_SHA)] = { etag: '"c906"', body: pending };
+    // CI starts on the same head with nothing else moving: none -> pending is
+    // not a wake.
+    table.rest[checksUrl(HEAD_SHA)] = { etag: '"c906b"', body: pending };
     const second = await scan(harness, trackerId, stub);
     expect(second.outcomes[0].status).toBe("mapped");
     expect(second.outcomes[0].detail).toContain("not settled, no wake");
@@ -931,5 +930,87 @@ describe("item hardening", () => {
     expect(result.outcomes[0].detail).toContain("403");
     expect(result.outcomes[0].detail).not.toContain("rate limited");
     expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: COMPANY, stateKey: "rate-limit" })).toBeNull();
+  });
+
+  it("quoted upstream-title URLs never steer card identity", async () => {
+    // A PR whose title mentions another issue: the created card quotes that
+    // URL as untrusted text. Tracking the mentioned issue must not attach to
+    // (or rewrite the origin of) the quoting card.
+    const quotingTitle = "Fix https://github.com/paperclipai/paperclip/issues/912";
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(911)]: { etag: '"i911"', body: pullIssueRow(911, { title: quotingTitle }) },
+        [pullUrl(911)]: { etag: '"p911"', body: pullRow(911, { title: quotingTitle, head: { sha: HEAD_SHA, label: "TogetherWeOwn:q" } }) },
+        [reviewsUrl(911)]: { etag: '"r911"', body: [] as unknown[] },
+        [checksUrl(HEAD_SHA)]: { etag: '"c911"', body: checksSuccess },
+        [issueUrl(912)]: { etag: '"i912"', body: issueRow(912, { title: "the mentioned issue" }) },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const extras = [{ owner: OWNER, repo: REPO, kind: "pull", number: 911 }];
+
+    const first = await scan(harness, trackerId, stub, { extraTrackedItems: extras });
+    expect(first.outcomes.find((o) => o.item === `${OWNER}/${REPO}#911`)?.status).toBe("created");
+
+    const second = await scan(harness, trackerId, stub, {
+      extraTrackedItems: [...extras, { owner: OWNER, repo: REPO, kind: "issue", number: 912 }],
+    });
+    // The mentioned issue has no card of its own and is not ours: it must not
+    // borrow the quoting card, and the quoting card keeps its origin.
+    expect(second.outcomes.find((o) => o.item === `${OWNER}/${REPO}#912`)?.status).toBe("not-ours");
+    const cards = await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND });
+    expect(cards).toHaveLength(1);
+    expect(cards[0].originId).toBe(`${OWNER}/${REPO}#911`);
+  });
+
+  it("an unsettled check transition alongside other changes still wakes", async () => {
+    await child(harness, trackerId, {}, `${OWNER}/${REPO}#913`);
+    const NEW_HEAD = "eee15b8b9444556677889900112233ddeeffff22";
+    const table: RouteTable = { rest: pullTable(913, "913a"), graphqlDiscussion: null, calls: [] };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+
+    await scan(harness, trackerId, stub);
+    expect(wakes).toHaveLength(0);
+
+    // New head with pending checks AND a new review in the same window: the
+    // review must wake even though the check transition alone never would.
+    table.rest[pullUrl(913)] = { etag: '"p913b"', body: pullRow(913, { head: { sha: NEW_HEAD, label: "someone:branch" } }) };
+    table.rest[reviewsUrl(913)] = { etag: '"r913b"', body: [{ id: 7, state: "commented" }] };
+    table.rest[checksUrl(NEW_HEAD)] = {
+      etag: '"c913b"',
+      body: { total_count: 1, check_runs: [{ status: "in_progress", conclusion: null, name: "ci" }] },
+    };
+    const changed = await scan(harness, trackerId, stub);
+    expect(changed.outcomes[0].status).toBe("woke");
+    expect(changed.outcomes[0].reason).toContain("checks success->pending");
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("a reopened issue is tracked again instead of staying skipped-closed", async () => {
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(914)]: { etag: '"i914a"', body: issueRow(914, { state: "closed" }) },
+      },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const config = {
+      operatorLogin: "stranger",
+      extraTrackedItems: [{ owner: OWNER, repo: REPO, kind: "issue", number: 914 }],
+    };
+    const first = await scan(harness, trackerId, stub, config);
+    expect(first.outcomes).toEqual([
+      { item: `${OWNER}/${REPO}#914`, card: null, status: "skipped-closed", detail: "no card for closed item" },
+    ]);
+
+    // Reopened upstream: the fresh response is authoritative, so a card is created.
+    table.rest[issueUrl(914)] = { etag: '"i914b"', body: issueRow(914, { state: "open" }) };
+    const second = await scan(harness, trackerId, stub, config);
+    expect(second.outcomes.find((o) => o.item === `${OWNER}/${REPO}#914`)?.status).toBe("created");
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND })).toHaveLength(1);
   });
 });

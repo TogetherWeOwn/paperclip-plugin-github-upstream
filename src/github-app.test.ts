@@ -361,6 +361,38 @@ describe("resolveAuthToken + scans in App mode", () => {
     expect(dump).not.toContain(seenJwt.replace(/^Bearer /, ""));
   });
 
+  it("an empty resolved PAT fails closed instead of scanning anonymously", async () => {
+    harness.ctx.secrets.resolve = (async () => "  ") as typeof harness.ctx.secrets.resolve;
+    let fetched = false;
+    const guard = (async () => {
+      fetched = true;
+      return new Response("public data", { status: 200, headers: { "content-type": "application/json" } });
+    }) as (url: string, init?: RequestInit) => Promise<Response>;
+    const { outcomes, stats } = await runReleaseScan(
+      harness.ctx,
+      COMPANY,
+      resolveConfig({ tokenSecretRef: TOKEN_REF, releaseRepos: ["router-for-me/CLIProxyAPI"] }),
+      { fetchImpl: guard },
+    );
+    expect(stats.errors).toBe(1);
+    expect(outcomes[0].status).toBe("error");
+    expect(outcomes[0].detail).toMatch(/refusing unauthenticated scan/);
+    expect(fetched).toBe(false);
+  });
+
+  it("an empty resolved App private key fails closed too", async () => {
+    harness.ctx.secrets.resolve = (async () => "") as typeof harness.ctx.secrets.resolve;
+    let fetched = false;
+    const guard = (async () => {
+      fetched = true;
+      return new Response("unreachable", { status: 500 });
+    }) as (url: string, init?: RequestInit) => Promise<Response>;
+    const { outcomes } = await runReleaseScan(harness.ctx, COMPANY, appConfig(), { fetchImpl: guard });
+    expect(outcomes[0].status).toBe("error");
+    expect(outcomes[0].detail).toMatch(/refusing unauthenticated scan/);
+    expect(fetched).toBe(false);
+  });
+
   it("PAT mode still resolves through the secrets stub", async () => {
     const token = await resolveAuthToken(
       harness.ctx,

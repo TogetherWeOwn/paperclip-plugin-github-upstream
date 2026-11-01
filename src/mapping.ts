@@ -55,6 +55,23 @@ export function githubUrlsInText(text: string): string[] {
   return text.match(URL_RE) ?? [];
 }
 
+/**
+ * github.com URLs that may identify the card's item. Blockquote lines are
+ * excluded: the plugin itself quotes the upstream title as `> ...`, and
+ * upstream titles are untrusted text that can carry arbitrary URLs. Letting
+ * them steer identity would let a maintainer-edited title hijack the card
+ * (phantom tracked entries, wrong wakes, origin backfill to another item).
+ * Operator prose and the trusted header block still match.
+ */
+export function identityUrlsInText(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const unquoted = text
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith(">"))
+    .join("\n");
+  return githubUrlsInText(unquoted);
+}
+
 /** Case-insensitive owner/repo comparison: GitHub names are case-preserving, not case-sensitive. */
 export const sameItemRef = (
   a: Pick<TrackedItemRef, "owner" | "repo" | "number">,
@@ -80,11 +97,15 @@ export function findCardForItem<T extends CardLike>(cards: T[], item: Pick<Track
   const byOrigin = cards.find((c) => c.originKind === ITEM_ORIGIN_KIND && (c.originId ?? "").toLowerCase() === originId);
   if (byOrigin) return byOrigin;
   for (const card of cards) {
+    // A card that explicitly owns another item never matches by URL: only
+    // origin-less (legacy) cards match this way, so prose that mentions a
+    // second item can never steal or overwrite an explicit origin.
+    if (card.originKind === ITEM_ORIGIN_KIND && card.originId && card.originId.toLowerCase() !== originId) continue;
     for (const wp of card.workProducts ?? []) {
       if (wp.url && matchesItem(wp.url, item)) return card;
     }
     if (typeof card.description === "string") {
-      for (const url of githubUrlsInText(card.description)) {
+      for (const url of identityUrlsInText(card.description)) {
         if (matchesItem(url, item)) return card;
       }
     }

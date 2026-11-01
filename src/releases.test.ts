@@ -283,6 +283,8 @@ describe("release hardening", () => {
     expect(cards).toHaveLength(1);
     expect(cards[0].id).toBe(card.id);
     expect(cards[0].title).toContain("router-for-me/cliproxyapi@v8.0.51");
+    // The origin moves with the retitle: it is the durable dedup record.
+    expect(cards[0].originId).toBe("router-for-me/cliproxyapi@v8.0.51");
     expect(wakes).toHaveLength(1);
     expect(wakes[0].issueId).toBe(card.id);
     expect(wakes[0].options?.idempotencyKey).toBe("upstream:router-for-me/cliproxyapi@v8.0.51");
@@ -330,6 +332,43 @@ describe("release hardening", () => {
     ]);
     expect(result.stats.errors).toBe(1);
     expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND })).toHaveLength(0);
+  });
+
+  it("a retitled card still dedupes after plugin state loss", async () => {
+    await seedState("v8.0.50", "v8.0.50", '"u1"');
+    const card = await openCard("v8.0.50");
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"u2"', body: releaseBody("v8.0.51") } });
+
+    const first = await scan(harness, stub);
+    expect(first.outcomes[0].status).toBe("updated");
+    await harness.ctx.issues.update(card.id, { status: "done" }, COMPANY);
+
+    // State is lost, but the closed card carries the newest tag in its
+    // originId: the exact lookup finds it instead of creating a duplicate.
+    await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "releases" }, {});
+    const second = await scan(harness, stub, { compareBases: { "router-for-me/CLIProxyAPI": "v8.0.50" } });
+    expect(second.outcomes[0].status).toBe("already-created");
+    expect(second.stats.creates).toBe(0);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND })).toHaveLength(1);
+  });
+
+  it("a wake-exhausted tick creates no release card either (creates spend wakes)", async () => {
+    const { stub } = releaseStub({ "router-for-me/CLIProxyAPI": { etag: '"w1"', body: releaseBody("v8.0.55") } });
+    const config = {
+      compareBases: { "router-for-me/CLIProxyAPI": "v8.0.54" },
+      maxCreatesPerTick: 2,
+      maxWakesPerTick: 0,
+    };
+    const first = await scan(harness, stub, config);
+    expect(first.outcomes).toEqual([
+      { repo: "router-for-me/cliproxyapi", status: "capped", tag: "v8.0.55", detail: expect.stringContaining("deferred to next tick") },
+    ]);
+    expect(first.stats.creates).toBe(0);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: RELEASE_ORIGIN_KIND })).toHaveLength(0);
+
+    // The next tick with wake budget creates the card.
+    const second = await scan(harness, stub, { ...config, maxWakesPerTick: 5 });
+    expect(second.outcomes).toEqual([{ repo: "router-for-me/cliproxyapi", status: "created", tag: "v8.0.55" }]);
   });
 
   it("F7: a release scan with no auth configured errors without any fetch", async () => {

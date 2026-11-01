@@ -261,11 +261,13 @@ async function ensureReleaseCard(
   if (config.dryRun) {
     return { repo: key, status: "would-create", tag, detail: `would create card originId ${originId}` };
   }
-  // Spend cap: leave createdTag unset so the next tick picks the tag up.
-  if (stats.creates >= config.maxCreatesPerTick) {
+  // Spend cap: leave createdTag unset so the next tick picks the tag up. A
+  // create assigns an agent, so it spends the wake budget too (like the item
+  // and discovery paths): a wake-exhausted tick creates nothing.
+  if (stats.creates >= config.maxCreatesPerTick || stats.wakes + stats.creates >= config.maxWakesPerTick) {
     stats.capped += 1;
-    ctx.logger.info("github-upstream tick cap: deferring release create", { companyId, repo: key, tag, creates: stats.creates });
-    return { repo: key, status: "capped", tag, detail: "create budget exhausted, deferred to next tick" };
+    ctx.logger.info("github-upstream tick cap: deferring release create", { companyId, repo: key, tag, creates: stats.creates, wakes: stats.wakes + stats.creates });
+    return { repo: key, status: "capped", tag, detail: "create/wake budget exhausted, deferred to next tick" };
   }
   await createReleaseCard(ctx, companyId, config, owner, repo, tag, body, previousTag);
   record.createdTag = tag;
@@ -342,8 +344,11 @@ async function createReleaseCard(
 }
 
 /**
- * Retitle an open intake card to the newest tag. The card keeps its original
- * originId; `createdTag` state tracks the newest processed tag instead.
+ * Retitle an open intake card to the newest tag, moving its originId along.
+ * The originId is the durable dedup record: if plugin state is ever lost, the
+ * exact originId lookup still finds the card for its newest tag instead of
+ * creating a duplicate. `createdTag` state tracks the newest processed tag
+ * for the wake-at-most-once bookkeeping.
  */
 async function updateReleaseCard(
   ctx: PluginContext,
@@ -361,6 +366,8 @@ async function updateReleaseCard(
   const publishedAt = typeof release?.published_at === "string" ? release.published_at : null;
   await ctx.issues.update(card.id, {
     title: `Upstream release ${originId} — intake`,
+    originKind: RELEASE_ORIGIN_KIND,
+    originId,
     description: releaseCardBody({
       owner,
       repo,

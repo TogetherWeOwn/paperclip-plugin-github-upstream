@@ -15,7 +15,7 @@ Our own upstream actions never wake our own card: on a changed fingerprint (neve
 
 ## Card mapping
 
-An upstream item maps to a card by `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL work product, then by a GitHub URL in the description (the shape most existing follow-through cards are in). Cards found by URL get `originKind`/`originId` backfilled. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
+An upstream item maps to a card by `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL work product, then by a GitHub URL in the description (the shape most existing follow-through cards are in). Blockquoted lines are never identity: the plugin quotes the upstream title as untrusted text, and titles can carry arbitrary URLs. Cards found by URL get `originKind`/`originId` backfilled, but a card that already owns another item never matches by URL. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
 
 ## Rate limits
 
