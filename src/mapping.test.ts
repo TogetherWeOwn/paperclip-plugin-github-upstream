@@ -81,7 +81,7 @@ describe("parseGitHubUrl", () => {
 describe("followThroughCards", () => {
   it("selects bounded owners regardless of subtree order, excluding programs and gates", () => {
     const cards = [
-      card({ id: "nested", parentId: "program" }),
+      card({ id: "nested", parentId: "program", description: "Owns https://github.com/paperclipai/paperclip/issues/100" }),
       card({ id: "root", parentId: null }),
       card({ id: "direct", parentId: "root" }),
       card({ id: "program", parentId: "root" }),
@@ -94,6 +94,42 @@ describe("followThroughCards", () => {
     ];
     expect(followThroughCards(cards, "root").map((c) => c.id)).toEqual(["direct", "nested"]);
   });
+});
+
+describe("owner classification", () => {
+  it.each([null, "https://github.com/paperclipai/paperclip/issues/100"])(
+    "preserves an explicit owner even when its subtask has identity %s",
+    (description) => {
+      const owner = card({ id: "owner", parentId: "root", originKind: ITEM_ORIGIN_KIND, originId: "paperclipai/paperclip#100" });
+      const task = card({ id: "task", parentId: owner.id, title: "Fix CI", description });
+      expect(followThroughCards([task, owner], "root")).toEqual([owner]);
+    },
+  );
+
+  it("does not demote a description-only owner for an ordinary subtask", () => {
+    const owner = card({ id: "owner", parentId: "root", description: "Owns https://github.com/paperclipai/paperclip/issues/100" });
+    const task = card({ id: "task", parentId: owner.id, title: "Fix CI" });
+    expect(followThroughCards([task, owner], "root")).toEqual([owner]);
+  });
+
+  it.each(["Upstream gateway timeout investigation", "Upstream gatekeeper fix"])(
+    "retains item title %s",
+    (title) => {
+      const owner = card({ parentId: "root", title, originKind: ITEM_ORIGIN_KIND, originId: "paperclipai/paperclip#100" });
+      expect(followThroughCards([owner], "root")).toEqual([owner]);
+    },
+  );
+
+  it.each(["Upstream gate", "Upstream gate (R): reply", "Upstream gate: issue", "Upstream gate — reply"])(
+    "excludes actual gate title %s at either owner depth",
+    (title) => {
+      const program = card({ id: "program", parentId: "root" });
+      const nested = card({ id: "nested", parentId: program.id, description: "Owns https://github.com/paperclipai/paperclip/issues/100" });
+      const directGate = card({ id: "direct-gate", parentId: "root", title });
+      const nestedGate = card({ id: "nested-gate", parentId: program.id, title });
+      expect(followThroughCards([program, nested, directGate, nestedGate], "root")).toEqual([nested]);
+    },
+  );
 });
 
 describe("findCardForItem", () => {

@@ -353,7 +353,7 @@ async function syncOneItem(
   const snapshot = fetched.snapshot;
 
   let card = findCardForItem(children, item);
-  if (card && !previous.cardId) record.cardId = card.id;
+  const ownerChanged = card !== null && previous.cardId !== card.id;
   if (!card) {
     // A new "ours" item with no card gets a child of the tracker.
     const ours = isOursItem(config, { headLabel: snapshot.headLabel, authorLogin: snapshot.authorLogin });
@@ -405,10 +405,11 @@ async function syncOneItem(
   // A legacy record with no other change still syncs labels/header once (new
   // awaiting facets for old cards) but never wakes for the backfill itself.
   const upgradeSync = legacyNoReviewState && !firstSeen;
-  if (changed || firstSeen || upgradeSync) {
+  const ownerSync = ownerChanged && !changed && !firstSeen && !upgradeSync;
+  if (changed || firstSeen || upgradeSync || ownerChanged) {
     const patch = buildCardPatch(card, item, snapshot, config, config.dryRun);
     const changeDetail = prevSnapshot ? describeChange(prevForCompare, snapshot) : null;
-    const detail = changeDetail ?? (firstSeen || !prevSnapshot ? "first seen" : "backfill review state (no upstream change)");
+    const detail = changeDetail ?? (firstSeen || !prevSnapshot ? "first seen" : ownerSync ? "owner changed (no upstream change)" : "backfill review state (no upstream change)");
     // An updatedAt-only change (our own title/body/label edits do exactly
     // this) syncs the header but never wakes. A move into an unsettled check
     // state (pending/none) is likewise not a wake unless other material state
@@ -431,15 +432,20 @@ async function syncOneItem(
       (prevForCompare.headSha ?? null) !== (snapshot.headSha ?? null) ||
       prevForCompare.draft !== snapshot.draft
     );
-    const silentSync = activityOnly || (checksUnsettled && !materialChange);
+    // A local owner correction needs initialization even on a cached 304,
+    // but is not itself an upstream change and must not spend a wake.
+    const silentSync = ownerSync || activityOnly || (checksUnsettled && !materialChange);
     if (silentSync) {
-      const silentDetail = activityOnly
-        ? "updatedAt-only change: header/labels synced, no wake"
-        : `checks ${prevForCompare.checkConclusion}->${snapshot.checkConclusion}: not settled, no wake`;
-      if (Object.keys(patch).length > 0 && !config.dryRun) {
-        await ctx.issues.update(card.id, patch as never, companyId);
+      const silentDetail = ownerSync
+        ? `${config.dryRun ? "would sync" : "synced"} owner origin/header/labels, no upstream change or wake`
+        : activityOnly
+          ? "updatedAt-only change: header/labels synced, no wake"
+          : `checks ${prevForCompare.checkConclusion}->${snapshot.checkConclusion}: not settled, no wake`;
+      if (!config.dryRun) {
+        if (Object.keys(patch).length > 0) await ctx.issues.update(card.id, patch as never, companyId);
+        record.cardId = card.id;
+        if (!ownerSync) record.wokenFingerprint = record.fingerprint;
       }
-      if (!config.dryRun) record.wokenFingerprint = record.fingerprint;
       return { item: key, card: card.id, status: "mapped", reason: detail, detail: silentDetail };
     }
     if (Object.keys(patch).length > 0) {
@@ -448,6 +454,7 @@ async function syncOneItem(
       }
       await ctx.issues.update(card.id, patch as never, companyId);
     }
+    if (!config.dryRun) record.cardId = card.id;
     if (firstSeen || record.wokenFingerprint === record.fingerprint || (upgradeSync && !changed)) {
       record.wokenFingerprint = record.fingerprint;
       return { item: key, card: card.id, status: changed || upgradeSync ? "mapped" : "unchanged", reason: detail, detail: "labels/header synced, no wake (first seen or already woken)" };

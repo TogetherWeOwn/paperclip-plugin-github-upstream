@@ -45,16 +45,23 @@ export type CardLike = Pick<Issue, "id" | "originKind" | "originId"> & {
 
 /** Gate cards are review evidence, never item owners. */
 export const GATE_TITLE_PREFIX = "Upstream gate";
+const GATE_TITLE_RE = new RegExp(`^${GATE_TITLE_PREFIX}(?:$|[\\s(:—–-])`, "u");
+
+export const isGateCard = (card: Pick<CardLike, "title">): boolean => GATE_TITLE_RE.test(card.title ?? "");
+
+const hasItemOrigin = (card: CardLike): boolean => card.originKind === ITEM_ORIGIN_KIND && !!card.originId;
+const hasItemIdentity = (card: CardLike): boolean =>
+  hasItemOrigin(card) || identityUrlsInText(card.description).some((url) => parseGitHubUrl(url) !== null);
 
 /**
  * Owners sit directly under the tracker or one program level below it.
- * A direct child with non-gate children is a program container, not an owner:
- * its summary may mention the same URLs as the actual item cards below it.
+ * Explicit origins remain authoritative even with subtasks. Otherwise a child
+ * with item identity identifies a program whose summary must not claim it.
  */
 export function followThroughCards<T extends CardLike>(cards: T[], trackerId: string): T[] {
-  const direct = cards.filter((c) => c.id !== trackerId && c.parentId === trackerId && !(c.title ?? "").startsWith(GATE_TITLE_PREFIX));
-  const directIds = new Set(direct.map((c) => c.id));
-  const nested = cards.filter((c) => c.id !== trackerId && c.parentId && directIds.has(c.parentId) && !(c.title ?? "").startsWith(GATE_TITLE_PREFIX));
+  const direct = cards.filter((c) => c.id !== trackerId && c.parentId === trackerId && !isGateCard(c));
+  const containers = new Set(direct.filter((c) => !hasItemOrigin(c)).map((c) => c.id));
+  const nested = cards.filter((c) => c.id !== trackerId && c.parentId && containers.has(c.parentId) && !isGateCard(c) && hasItemIdentity(c));
   const programIds = new Set(nested.map((c) => c.parentId));
   return [...direct.filter((c) => !programIds.has(c.id)), ...nested];
 }

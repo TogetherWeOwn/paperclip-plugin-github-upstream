@@ -3,7 +3,7 @@ import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
 import { resolveAuthToken } from "./github-app.js";
 import { backoffDelayMs, GITHUB_API_BASE, githubGet, githubGraphql, type FetchLike } from "./github.js";
 import { capsOf, wakesUsed } from "./items.js";
-import { findCardForItem, followThroughCards, GATE_TITLE_PREFIX, parseGitHubUrl, safeUpstreamUrl, type CardLike } from "./mapping.js";
+import { findCardForItem, followThroughCards, isGateCard, parseGitHubUrl, safeUpstreamUrl, type CardLike } from "./mapping.js";
 import { ITEM_ORIGIN_KIND, ORIGIN_KIND_PREFIX } from "./manifest.js";
 import { isBackedOff, setBackoff, stateKey, type RunStats } from "./state.js";
 
@@ -859,7 +859,7 @@ async function judgePost(
   }
 
   const gates = allCards.filter(
-    (c) => c.parentId === card.id && (c.title ?? "").startsWith(GATE_TITLE_PREFIX) && c.status === "done",
+    (c) => c.parentId === card.id && isGateCard(c) && c.status === "done",
   );
   const postMs = Date.parse(post.createdAt);
   const approved = gates.find((g) => {

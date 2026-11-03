@@ -328,6 +328,83 @@ describe("item job", () => {
     expect((await harness.ctx.issues.get(card.id, COMPANY))?.parentId).toBe(program.id);
   });
 
+  it.each([false, true])("preserves established owners with ordinary subtasks (explicit tracking: %s)", async (explicit) => {
+    const card = await child(harness, trackerId, {
+      title: "Follow-through owner",
+      description: `Owns https://github.com/${OWNER}/${REPO}/issues/207`,
+    }, `${OWNER}/${REPO}#207`);
+    const table: RouteTable = {
+      rest: { [issueUrl(207)]: { etag: '"i207"', body: issueRow(207, { user: { login: "Rick7C2" } }) } },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    await scan(harness, trackerId, stub);
+    await child(harness, card.id, {
+      title: "Fix CI",
+      description: `Related to https://github.com/${OWNER}/${REPO}/issues/207`,
+    }, null);
+    await child(harness, card.id, { title: "Upstream gate (R): reply" }, null);
+    const updates = spyUpdates(harness);
+    table.rest[issueUrl(207)] = { etag: '"i208"', body: issueRow(207, { comments: 3 }) };
+    const out = await scan(harness, trackerId, stub, explicit ? {
+      extraTrackedItems: [{ owner: OWNER, repo: REPO, kind: "issue", number: 207 }],
+    } : {});
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "woke" });
+    expect(out.stats.creates).toBe(0);
+    expect(wakes.map((w) => w.issueId)).toEqual([card.id]);
+    expect(updates.map((u) => u.issueId)).toEqual([card.id]);
+    const stored = await harness.ctx.state.get(stateKey(COMPANY, "items")) as Record<string, { cardId: string }>;
+    expect(stored[`${OWNER}/${REPO}#207`].cardId).toBe(card.id);
+  });
+
+  it.each([false, true])("rebinds cached ownership on an unchanged response (dry run: %s)", async (dryRun) => {
+    const description = `Includes https://github.com/${OWNER}/${REPO}/issues/208`;
+    const summary = await child(harness, trackerId, { title: "Program summary", description }, null);
+    const table: RouteTable = {
+      rest: { [issueUrl(208)]: { etag: '"i208"', body: issueRow(208) } },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const config = { labelIdByName: { "gh:state/open": "L-open" } };
+    await scan(harness, trackerId, stub, config);
+    const before = await harness.ctx.state.get(stateKey(COMPANY, "items")) as Record<string, { cardId: string; fingerprint: string }>;
+    expect(before[`${OWNER}/${REPO}#208`].cardId).toBe(summary.id);
+
+    // Correct a previously mapped summary. An explicit item origin remains
+    // authoritative until removed; adding a subtask must not revoke it.
+    await harness.ctx.issues.update(summary.id, { originId: null, description } as never, COMPANY);
+    const card = await child(harness, summary.id, { description: `Owns https://github.com/${OWNER}/${REPO}/issues/208` }, null);
+    const updates = spyUpdates(harness);
+    const out = await scan(harness, trackerId, stub, { ...config, dryRun });
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "mapped" });
+    expect(out.stats).toMatchObject({ ok200: 0, notModified304: 1, creates: 0, wakes: 0 });
+    expect(wakes).toEqual([]);
+    const stored = await harness.ctx.state.get(stateKey(COMPANY, "items")) as typeof before;
+    expect(stored[`${OWNER}/${REPO}#208`].fingerprint).toBe(before[`${OWNER}/${REPO}#208`].fingerprint);
+    expect(stored[`${OWNER}/${REPO}#208`].cardId).toBe(dryRun ? summary.id : card.id);
+    expect(updates.map((u) => u.issueId)).toEqual(dryRun ? [] : [card.id]);
+    if (dryRun) {
+      expect((await harness.ctx.issues.get(card.id, COMPANY))?.originId).toBeNull();
+      await scan(harness, trackerId, stub, config);
+    }
+    const mapped = await harness.ctx.issues.get(card.id, COMPANY);
+    expect(mapped?.originId).toBe(`${OWNER}/${REPO}#208`);
+    expect(mapped?.description).toContain(`<!-- github-upstream: ${OWNER}/${REPO}#208 -->`);
+    expect(mapped?.labelIds).toContain("L-open");
+    const updateCount = updates.length;
+    expect((await scan(harness, trackerId, stub, config)).outcomes[0].status).toBe("unchanged");
+    expect(updates).toHaveLength(updateCount);
+    expect(wakes).toEqual([]);
+    table.rest[issueUrl(208)] = { etag: '"i209"', body: issueRow(208, { comments: 3 }) };
+    expect((await scan(harness, trackerId, stub, config)).outcomes[0]).toMatchObject({ card: card.id, status: "woke" });
+    expect(wakes.map((w) => w.issueId)).toEqual([card.id]);
+  });
+
   it("requires a description URL for a work-product-only card", async () => {
     const card = await child(harness, trackerId, {
       description: "Owns an upstream item; see work product.",
