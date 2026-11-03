@@ -4,6 +4,7 @@ import {
   decideAwaiting,
   describeChange,
   findCardForItem,
+  followThroughCards,
   fingerprintOf,
   headerBlock,
   identityUrlsInText,
@@ -77,6 +78,24 @@ describe("parseGitHubUrl", () => {
   });
 });
 
+describe("followThroughCards", () => {
+  it("selects bounded owners regardless of subtree order, excluding programs and gates", () => {
+    const cards = [
+      card({ id: "nested", parentId: "program" }),
+      card({ id: "root", parentId: null }),
+      card({ id: "direct", parentId: "root" }),
+      card({ id: "program", parentId: "root" }),
+      card({ id: "gate", parentId: "direct", title: "Upstream gate (R): reply" }),
+      card({ id: "nested-gate", parentId: "nested", title: "Upstream gate (N): issue" }),
+      card({ id: "misplaced-gate", parentId: "root", title: "Upstream gate (N): issue" }),
+      card({ id: "gate-child", parentId: "misplaced-gate" }),
+      card({ id: "too-deep", parentId: "nested" }),
+      card({ id: "unrelated", parentId: "elsewhere" }),
+    ];
+    expect(followThroughCards(cards, "root").map((c) => c.id)).toEqual(["direct", "nested"]);
+  });
+});
+
 describe("findCardForItem", () => {
   const item = { owner: "paperclipai", repo: "paperclip", number: 15158 };
 
@@ -85,9 +104,9 @@ describe("findCardForItem", () => {
     expect(findCardForItem(cards, item)?.id).toBe("match");
   });
 
-  it("finds a card by GitHub work product URL", () => {
+  it("does not identify a card by a work product alone", () => {
     const cards = [card({ id: "wp", workProducts: [{ url: "https://github.com/paperclipai/paperclip/pull/15158" }] })];
-    expect(findCardForItem(cards, item)?.id).toBe("wp");
+    expect(findCardForItem(cards, item)).toBeNull();
   });
 
   it("finds a card by a GitHub URL in the description", () => {

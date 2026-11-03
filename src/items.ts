@@ -7,6 +7,7 @@ import {
   decideAwaiting,
   describeChange,
   findCardForItem,
+  followThroughCards,
   fingerprintOf,
   headerBlock,
   identityUrlsInText,
@@ -201,12 +202,10 @@ export async function runItemScan(
     outcomes.push({ item: "-", card: null, status: "error", detail: "tracker subtree unreadable" });
     return { outcomes, stats };
   }
-  const children = tracker.issues.filter(
-    (c) => c.id !== tracker.rootIssueId && (c as { parentId?: string }).parentId === config.followThroughTrackerIssueId,
-  );
+  const children = followThroughCards(tracker.issues, tracker.rootIssueId);
 
-  // Resolve the tracked set: explicit config items plus every tracker child
-  // that resolves to a GitHub item (originId, work product URL, or description URL).
+  // Resolve the tracked set: explicit config items plus direct or program-nested
+  // owners that resolve to a GitHub item (originId or description URL).
   const tracked = new Map<string, TrackedItemRef & { kind: "issue" | "pull" | "discussion" }>();
   for (const extra of config.extraTrackedItems) tracked.set(itemKey(extra), extra);
   for (const child of children) {
@@ -250,11 +249,6 @@ function refFromCard(card: CardLike & { description?: string | null }): (Tracked
       return { owner: match[1], repo: match[2], number: Number.parseInt(match[3], 10), kind };
     }
   }
-  for (const wp of card.workProducts ?? []) {
-    if (!wp.url) continue;
-    const ref = parseGitHubUrl(wp.url);
-    if (ref) return ref;
-  }
   for (const url of identityUrlsInText(card.description)) {
     const ref = parseGitHubUrl(url);
     if (ref) return ref;
@@ -264,7 +258,6 @@ function refFromCard(card: CardLike & { description?: string | null }): (Tracked
 
 function kindFromCard(card: CardLike): "issue" | "pull" | "discussion" {
   const urls: string[] = [];
-  for (const wp of card.workProducts ?? []) if (wp.url) urls.push(wp.url);
   if (typeof card.description === "string") urls.push(...identityUrlsInText(card.description));
   for (const url of urls) {
     const ref = parseGitHubUrl(url);

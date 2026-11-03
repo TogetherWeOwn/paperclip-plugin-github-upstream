@@ -269,6 +269,98 @@ describe("item job", () => {
     expect(refetched?.originId).toBe(`${OWNER}/${REPO}#200`);
   });
 
+  it("tracks program grandchildren without duplicating or waking their program or gates", async () => {
+    const program = await child(harness, trackerId, {
+      title: "Upstream program",
+      description: `Includes https://github.com/${OWNER}/${REPO}/issues/201`,
+    }, null);
+    const card = await child(harness, program.id, {
+      description: `Owns https://github.com/${OWNER}/${REPO}/issues/201`,
+    }, null);
+    const gate = await child(harness, card.id, {
+      title: "Upstream gate (R): reply",
+      description: `Draft for https://github.com/${OWNER}/${REPO}/issues/202`,
+    }, null);
+    await child(harness, trackerId, {
+      title: "Upstream gate (N): misplaced gate",
+      description: `Draft for https://github.com/${OWNER}/${REPO}/issues/203`,
+    }, null);
+    await child(harness, card.id, {
+      description: `Too deep: https://github.com/${OWNER}/${REPO}/issues/204`,
+    }, null);
+    await child(harness, gate.id, {
+      description: `Gate child: https://github.com/${OWNER}/${REPO}/issues/205`,
+    }, null);
+    const table: RouteTable = {
+      rest: { [issueUrl(201)]: { etag: '"i201"', body: issueRow(201, { user: { login: "Rick7C2" } }) } },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const wakes = spyWakes(harness);
+    const updates = spyUpdates(harness);
+    const config = {
+      operatorLogin: "Rick7C2",
+      extraTrackedItems: [{ owner: OWNER, repo: REPO, kind: "issue", number: 201 }],
+      discoveryQueries: ["repo:paperclipai/paperclip author:Rick7C2"],
+    };
+    const withSearch = (async (url: string, init?: RequestInit) => {
+      if (url.startsWith("https://api.github.com/search/issues")) {
+        return json({ items: [issueRow(201)] }, null);
+      }
+      return stub(url, init);
+    }) as FetchStub;
+
+    const first = await scan(harness, trackerId, withSearch, config);
+    expect(first.outcomes).toHaveLength(1);
+    expect(first.outcomes[0]).toMatchObject({ card: card.id, status: "unchanged" });
+    expect(first.stats.creates).toBe(0);
+    expect(wakes).toHaveLength(0);
+    expect(updates.map((u) => u.issueId)).toEqual([card.id]);
+
+    // Once mapped, the grandchild is tracked without an explicit config entry.
+    table.rest[issueUrl(201)] = { etag: '"i202"', body: issueRow(201, { comments: 3 }) };
+    const changed = await scan(harness, trackerId, withSearch);
+    expect(changed.outcomes).toHaveLength(1);
+    expect(changed.outcomes[0]).toMatchObject({ card: card.id, status: "woke" });
+    expect(wakes.map((w) => w.issueId)).toEqual([card.id]);
+    expect(table.calls.every((call) => call.includes("/issues/201"))).toBe(true);
+    expect((await harness.ctx.issues.get(card.id, COMPANY))?.parentId).toBe(program.id);
+  });
+
+  it("requires a description URL for a work-product-only card", async () => {
+    const card = await child(harness, trackerId, {
+      description: "Owns an upstream item; see work product.",
+      workProducts: [{ url: `https://github.com/${OWNER}/${REPO}/issues/206` }],
+    }, null);
+    // Simulate a host that does enrich subtree rows: identity must not change
+    // between that shape and the current host's raw rows without workProducts.
+    const getSubtree = harness.ctx.issues.getSubtree.bind(harness.ctx.issues);
+    harness.ctx.issues.getSubtree = async (...args) => {
+      const subtree = await getSubtree(...args);
+      return { ...subtree, issues: subtree.issues.map((c) => c.id === card.id
+        ? { ...c, workProducts: [{ url: `https://github.com/${OWNER}/${REPO}/issues/206` }] as never }
+        : c) };
+    };
+    const table: RouteTable = {
+      rest: { [issueUrl(206)]: { etag: '"i206"', body: issueRow(206) } },
+      graphqlDiscussion: null,
+      calls: [],
+    };
+    const stub = itemStub(table);
+    const updates = spyUpdates(harness);
+    expect((await scan(harness, trackerId, stub)).outcomes).toEqual([]);
+    expect(table.calls).toEqual([]);
+    expect(updates).toEqual([]);
+
+    await harness.ctx.issues.update(card.id, {
+      description: `Owns https://github.com/${OWNER}/${REPO}/issues/206`,
+    }, COMPANY);
+    const linked = await scan(harness, trackerId, stub);
+    expect(linked.outcomes[0]).toMatchObject({ card: card.id, status: "unchanged" });
+    expect((await harness.ctx.issues.get(card.id, COMPANY))?.originId).toBe(`${OWNER}/${REPO}#206`);
+  });
+
   it("creates a follow-through card for a new ours item and ignores not-ours ones", async () => {
     const table: RouteTable = {
       rest: {

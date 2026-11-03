@@ -3,7 +3,7 @@ import { itemKey, type TrackedItemRef, type UpstreamConfig } from "./config.js";
 import { resolveAuthToken } from "./github-app.js";
 import { backoffDelayMs, GITHUB_API_BASE, githubGet, githubGraphql, type FetchLike } from "./github.js";
 import { capsOf, wakesUsed } from "./items.js";
-import { findCardForItem, parseGitHubUrl, safeUpstreamUrl, type CardLike } from "./mapping.js";
+import { findCardForItem, followThroughCards, GATE_TITLE_PREFIX, parseGitHubUrl, safeUpstreamUrl, type CardLike } from "./mapping.js";
 import { ITEM_ORIGIN_KIND, ORIGIN_KIND_PREFIX } from "./manifest.js";
 import { isBackedOff, setBackoff, stateKey, type RunStats } from "./state.js";
 
@@ -41,8 +41,7 @@ export const SCAN_OVERLAP_MS = 5 * 60 * 1000;
 /** Label applied to the follow-through card of an ungated post. */
 export const UNGATED_LABEL_NAME = "upstream:ungated";
 
-/** Gate cards carry this title prefix (see the `upstream-gate` skill). */
-export const GATE_TITLE_PREFIX = "Upstream gate";
+export { GATE_TITLE_PREFIX } from "./mapping.js";
 
 /**
  * Origin identity for Chief-of-Staff flag cards. This must sit under
@@ -229,9 +228,9 @@ export async function runAuditScan(
   const allCards = tracker.issues.filter(
     (c) => c.id !== tracker.rootIssueId,
   ) as AuditCard[];
-  // Follow-through mapping sees direct tracker children only (like item-scan);
-  // gate cards live one level down and must never match as follow-throughs.
-  const directChildren = allCards.filter((c) => c.parentId === config.followThroughTrackerIssueId);
+  // Use the same bounded owner set as item-scan; keep every descendant in
+  // allCards so gates under program-nested owners still count as evidence.
+  const ownerCards = followThroughCards(allCards, tracker.rootIssueId);
 
   const onRateLimited = async (untilMs: number): Promise<void> => {
     await setBackoff(ctx, companyId, untilMs);
@@ -280,7 +279,7 @@ export async function runAuditScan(
       for (const k of Object.keys(fullSnapshot)) state.fullPages[k] = true;
     };
     try {
-      const itemOutcomes = await processItem(ctx, companyId, config, deps.fetchImpl, token, watched, ref, directChildren, allCards, state, stats,
+      const itemOutcomes = await processItem(ctx, companyId, config, deps.fetchImpl, token, watched, ref, ownerCards, allCards, state, stats,
         async (untilMs) => onRateLimited(untilMs), now());
       outcomes.push(...itemOutcomes);
       // Errors and budget deferrals both hold the search watermark: the
@@ -461,7 +460,7 @@ async function processItem(
   token: string,
   watched: Set<string>,
   ref: TrackedItemRef & { kind: "issue" | "pull" | "discussion" },
-  directChildren: AuditCard[],
+  ownerCards: AuditCard[],
   allCards: AuditCard[],
   state: AuditState,
   stats: RunStats,
@@ -511,7 +510,7 @@ async function processItem(
       outcomes.push({ post: post.postUrl, item: key, card: null, status: "skipped-cutover" });
       continue;
     }
-    outcomes.push(await judgePost(ctx, companyId, config, post, directChildren, allCards, state, stats, nowMs));
+    outcomes.push(await judgePost(ctx, companyId, config, post, ownerCards, allCards, state, stats, nowMs));
   }
 
   if (!config.dryRun && posts.length > 0) {
@@ -825,7 +824,7 @@ async function judgePost(
   companyId: string,
   config: UpstreamConfig,
   post: AuditPost,
-  directChildren: AuditCard[],
+  ownerCards: AuditCard[],
   allCards: AuditCard[],
   state: AuditState,
   stats: RunStats,
@@ -833,7 +832,7 @@ async function judgePost(
 ): Promise<AuditOutcome> {
   const key = itemKey(post.item);
   const caps = capsOf(config);
-  let card = findCardForItem(directChildren, post.item);
+  let card = findCardForItem(ownerCards, post.item);
   if (!card) {
     if (config.dryRun) {
       return { post: post.postUrl, item: key, card: null, status: "would-flag", reason: `would create follow-through card for ${key} and flag ${post.postKind} by @${post.authorLogin}` };
@@ -854,7 +853,7 @@ async function judgePost(
       originId: key,
     });
     card = created as AuditCard;
-    directChildren.push(card);
+    ownerCards.push(card);
     allCards.push(card);
     stats.creates += 1;
   }

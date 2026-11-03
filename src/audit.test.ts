@@ -156,6 +156,31 @@ describe("audit job", () => {
     expect(refetched?.labelIds ?? []).not.toContain(UNGATED_ID);
   });
 
+  it("reuses a program grandchild and recognizes its gate without a duplicate", async () => {
+    const program = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      parentId: trackerId,
+      title: "Program summary",
+      description: `Includes ${issueHtml(100)}`,
+    });
+    const card = await followThrough(harness, program.id, 100);
+    await gateCard(harness, card.id, GATE_BEFORE);
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(100)]: { etag: '"i1"', body: issueRow(100) },
+        [commentsUrl(100)]: { etag: '"m1"', body: [comment(1, "Rick7C2")] },
+      },
+      searchItems: [{ html_url: issueHtml(100) }],
+      graphqlDiscussion: null,
+    };
+    const out = await scan(harness, trackerId, auditStub(table));
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "gated" });
+    expect(out.stats).toMatchObject({ wakes: 0, creates: 0 });
+    expect(await flagCards(harness)).toHaveLength(0);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND })).toHaveLength(1);
+  });
+
   it("an ungated post is labelled and flagged, deduped on a rerun", async () => {
     const table: RouteTable = {
       rest: {
