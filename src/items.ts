@@ -7,6 +7,7 @@ import {
   decideAwaiting,
   describeChange,
   findCardForItem,
+  followThroughCards,
   fingerprintOf,
   headerBlock,
   identityUrlsInText,
@@ -201,12 +202,10 @@ export async function runItemScan(
     outcomes.push({ item: "-", card: null, status: "error", detail: "tracker subtree unreadable" });
     return { outcomes, stats };
   }
-  const children = tracker.issues.filter(
-    (c) => c.id !== tracker.rootIssueId && (c as { parentId?: string }).parentId === config.followThroughTrackerIssueId,
-  );
+  const children = followThroughCards(tracker.issues, tracker.rootIssueId);
 
-  // Resolve the tracked set: explicit config items plus every tracker child
-  // that resolves to a GitHub item (originId, work product URL, or description URL).
+  // Resolve the tracked set: explicit config items plus direct or program-nested
+  // owners that resolve to a GitHub item (originId or description URL).
   const tracked = new Map<string, TrackedItemRef & { kind: "issue" | "pull" | "discussion" }>();
   for (const extra of config.extraTrackedItems) tracked.set(itemKey(extra), extra);
   for (const child of children) {
@@ -250,11 +249,6 @@ function refFromCard(card: CardLike & { description?: string | null }): (Tracked
       return { owner: match[1], repo: match[2], number: Number.parseInt(match[3], 10), kind };
     }
   }
-  for (const wp of card.workProducts ?? []) {
-    if (!wp.url) continue;
-    const ref = parseGitHubUrl(wp.url);
-    if (ref) return ref;
-  }
   for (const url of identityUrlsInText(card.description)) {
     const ref = parseGitHubUrl(url);
     if (ref) return ref;
@@ -264,7 +258,6 @@ function refFromCard(card: CardLike & { description?: string | null }): (Tracked
 
 function kindFromCard(card: CardLike): "issue" | "pull" | "discussion" {
   const urls: string[] = [];
-  for (const wp of card.workProducts ?? []) if (wp.url) urls.push(wp.url);
   if (typeof card.description === "string") urls.push(...identityUrlsInText(card.description));
   for (const url of urls) {
     const ref = parseGitHubUrl(url);
@@ -360,7 +353,7 @@ async function syncOneItem(
   const snapshot = fetched.snapshot;
 
   let card = findCardForItem(children, item);
-  if (card && !previous.cardId) record.cardId = card.id;
+  const ownerChanged = card !== null && previous.cardId !== card.id;
   if (!card) {
     // A new "ours" item with no card gets a child of the tracker.
     const ours = isOursItem(config, { headLabel: snapshot.headLabel, authorLogin: snapshot.authorLogin });
@@ -412,10 +405,11 @@ async function syncOneItem(
   // A legacy record with no other change still syncs labels/header once (new
   // awaiting facets for old cards) but never wakes for the backfill itself.
   const upgradeSync = legacyNoReviewState && !firstSeen;
-  if (changed || firstSeen || upgradeSync) {
+  const ownerSync = ownerChanged && !changed && !firstSeen && !upgradeSync;
+  if (changed || firstSeen || upgradeSync || ownerChanged) {
     const patch = buildCardPatch(card, item, snapshot, config, config.dryRun);
     const changeDetail = prevSnapshot ? describeChange(prevForCompare, snapshot) : null;
-    const detail = changeDetail ?? (firstSeen || !prevSnapshot ? "first seen" : "backfill review state (no upstream change)");
+    const detail = changeDetail ?? (firstSeen || !prevSnapshot ? "first seen" : ownerSync ? "owner changed (no upstream change)" : "backfill review state (no upstream change)");
     // An updatedAt-only change (our own title/body/label edits do exactly
     // this) syncs the header but never wakes. A move into an unsettled check
     // state (pending/none) is likewise not a wake unless other material state
@@ -438,15 +432,20 @@ async function syncOneItem(
       (prevForCompare.headSha ?? null) !== (snapshot.headSha ?? null) ||
       prevForCompare.draft !== snapshot.draft
     );
-    const silentSync = activityOnly || (checksUnsettled && !materialChange);
+    // A local owner correction needs initialization even on a cached 304,
+    // but is not itself an upstream change and must not spend a wake.
+    const silentSync = ownerSync || activityOnly || (checksUnsettled && !materialChange);
     if (silentSync) {
-      const silentDetail = activityOnly
-        ? "updatedAt-only change: header/labels synced, no wake"
-        : `checks ${prevForCompare.checkConclusion}->${snapshot.checkConclusion}: not settled, no wake`;
-      if (Object.keys(patch).length > 0 && !config.dryRun) {
-        await ctx.issues.update(card.id, patch as never, companyId);
+      const silentDetail = ownerSync
+        ? `${config.dryRun ? "would sync" : "synced"} owner origin/header/labels, no upstream change or wake`
+        : activityOnly
+          ? "updatedAt-only change: header/labels synced, no wake"
+          : `checks ${prevForCompare.checkConclusion}->${snapshot.checkConclusion}: not settled, no wake`;
+      if (!config.dryRun) {
+        if (Object.keys(patch).length > 0) await ctx.issues.update(card.id, patch as never, companyId);
+        record.cardId = card.id;
+        if (!ownerSync) record.wokenFingerprint = record.fingerprint;
       }
-      if (!config.dryRun) record.wokenFingerprint = record.fingerprint;
       return { item: key, card: card.id, status: "mapped", reason: detail, detail: silentDetail };
     }
     if (Object.keys(patch).length > 0) {
@@ -455,6 +454,7 @@ async function syncOneItem(
       }
       await ctx.issues.update(card.id, patch as never, companyId);
     }
+    if (!config.dryRun) record.cardId = card.id;
     if (firstSeen || record.wokenFingerprint === record.fingerprint || (upgradeSync && !changed)) {
       record.wokenFingerprint = record.fingerprint;
       return { item: key, card: card.id, status: changed || upgradeSync ? "mapped" : "unchanged", reason: detail, detail: "labels/header synced, no wake (first seen or already woken)" };

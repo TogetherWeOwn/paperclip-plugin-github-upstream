@@ -156,6 +156,73 @@ describe("audit job", () => {
     expect(refetched?.labelIds ?? []).not.toContain(UNGATED_ID);
   });
 
+  it.each([false, true])("reuses a program grandchild and recognizes its gate without a duplicate (description only: %s)", async (descriptionOnly) => {
+    const program = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      parentId: trackerId,
+      title: "Program summary",
+      description: `Includes ${issueHtml(100)}`,
+    });
+    const card = descriptionOnly
+      ? await harness.ctx.issues.create({ companyId: COMPANY, parentId: program.id, title: "Nested owner", description: `Owns ${issueHtml(100)}` })
+      : await followThrough(harness, program.id, 100);
+    await gateCard(harness, card.id, GATE_BEFORE);
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(100)]: { etag: '"i1"', body: issueRow(100) },
+        [commentsUrl(100)]: { etag: '"m1"', body: [comment(1, "Rick7C2")] },
+      },
+      searchItems: [{ html_url: issueHtml(100) }],
+      graphqlDiscussion: null,
+    };
+    const out = await scan(harness, trackerId, auditStub(table));
+    expect(out.outcomes).toHaveLength(1);
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "gated" });
+    expect(out.stats).toMatchObject({ wakes: 0, creates: 0 });
+    expect(await flagCards(harness)).toHaveLength(0);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND })).toHaveLength(descriptionOnly ? 0 : 1);
+  });
+
+  it("preserves an established owner's gate evidence when ordinary subtasks exist", async () => {
+    const card = await followThrough(harness, trackerId, 100);
+    await harness.ctx.issues.create({
+      companyId: COMPANY, parentId: card.id, title: "Fix CI", description: `Related to ${issueHtml(100)}`,
+    });
+    await gateCard(harness, card.id, GATE_BEFORE);
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(100)]: { etag: '"i1"', body: issueRow(100) },
+        [commentsUrl(100)]: { etag: '"m1"', body: [comment(1, "Rick7C2")] },
+      },
+      searchItems: [{ html_url: issueHtml(100) }],
+      graphqlDiscussion: null,
+    };
+    const out = await scan(harness, trackerId, auditStub(table));
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "gated" });
+    expect(out.stats).toMatchObject({ creates: 0, wakes: 0 });
+    expect(await flagCards(harness)).toHaveLength(0);
+    expect(await harness.ctx.issues.list({ companyId: COMPANY, originKind: ITEM_ORIGIN_KIND })).toHaveLength(1);
+  });
+
+  it("does not accept a completed gateway subtask as an approved gate", async () => {
+    const card = await followThrough(harness, trackerId, 100);
+    const task = await harness.ctx.issues.create({
+      companyId: COMPANY, parentId: card.id, title: "Upstream gateway timeout investigation", status: "done",
+    } as never);
+    await harness.ctx.issues.update(task.id, { completedAt: GATE_BEFORE } as never, COMPANY);
+    const table: RouteTable = {
+      rest: {
+        [issueUrl(100)]: { etag: '"i1"', body: issueRow(100) },
+        [commentsUrl(100)]: { etag: '"m1"', body: [comment(1, "Rick7C2")] },
+      },
+      searchItems: [{ html_url: issueHtml(100) }],
+      graphqlDiscussion: null,
+    };
+    const out = await scan(harness, trackerId, auditStub(table));
+    expect(out.outcomes[0]).toMatchObject({ card: card.id, status: "flagged" });
+    expect(await flagCards(harness)).toHaveLength(1);
+  });
+
   it("an ungated post is labelled and flagged, deduped on a rerun", async () => {
     const table: RouteTable = {
       rest: {

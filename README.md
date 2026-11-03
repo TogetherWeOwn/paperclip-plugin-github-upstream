@@ -20,7 +20,15 @@ Our own upstream actions never wake our own card: on a changed fingerprint (neve
 
 ## Card mapping
 
-An upstream item maps to a card by `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL work product, then by a GitHub URL in the description (the shape most existing follow-through cards are in). Blockquoted lines are never identity: the plugin quotes the upstream title as untrusted text, and titles can carry arbitrary URLs. Cards found by URL get `originKind`/`originId` backfilled, but a card that already owns another item never matches by URL. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
+Follow-through owners may sit directly under the tracker or under one program card (tracker → program → item). Both item sync and audit use that same owner set, so explicit `extraTrackedItems` entries and discovery reuse nested cards rather than creating duplicates. A direct child's explicit plugin item origin remains authoritative even when it has ordinary subtasks; those subtasks never become owners. Without an explicit item origin, a direct child is treated as a program only when a non-gate child has its own item identity (plugin origin or unquoted description URL). The identified children then own their items, not the program summary. Ordinary identity-less subtasks do not turn an item into a program.
+
+Gate titles match `Upstream gate` followed by the end of the title, whitespace, or a delimiter (`(`, `:`, `-`, `–`, `—`). They are never owners, and their children and items deeper than one program level are not scanned. Titles such as `Upstream gateway timeout investigation` remain ordinary items and never count as gate evidence. Actual gates under either direct or program-nested owners still count as audit evidence.
+
+When correcting an old summary that was mistakenly mapped as an item, remove its explicit item origin before relying on its nested owner. A changed owner initializes its origin, description header and labels even when the upstream response is unchanged or cached (`304`), without waking it for the ownership correction alone. Dry runs report that sync without modifying the card or consuming the live ownership repair.
+
+An upstream item maps to a card by plugin `originId` (`{owner}/{repo}#{n}`), then by a GitHub URL in the description. **A work product alone is not sufficient:** the host's plugin `getSubtree` returns raw issue rows without work products and has no include-work-products option. Put the canonical issue/PR/discussion URL in an unquoted description line before relying on plugin tracking; attaching a GitHub work product is still useful for navigation but does not establish identity. This contract also applies to dry runs. Existing plugin origins remain valid without a description link (bare origins default to PR and self-correct to issue).
+
+Blockquoted lines are never identity: the plugin quotes the upstream title as untrusted text, and titles can carry arbitrary URLs. Cards found by description URL get `originKind`/`originId` backfilled, but a card that already owns another item never matches by URL. New "ours" items with no card get a follow-through child of the tracker: a PR whose head matches `ourHeadPrefixes` (`TogetherWeOwn:*` by default) or whose author is `operatorLogin`. Issue search discovery (`discoveryQueries`) runs at most hourly and only creates cards for ours items.
 
 ## GitHub tab
 
@@ -91,7 +99,7 @@ paperclip-github-upstream-dryrun \
   --cards ./cards.json --config ./config.json --state ./dryrun-state.json
 ```
 
-`cards.json` holds the tracker children reduced to `{id, parentId, originKind, originId, labels, labelIds, description, workProducts, assigneeAgentId, status, identifier}`. Dry-run intentions are printed as one JSON object per line.
+`cards.json` holds tracker descendants (including program containers and gate cards) reduced to `{id, title, parentId, originKind, originId, labels, labelIds, description, assigneeAgentId, status, completedAt, identifier}`. Preserve parent links and gate titles so owner selection and audit evidence match production; `workProducts` are ignored for identity. Pass `--tracker-id <id>` when program nesting makes automatic parent inference ambiguous. Dry-run intentions are printed as one JSON object per line.
 
 ## Development
 

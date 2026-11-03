@@ -38,8 +38,33 @@ export type CardLike = Pick<Issue, "id" | "originKind" | "originId"> & {
   labels?: Array<{ name: string }> | undefined;
   labelIds?: string[] | undefined;
   description?: string | null | undefined;
+  title?: string | null | undefined;
+  parentId?: string | null | undefined;
   workProducts?: Array<{ url: string | null }> | undefined;
 };
+
+/** Gate cards are review evidence, never item owners. */
+export const GATE_TITLE_PREFIX = "Upstream gate";
+const GATE_TITLE_RE = new RegExp(`^${GATE_TITLE_PREFIX}(?:$|[\\s(:—–-])`, "u");
+
+export const isGateCard = (card: Pick<CardLike, "title">): boolean => GATE_TITLE_RE.test(card.title ?? "");
+
+const hasItemOrigin = (card: CardLike): boolean => card.originKind === ITEM_ORIGIN_KIND && !!card.originId;
+const hasItemIdentity = (card: CardLike): boolean =>
+  hasItemOrigin(card) || identityUrlsInText(card.description).some((url) => parseGitHubUrl(url) !== null);
+
+/**
+ * Owners sit directly under the tracker or one program level below it.
+ * Explicit origins remain authoritative even with subtasks. Otherwise a child
+ * with item identity identifies a program whose summary must not claim it.
+ */
+export function followThroughCards<T extends CardLike>(cards: T[], trackerId: string): T[] {
+  const direct = cards.filter((c) => c.id !== trackerId && c.parentId === trackerId && !isGateCard(c));
+  const containers = new Set(direct.filter((c) => !hasItemOrigin(c)).map((c) => c.id));
+  const nested = cards.filter((c) => c.id !== trackerId && c.parentId && containers.has(c.parentId) && !isGateCard(c) && hasItemIdentity(c));
+  const programIds = new Set(nested.map((c) => c.parentId));
+  return [...direct.filter((c) => !programIds.has(c.id)), ...nested];
+}
 
 const GITHUB_ITEM_RE =
   /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/(pull|issues|discussions)\/(\d+)(?:[/?#].*)?$/i;
@@ -96,9 +121,9 @@ const matchesItem = (url: string, item: Pick<TrackedItemRef, "owner" | "repo" | 
 };
 
 /**
- * Find the card for an item: first by originId, then by GitHub URL work
- * product, then by a GitHub URL in the description (the shape most existing
- * follow-through cards are in). Mirrors refFromCard's tracking so a tracked
+ * Find the card for an item: first by originId, then by a GitHub URL in the
+ * description. Work products are not identity: the host's subtree API does
+ * not include them. Mirrors refFromCard's tracking so a tracked
  * item always resolves to the card that caused it to be tracked.
  */
 export function findCardForItem<T extends CardLike>(cards: T[], item: Pick<TrackedItemRef, "owner" | "repo" | "number">): T | null {
@@ -110,9 +135,6 @@ export function findCardForItem<T extends CardLike>(cards: T[], item: Pick<Track
     // origin-less (legacy) cards match this way, so prose that mentions a
     // second item can never steal or overwrite an explicit origin.
     if (card.originKind === ITEM_ORIGIN_KIND && card.originId && card.originId.toLowerCase() !== originId) continue;
-    for (const wp of card.workProducts ?? []) {
-      if (wp.url && matchesItem(wp.url, item)) return card;
-    }
     if (typeof card.description === "string") {
       for (const url of identityUrlsInText(card.description)) {
         if (matchesItem(url, item)) return card;
@@ -122,7 +144,7 @@ export function findCardForItem<T extends CardLike>(cards: T[], item: Pick<Track
   return null;
 }
 
-/** Patch that backfills originKind/originId on a card found by work product. Null when already set. */
+/** Patch that backfills originKind/originId on a card found by description URL. Null when already set. */
 export function backfillPatch<T extends CardLike>(card: T, item: Pick<TrackedItemRef, "owner" | "repo" | "number">): { originKind: string; originId: string } | null {
   const originId = itemOriginId(item);
   if (card.originKind === ITEM_ORIGIN_KIND && (card.originId ?? "").toLowerCase() === originId.toLowerCase()) return null;
