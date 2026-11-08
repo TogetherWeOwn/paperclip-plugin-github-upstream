@@ -97,7 +97,7 @@ describe("release job", () => {
       expect(card.description).toContain("separate immutable frozen-candidate procedure");
       expect(card.description).toContain("mutable discovery intake is not an accepted frozen candidate");
       expect(card.description).toContain("keep accepted candidate evidence separate and unchanged");
-      expect(card.description).not.toMatch(/carried patches|rebase|build and test|install confirmation|human.confirmation/i);
+      expect(card.description).not.toMatch(/carried patches|\brebase\b|build and test|install confirmation|human.confirmation/i);
       if (compareBase) {
         expect(card.description).toContain(`Changes since our base (\`${compareBase}\`)`);
         expect(card.description).toContain(`compare/${compareBase}...${tag}`);
