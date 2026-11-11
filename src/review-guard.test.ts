@@ -329,10 +329,12 @@ describe("review-guard events (real SDK contract)", () => {
     const config = resolveConfig(GUARD_CONFIG);
     const issue = seedIssue(harness);
     let attempts = 0;
+    const bodies: string[] = [];
     const origComment = harness.ctx.issues.createComment.bind(harness.ctx.issues);
     harness.ctx.issues.createComment = (async (...args: Parameters<typeof origComment>) => {
       attempts += 1;
       if (attempts === 1) throw new Error("comment blew up");
+      bodies.push(String(args[1]));
       return origComment(...args);
     }) as typeof harness.ctx.issues.createComment;
 
@@ -343,9 +345,40 @@ describe("review-guard events (real SDK contract)", () => {
     const retry = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, config);
     expect(retry).toEqual({ applied: false, reason: "comment-retried" });
     expect(attempts).toBe(2);
+    expect(bodies[0]).toContain("company default");
     const third = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, config);
     expect(third).toEqual({ applied: false, reason: "has-stages" });
     expect(attempts).toBe(2);
+  });
+
+  it("retried audit comment keeps the original config source after a config change", async () => {
+    const harness = await setup();
+    const bodies: string[] = [];
+    const issue = seedIssue(harness);
+    let attempts = 0;
+    const origComment = harness.ctx.issues.createComment.bind(harness.ctx.issues);
+    harness.ctx.issues.createComment = (async (...args: Parameters<typeof origComment>) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("comment blew up");
+      bodies.push(String(args[1]));
+      return origComment(...args);
+    }) as typeof harness.ctx.issues.createComment;
+
+    await expect(
+      ensureReviewPolicy(harness.ctx, COMPANY, issue as never, resolveConfig(GUARD_CONFIG)),
+    ).rejects.toThrow("comment blew up");
+    // Config changes to a project override before the retry: the card still
+    // carries the company-default stages, so the retry must say so.
+    const changed = { ...GUARD_CONFIG, reviewAgentIdsByProjectId: { [PROJECT]: [EXTRA] } };
+    const retry = await ensureReviewPolicy(
+      harness.ctx,
+      COMPANY,
+      (await harness.ctx.issues.get(issue.id, COMPANY)) as never,
+      resolveConfig(changed),
+    );
+    expect(retry).toEqual({ applied: false, reason: "comment-retried" });
+    expect(bodies[0]).toContain("company default");
+    expect(bodies[0]).not.toContain("project override");
   });
 
   it("dry-run writes nothing", async () => {

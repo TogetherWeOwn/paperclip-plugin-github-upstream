@@ -98,7 +98,7 @@ export const buildReviewPolicy = (agentIds: string[], existing?: IssueExecutionP
   })),
 });
 
-type AppliedRecord = Record<string, { at: string; stages: number; commented?: boolean }>;
+type AppliedRecord = Record<string, { at: string; stages: number; commented?: boolean; source?: string }>;
 
 const readApplied = async (ctx: PluginContext, companyId: string): Promise<AppliedRecord> =>
   ((await ctx.state.get(stateKey(companyId, "review-guard.applied"))) as AppliedRecord | null) ?? {};
@@ -132,7 +132,9 @@ export async function ensureReviewPolicy(
     // A pending record means the policy was stamped but the audit comment
     // failed: retry the comment instead of hiding behind the live stage.
     if (prior && prior.commented === false && !dryRun) {
-      const { source } = pickReview(config, issue);
+      // The retry must attribute the original source, not whatever the
+      // config says now: the staged stages are the ones from stamp time.
+      const source = prior.source ?? pickReview(config, issue).source;
       const stageCount = prior.stages;
       await ctx.issues.createComment(
         issue.id,
@@ -188,7 +190,7 @@ export async function ensureReviewPolicy(
   if (!prior) {
     await writeApplied(ctx, companyId, {
       ...applied,
-      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false },
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source },
     });
     await ctx.issues.createComment(
       issue.id,
@@ -198,7 +200,7 @@ export async function ensureReviewPolicy(
     commented = true;
     await writeApplied(ctx, companyId, {
       ...applied,
-      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true },
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true, source },
     });
   }
 
