@@ -83,6 +83,13 @@ describe("containsStandaloneToken", () => {
     expect(containsStandaloneToken("defer two-1", "TWO-1")).toBe(true);
     expect(containsStandaloneToken("defer xtwo-1x", "TWO-1")).toBe(false);
   });
+
+  it("treats underscores and dollar signs as identifier characters", () => {
+    expect(containsStandaloneToken("Decision: defer TWO-1_archive until Q3", "TWO-1")).toBe(false);
+    expect(containsStandaloneToken("Decision: defer TWO-1$foo until Q3", "TWO-1")).toBe(false);
+    expect(containsStandaloneToken("Decision: defer _TWO-1 until Q3", "TWO-1")).toBe(false);
+    expect(containsStandaloneToken("Decision: defer $TWO-1 until Q3", "TWO-1")).toBe(false);
+  });
 });
 
 describe("decisionNamesTarget", () => {
@@ -303,6 +310,34 @@ describe("defer_blocked_card tool", () => {
     }, runCtx);
     expect(missingDecision.error).toMatch(/decisionIssueId .* not found/);
     expect((await harness.ctx.issues.get(target.id, COMPANY))!.status).toBe("blocked");
+  });
+
+  it("repairs the audit comment when the card reaches backlog between the two reads", async () => {
+    const harness = await setup();
+    const { target, decision } = await seedPair(harness);
+    // Another actor moves the card to backlog between the handler's first
+    // and second reads, but fails before posting its audit comment.
+    const originalGet = harness.ctx.issues.get.bind(harness.ctx.issues);
+    let targetReads = 0;
+    harness.ctx.issues.get = (async (...args: never[]) => {
+      if (args[0] === target.id) targetReads += 1;
+      const issue = await (originalGet as (...a: never[]) => Promise<never>)(...args);
+      if (args[0] === target.id && targetReads === 2) {
+        await harness.ctx.issues.update(target.id, { status: "backlog" }, COMPANY);
+        return originalGet(target.id, COMPANY) as never;
+      }
+      return issue;
+    }) as typeof harness.ctx.issues.get;
+    const result = await harness.executeTool(DEFER_TOOL_NAME, {
+      targetIssueId: target.id,
+      decisionIssueId: decision.id,
+      revisitTrigger: "2026-12-01T00:00:00Z",
+    }, runCtx);
+    expect(result.error).toBeUndefined();
+    expect(result.data).toMatchObject({ deferred: true, alreadyDeferred: true });
+    const comments = await harness.ctx.issues.listComments(target.id, COMPANY);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain(CALLER);
   });
 
   it("self-heals a lost audit comment on the idempotent path", async () => {

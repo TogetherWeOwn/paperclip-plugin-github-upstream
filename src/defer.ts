@@ -95,7 +95,9 @@ const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/
  * this deferral.
  */
 export function containsStandaloneToken(text: string, token: string): boolean {
-  const pattern = new RegExp(`(?<![A-Za-z0-9-])${escapeRegExp(token)}(?![A-Za-z0-9-])`, "i");
+  // `_` and `$` are identifier characters: `TWO-1_archive` / `TWO-1$foo` must
+  // not count as naming `TWO-1`. (`\b` also misses `$`, which `\w` excludes.)
+  const pattern = new RegExp(`(?<![A-Za-z0-9_$-])${escapeRegExp(token)}(?![A-Za-z0-9_$-])`, "i");
   return pattern.test(text);
 }
 
@@ -229,9 +231,9 @@ export function registerDeferTool(ctx: PluginContext): void {
         return { error: checked.error, data: { refusal: checked.refusal, deferred: false } };
       }
 
-      // Idempotent: already deferred, no second update. Self-heal the audit
-      // comment if a prior attempt moved the card but lost the comment.
-      if (target.status === "backlog") {
+      // Self-heal the audit comment if a prior attempt moved the card but
+      // lost the comment (shared by both already-backlog branches).
+      const ensureAuditComment = async () => {
         const targetComments = (await ctx.issues.listComments(target.id, companyId)).map((c) => c.body);
         if (!hasDeferAuditComment(targetComments, decision)) {
           await ctx.issues.createComment(
@@ -246,6 +248,11 @@ export function registerDeferTool(ctx: PluginContext): void {
             companyId,
           );
         }
+      };
+
+      // Idempotent: already deferred, no second update.
+      if (target.status === "backlog") {
+        await ensureAuditComment();
         return {
           content: `${target.identifier ?? target.id} is already in backlog; nothing changed.`,
           data: { deferred: true, alreadyDeferred: true, targetId: target.id, decisionId: decision.id },
@@ -263,6 +270,7 @@ export function registerDeferTool(ctx: PluginContext): void {
         return { error: rechecked.error, data: { refusal: rechecked.refusal, deferred: false } };
       }
       if (fresh.status === "backlog") {
+        await ensureAuditComment();
         return {
           content: `${fresh.identifier ?? fresh.id} is already in backlog; nothing changed.`,
           data: { deferred: true, alreadyDeferred: true, targetId: fresh.id, decisionId: decision.id },
