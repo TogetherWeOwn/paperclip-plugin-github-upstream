@@ -71,6 +71,20 @@ describe("isParkedRoot", () => {
     expect(isParkedRoot({ status: "todo", title: "no go-to", description: null, archivedAt: null })).toBeNull();
     expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: no go to launch", archivedAt: null })).toBeNull();
   });
+
+  it("parks explicit title continuations (D1)", () => {
+    expect(isParkedRoot({ status: "todo", title: "Deferred until Q3", description: null, archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "todo", title: "NO-GO for launch", description: null, archivedAt: null })?.kind).toBe("no-go");
+  });
+
+  it("does not let the description veto a title-only disposition (D2)", () => {
+    expect(isParkedRoot({ status: "todo", title: "NO-GO", description: "To revisit when upstream lands", archivedAt: null })?.kind).toBe("no-go");
+    expect(isParkedRoot({ status: "todo", title: "Deferred", description: "Execution scheduled for later", archivedAt: null })?.kind).toBe("deferred");
+  });
+
+  it("lets an explicit label override the incidental-adjective exclusion (D3)", () => {
+    expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: deferred execution until Q3", archivedAt: null })?.kind).toBe("deferred");
+  });
 });
 
 describe("extractRevisitTrigger", () => {

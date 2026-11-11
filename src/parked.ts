@@ -162,21 +162,30 @@ const LIVE_TEXT_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked
  * woken. Archived roots likewise never park.
  */
 // "deferred rendering/loading/..." is an adjective, never a disposition.
-const DEFERRED_NOUN = String.raw`(?!\s+(?:rendering|loading|display|paint|execution|initialization)\b)`;
+// Same-line only ([ \t], not \s): the title/description join is "\n", so a
+// title-only disposition must not be vetoed by the description's first
+// word (D2: title `Deferred` + description `Execution...`).
+const DEFERRED_NOUN = String.raw`(?![ \t]+(?:rendering|loading|display|paint|execution|initialization)\b)`;
 // "no go-to" / "no go to ..." is the go-to compound, never a NO-GO.
 // The lookahead permits GO followed by a separator that is not `to`.
-const NO_GO_NOT_GOTO = String.raw`(?![-\s]?to\b)`;
+// Same-line only: title `NO-GO` + description `To revisit...` must not veto (D2).
+const NO_GO_NOT_GOTO = String.raw`(?![ \t\-]?to\b)`;
 
 const NO_GO_RES: RegExp[] = [
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
-  new RegExp(String.raw`(?:^|\n)\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}\s*(?:[:\-–—]|\.|$)`, "im"),
+  // Line prefix: punctuation/EOL or explicit continuation (D1: `NO-GO for launch`).
+  new RegExp(String.raw`(?:^|\n)[ \t]*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:[ \t]*(?:[:\-–—]|\.)|[ \t]+(?:for|on|until|because|pending)\b|[ \t]*$)`, "im"),
   new RegExp(String.raw`,\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:\s+(?:for|on|until|because)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
   new RegExp(String.raw`\b(?:is|was|remains?|marked|set to)\s+NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
 ];
 
 const DEFERRED_RES: RegExp[] = [
-  new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*deferred\b${DEFERRED_NOUN}`, "i"),
-  new RegExp(String.raw`(?:^|\n)\s*deferred\b${DEFERRED_NOUN}\s*(?:[:\-–—]|\.|$)`, "im"),
+  // D3: an explicit Decision:/Status: label wins over the incidental-adjective
+  // exclusion, so no DEFERRED_NOUN veto here (`Decision: deferred execution until Q3` parks).
+  new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*deferred\b`, "i"),
+  // Line prefix: punctuation/EOL or explicit continuation (D1: `Deferred until Q3`).
+  // DEFERRED_NOUN still vetoes `Deferred rendering...` titles.
+  new RegExp(String.raw`(?:^|\n)[ \t]*deferred\b${DEFERRED_NOUN}(?:[ \t]*(?:[:\-–—]|\.)|[ \t]+(?:until|for|on|because|pending|to)\b|[ \t]*$)`, "im"),
   new RegExp(String.raw`,\s*deferred\b${DEFERRED_NOUN}(?:\s+(?:until|for)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
   new RegExp(String.raw`\b(?:is|was|has been|been|remains?|marked)\s+deferred\b${DEFERRED_NOUN}`, "i"),
 ];
