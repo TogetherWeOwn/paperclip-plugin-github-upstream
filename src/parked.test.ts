@@ -89,6 +89,69 @@ describe("isParkedRoot", () => {
   it("lets an explicit label override the incidental-adjective exclusion (D3)", () => {
     expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: deferred execution until Q3", archivedAt: null })?.kind).toBe("deferred");
   });
+
+  it("does not park on a wrapped-line noun after 'deferred' (Devin 4533158195)", () => {
+    // A line break inside the description must not escape the noun veto.
+    expect(
+      isParkedRoot({ status: "todo", title: "Dashboard work", description: "The launch is deferred\nrendering work, see below", archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("does not let a following 'To ...' line veto an explicit NO-GO disposition", () => {
+    // A sentence-initial "To" on the next line is not the go-to compound.
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "Decision: NO-GO\nTo revisit when upstream lands", archivedAt: null })?.kind,
+    ).toBe("no-go");
+  });
+
+  it("still vetoes a wrapped go-to compound in an incidental predication", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "There is no go\nTo maintainer for this repo", archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("does not park on 'deferred' + NBSP + noun (rich-text adjective)", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "The dashboard is deferred\u00a0rendering work", archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("does not let a new paragraph veto a standalone Deferred disposition", () => {
+    // A blank line is a paragraph boundary, not a wrapped line.
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "Deferred\n\nExecution scheduled for Q3", archivedAt: null })?.kind,
+    ).toBe("deferred");
+    // Unicode line separators form a paragraph boundary too.
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "Deferred\u2028\u2028Execution scheduled for Q3", archivedAt: null })?.kind,
+    ).toBe("deferred");
+  });
+
+  it("still vetoes a CRLF-wrapped go-to compound in a predication", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "There is no go\r\nTo maintainer for this repo", archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("does not let a mixed paragraph break veto a no-go predication", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "The launch is no go\n\u2028To revisit in Q3", archivedAt: null })?.kind,
+    ).toBe("no-go");
+  });
+
+  it("does not park on 'Deferred to <team>' delegation", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "Deferred to the platform team", description: null, archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("still parks the D1-D3 preservation examples", () => {
+    expect(isParkedRoot({ status: "todo", title: "Deferred until Q3", description: null, archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "todo", title: "Deferred", description: "Execution scheduled for later", archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: deferred execution until Q3", archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "in_progress", title: "deferred rendering", description: null, archivedAt: null })).toBeNull();
+    expect(isParkedRoot({ status: "todo", title: "no go-to", description: null, archivedAt: null })).toBeNull();
+  });
 });
 
 describe("extractRevisitTrigger", () => {

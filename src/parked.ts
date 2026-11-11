@@ -156,27 +156,50 @@ const LIVE_TEXT_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked
  * "deferred rendering/loading" (adjective + noun), "no go-to"
  * (`GO` followed by `-to`/` to` is the go-to compound, not a NO-GO),
  * and `defer` alone ("defer to X" delegates, it does not park).
+ * Delegation via `deferred to X` ("deferred to the platform team" =
+ * handed to X) likewise does not park.
+ *
+ * Title and description are checked as SEPARATE fields (TWO-5904): a
+ * disposition in one field is never vetoed by the other field's first
+ * word (D2: title `Deferred` + description `Execution...`), while a
+ * wrapped line inside a single field stays one text — the noun veto
+ * spans line breaks within a field (`deferred\nrendering` is still
+ * `deferred rendering`), matching Devin's suggestion.
  *
  * Terminal/archived roots are never parked: a `done` root that retains an
  * old NO-GO note is complete, not parked, and its dependents must not be
  * woken. Archived roots likewise never park.
  */
 // "deferred rendering/loading/..." is an adjective, never a disposition.
-// Same-line only ([ \t], not \s): the title/description join is "\n", so a
-// title-only disposition must not be vetoed by the description's first
-// word (D2: title `Deferred` + description `Execution...`).
-const DEFERRED_NOUN = String.raw`(?![ \t]+(?:rendering|loading|display|paint|execution|initialization)\b)`;
+// The veto spans a SINGLE wrapped line break WITHIN one field (same-line
+// whitespace `[^\S\r\n]`, incl. NBSP, or one line break plus such
+// whitespace — not `\s+`): a line break inside the
+// description (`deferred\nrendering`) must not escape the veto, but a
+// blank line is a paragraph boundary (`Deferred\n\nExecution...` is a
+// standalone disposition plus a new paragraph, so it must still park).
+// Per-field checking keeps the title/description boundary separate (D2:
+// title `Deferred` + description `Execution...`).
+const DEFERRED_NOUN = String.raw`(?!(?:[^\S\r\n\u2028\u2029]+|[^\S\r\n\u2028\u2029]*(?:\r\n|\n|\r|\u2028|\u2029)[^\S\r\n\u2028\u2029]*)(?:rendering|loading|display|paint|execution|initialization)\b)`;
 // "no go-to" / "no go to ..." is the go-to compound, never a NO-GO.
 // The lookahead permits GO followed by a separator that is not `to`.
-// Same-line only: title `NO-GO` + description `To revisit...` must not veto (D2).
+// Explicit dispositions (label, line prefix, comma list) use a
+// same-line-only separator: a following line's sentence-initial
+// "To ..." (`Decision: NO-GO\nTo revisit...`) is a new sentence, not
+// the go-to compound, so it must not veto them. The incidental
+// predication (`is no go`) keeps the wrapped-line separator, so a
+// hard wrap inside the compound (`There is no go\nTo maintainer`)
+// is still vetoed. Per-field checking additionally keeps the
+// title/description boundary separate (D2: title `NO-GO` +
+// description `To revisit...` must not veto).
 const NO_GO_NOT_GOTO = String.raw`(?![ \t\-]?to\b)`;
+const NO_GO_NOT_GOTO_WRAP = String.raw`(?!(?:[ \t\-]?|[^\S\r\n\u2028\u2029]*(?:\r\n|\n|\r)[^\S\r\n\u2028\u2029]*)to\b)`;
 
 const NO_GO_RES: RegExp[] = [
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
   // Line prefix: punctuation/EOL or explicit continuation (D1: `NO-GO for launch`).
   new RegExp(String.raw`(?:^|\n)[ \t]*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:[ \t]*(?:[:\-–—]|\.)|[ \t]+(?:for|on|until|because|pending)\b|[ \t]*$)`, "im"),
   new RegExp(String.raw`,\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:\s+(?:for|on|until|because)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
-  new RegExp(String.raw`\b(?:is|was|remains?|marked|set to)\s+NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
+  new RegExp(String.raw`\b(?:is|was|remains?|marked|set to)\s+NO[-\s]?GO\b${NO_GO_NOT_GOTO_WRAP}`, "i"),
 ];
 
 const DEFERRED_RES: RegExp[] = [
@@ -184,8 +207,12 @@ const DEFERRED_RES: RegExp[] = [
   // exclusion, so no DEFERRED_NOUN veto here (`Decision: deferred execution until Q3` parks).
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*deferred\b`, "i"),
   // Line prefix: punctuation/EOL or explicit continuation (D1: `Deferred until Q3`).
-  // DEFERRED_NOUN still vetoes `Deferred rendering...` titles.
-  new RegExp(String.raw`(?:^|\n)[ \t]*deferred\b${DEFERRED_NOUN}(?:[ \t]*(?:[:\-–—]|\.)|[ \t]+(?:until|for|on|because|pending|to)\b|[ \t]*$)`, "im"),
+  // DEFERRED_NOUN still vetoes `Deferred rendering...` titles. No `to`
+  // continuation: `deferred to X` delegates to X (TWO-5904:
+  // `Deferred to the platform team` must not park). The explicit
+  // `Decision:`/`Status:` label above still parks `deferred to ...`,
+  // as an explicit disposition label wins over the delegation reading.
+  new RegExp(String.raw`(?:^|\n)[ \t]*deferred\b${DEFERRED_NOUN}(?:[ \t]*(?:[:\-–—]|\.)|[ \t]+(?:until|for|on|because|pending)\b|[ \t]*$)`, "im"),
   new RegExp(String.raw`,\s*deferred\b${DEFERRED_NOUN}(?:\s+(?:until|for)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
   new RegExp(String.raw`\b(?:is|was|has been|been|remains?|marked)\s+deferred\b${DEFERRED_NOUN}`, "i"),
 ];
@@ -198,9 +225,18 @@ export function isParkedRoot(
   if (issue.status === "backlog") return { kind: "backlog" };
   if (issue.status === "cancelled") return { kind: "cancelled" };
   if (!LIVE_TEXT_STATUSES.has(issue.status)) return null;
-  const text = `${issue.title ?? ""}\n${issue.description ?? ""}`;
-  if (NO_GO_RES.some((re) => re.test(text))) return { kind: "no-go" };
-  if (DEFERRED_RES.some((re) => re.test(text))) return { kind: "deferred" };
+  // Per-field check (TWO-5904): a disposition in one field must not be
+  // vetoed by the other field's first word (D2), while a wrapped line
+  // inside one field still counts for the noun veto (Devin 4533158195).
+  // Status precedes description so a title NO-GO wins over a
+  // description deferred note, matching the pre-split joined-text order.
+  const fields = [issue.title ?? "", issue.description ?? ""];
+  for (const field of fields) {
+    if (NO_GO_RES.some((re) => re.test(field))) return { kind: "no-go" };
+  }
+  for (const field of fields) {
+    if (DEFERRED_RES.some((re) => re.test(field))) return { kind: "deferred" };
+  }
   return null;
 }
 
