@@ -113,6 +113,23 @@ import { stateKey } from "./state.js";
  *   event is a cheap `not-parked` return. If a dependent is itself parked,
  *   its own events propagate from its own dedupe window — a genuine chain,
  *   bounded per root, not a self-loop.
+ * - Disabled housekeeping (missed-unpark fix): the `disabled` return
+ *   is NOT state-free. While `parkedPropagationEnabled` is off, the
+ *   handler still reads the root and, when the root is no longer
+ *   parked, closes its window (and drops its pending entries) — with
+ *   no wakes and no comments. Without this, an unpark + re-park at
+ *   the same `(status:kind)` while disabled left the old window (and
+ *   its `woken` set) in place, and the re-park after re-enabling
+ *   was skipped as an already-propagated continuous park: dependents
+ *   were never woken for the genuinely new park. A root that is
+ *   still parked while disabled keeps its window, so a disable/enable
+ *   cycle around an ordinary edit still does not re-wake (the
+ *   ordinary-edit no-re-wake invariant). Known residual: an unpark
+ *   event that is never delivered to any handler at all (not merely
+ *   delivered while disabled) is indistinguishable from an ordinary
+ *   edit at the next parked event — no status history is readable —
+ *   so the old window is still reused there. Fail direction is
+ *   under-waking only: never a spurious wake, mutation, or injection.
  * - Concurrent handlers (Devin 0001, R2-1): the state record is
  *   read-modify-write with no host CAS (SDK `state` exposes only
  *   get/set/delete), and production state reads are copy-semantics (a
@@ -700,9 +717,36 @@ export async function handleParkedEvent(
   const companyId = event.companyId;
   const config = await loadConfig(ctx, companyId);
   if (!config) return { status: "no-config" };
-  if (!config.parkedPropagationEnabled) return { status: "disabled" };
   const rootId = eventIssueId(event);
   if (!rootId) return { status: "no-entity" };
+  if (!config.parkedPropagationEnabled) {
+    // Disabled housekeeping (missed-unpark fix): an unpark delivered
+    // while propagation is off must still close the root's window, so
+    // a later re-park — even at the same (status:kind), after
+    // re-enabling — mints a fresh occurrence and wakes dependents
+    // again. No wake, no comment, and no window is opened while
+    // disabled: a still-parked root keeps its existing window, which
+    // preserves the ordinary-edit no-re-wake invariant across a
+    // disable/enable cycle with no intervening unpark. Roots with no
+    // window return without reading the issue, keeping the disabled
+    // path cheap for the common case.
+    const state = await readState(ctx, companyId);
+    if (!state.windows[rootId]) return { status: "disabled" };
+    let root: Issue | null = null;
+    try {
+      root = await ctx.issues.get(rootId, companyId);
+    } catch {
+      // Fail closed: without a readable root the park state is
+      // unknown, so keep the window (under-waking, never spurious).
+      return { status: "disabled" };
+    }
+    if (root && isParkedRoot(root)) return { status: "disabled" };
+    const base = cloneParkedState(state);
+    delete state.windows[rootId];
+    state.pending = state.pending.filter((p) => p.rootId !== rootId);
+    await writeParkedStateConvergent(ctx, companyId, state, base);
+    return { status: "disabled" };
+  }
   const root = await ctx.issues.get(rootId, companyId);
   if (!root) return { status: "not-found" };
   const parked = isParkedRoot(root);
