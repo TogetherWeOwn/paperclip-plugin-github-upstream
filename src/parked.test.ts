@@ -59,6 +59,18 @@ describe("isParkedRoot", () => {
   it("does not treat 'defer to' delegation as parked", () => {
     expect(isParkedRoot({ status: "todo", title: "defer to QA", description: "please defer to the QA agent", archivedAt: null })).toBeNull();
   });
+
+  it("does not park on incidental 'deferred rendering/loading' (Q1)", () => {
+    expect(isParkedRoot({ status: "in_progress", title: "x", description: "Implements deferred rendering/loading for the dashboard", archivedAt: null })).toBeNull();
+    expect(isParkedRoot({ status: "in_progress", title: "deferred rendering", description: null, archivedAt: null })).toBeNull();
+    expect(isParkedRoot({ status: "todo", title: "x", description: "The launch is deferred rendering work, see below", archivedAt: null })).toBeNull();
+  });
+
+  it("does not park on 'no go-to' (Q1)", () => {
+    expect(isParkedRoot({ status: "in_progress", title: "x", description: "There is no go-to for this work", archivedAt: null })).toBeNull();
+    expect(isParkedRoot({ status: "todo", title: "no go-to", description: null, archivedAt: null })).toBeNull();
+    expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: no go to launch", archivedAt: null })).toBeNull();
+  });
 });
 
 describe("extractRevisitTrigger", () => {
@@ -968,6 +980,58 @@ describe("copy-semantics state (R2-1)", () => {
     expect((stored?.windows.rootA as { woken: Record<string, string> } | undefined)?.woken.depA).toBe("invoke");
     expect((stored?.windows.rootB as { woken: Record<string, string> } | undefined)?.woken.depC).toBe("invoke");
     expect((stored?.pending as { dependentId: string }[]).map((p) => p.dependentId).sort()).toEqual(["depB", "depD"]);
+  });
+
+  it("one dependent read failure queues that dependent and still processes the others (Q2)", async () => {
+    const harness = await setup();
+    withCopySemantics(harness);
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const depA = await harness.ctx.issues.create({
+      companyId: COMPANY, title: "Dependent A", status: "blocked", assigneeAgentId: AGENT, blockedByIssueIds: [root.id],
+    });
+    const depB = await harness.ctx.issues.create({
+      companyId: COMPANY, title: "Dependent B", status: "blocked", assigneeAgentId: AGENT, blockedByIssueIds: [root.id],
+    });
+    harness.ctx.agents.invoke = (async () => ({ runId: "run-1" })) as typeof harness.ctx.agents.invoke;
+    const origGet = harness.ctx.issues.get.bind(harness.ctx.issues);
+    harness.ctx.issues.get = (async (id: string, companyId: string) => {
+      if (id === depA.id) throw new Error("transient read failure");
+      return (origGet as (...a: unknown[]) => Promise<unknown>)(id, companyId);
+    }) as typeof harness.ctx.issues.get;
+
+    await emitRootUpdate(harness, root.id);
+    const stored = await readStoredParked(harness);
+    // depA (first) failed to read -> queued pending with the marker
+    // convention; depB was still woken and recorded in the window.
+    expect((stored?.pending as { dependentId: string; marker: string }[]).map((p) => p.dependentId)).toEqual([depA.id]);
+    expect((stored?.pending as { marker: string }[])[0]?.marker).toContain("parked-blocker-delivered");
+    expect((stored?.windows[root.id] as { woken: Record<string, string> } | undefined)?.woken[depB.id]).toBeDefined();
+    expect((stored?.windows[root.id] as { woken: Record<string, string> } | undefined)?.woken[depA.id]).toBeUndefined();
+  });
+
+  it("a sweep read failure retains the entry instead of aborting the drain (Q2)", async () => {
+    const harness = await setup({ parkedMaxWakesPerEvent: 1 });
+    withCopySemantics(harness);
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const depA = await harness.ctx.issues.create({
+      companyId: COMPANY, title: "Dependent A", status: "blocked", assigneeAgentId: AGENT, blockedByIssueIds: [root.id],
+    });
+    const depB = await harness.ctx.issues.create({
+      companyId: COMPANY, title: "Dependent B", status: "blocked", assigneeAgentId: AGENT, blockedByIssueIds: [root.id],
+    });
+    harness.ctx.agents.invoke = (async () => ({ runId: "run-1" })) as typeof harness.ctx.agents.invoke;
+    void depA;
+    await emitRootUpdate(harness, root.id);
+    expect((await readStoredParked(harness))?.pending).toHaveLength(1);
+    // Sweep: the queued dependent's read now throws -> entry retained.
+    const origGet = harness.ctx.issues.get.bind(harness.ctx.issues);
+    harness.ctx.issues.get = (async (id: string, companyId: string) => {
+      if (id === depB.id) throw new Error("transient read failure");
+      return (origGet as (...a: unknown[]) => Promise<unknown>)(id, companyId);
+    }) as typeof harness.ctx.issues.get;
+    await harness.runJob(PARKED_JOB_KEY);
+    const stored = await readStoredParked(harness);
+    expect((stored?.pending as { dependentId: string }[]).map((p) => p.dependentId)).toEqual([depB.id]);
   });
 });
 

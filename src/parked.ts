@@ -144,17 +144,43 @@ const LIVE_TEXT_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked
 
 /**
  * A card is a parked root when its status is `backlog`/`cancelled` (the
- * native "parked" states) or its title/description carries a NO-GO/deferred
- * disposition marker. The SDK exposes no execution-decision disposition to
- * read (decision outcomes are only approved/changes_requested), so the
- * text markers are: `NO-GO` / `NO GO` (word-boundaried) and `deferred`.
- * `defer` alone is deliberately not matched: "defer to X" delegates, it
- * does not park.
+ * native "parked" states) or its title/description carries an EXPLICIT
+ * NO-GO/deferred disposition. The SDK exposes no execution-decision
+ * disposition to read (decision outcomes are only
+ * approved/changes_requested), so the text must be an explicit
+ * disposition, not incidental vocabulary (Q1): a label
+ * (`Decision: deferred ...`, `Status: NO-GO`), a title/line prefix
+ * (`NO-GO: launch`, `Deferred: ...`), a comma-listed disposition
+ * (`parked, no go`), a standalone disposition line, or a predication
+ * (`is deferred`, `marked no-go`). Incidental uses never park:
+ * "deferred rendering/loading" (adjective + noun), "no go-to"
+ * (`GO` followed by `-to`/` to` is the go-to compound, not a NO-GO),
+ * and `defer` alone ("defer to X" delegates, it does not park).
  *
  * Terminal/archived roots are never parked: a `done` root that retains an
  * old NO-GO note is complete, not parked, and its dependents must not be
  * woken. Archived roots likewise never park.
  */
+// "deferred rendering/loading/..." is an adjective, never a disposition.
+const DEFERRED_NOUN = String.raw`(?!\s+(?:rendering|loading|display|paint|execution|initialization)\b)`;
+// "no go-to" / "no go to ..." is the go-to compound, never a NO-GO.
+// The lookahead permits GO followed by a separator that is not `to`.
+const NO_GO_NOT_GOTO = String.raw`(?![-\s]?to\b)`;
+
+const NO_GO_RES: RegExp[] = [
+  new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
+  new RegExp(String.raw`(?:^|\n)\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}\s*(?:[:\-–—]|\.|$)`, "im"),
+  new RegExp(String.raw`,\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:\s+(?:for|on|until|because)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
+  new RegExp(String.raw`\b(?:is|was|remains?|marked|set to)\s+NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
+];
+
+const DEFERRED_RES: RegExp[] = [
+  new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*deferred\b${DEFERRED_NOUN}`, "i"),
+  new RegExp(String.raw`(?:^|\n)\s*deferred\b${DEFERRED_NOUN}\s*(?:[:\-–—]|\.|$)`, "im"),
+  new RegExp(String.raw`,\s*deferred\b${DEFERRED_NOUN}(?:\s+(?:until|for)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
+  new RegExp(String.raw`\b(?:is|was|has been|been|remains?|marked)\s+deferred\b${DEFERRED_NOUN}`, "i"),
+];
+
 export function isParkedRoot(
   issue: Pick<Issue, "status" | "title" | "description" | "archivedAt">,
 ): ParkedRoot | null {
@@ -164,8 +190,8 @@ export function isParkedRoot(
   if (issue.status === "cancelled") return { kind: "cancelled" };
   if (!LIVE_TEXT_STATUSES.has(issue.status)) return null;
   const text = `${issue.title ?? ""}\n${issue.description ?? ""}`;
-  if (/\bNO[-\s]?GO\b/i.test(text)) return { kind: "no-go" };
-  if (/\bdeferred\b/i.test(text)) return { kind: "deferred" };
+  if (NO_GO_RES.some((re) => re.test(text))) return { kind: "no-go" };
+  if (DEFERRED_RES.some((re) => re.test(text))) return { kind: "deferred" };
   return null;
 }
 
@@ -758,7 +784,21 @@ export async function handleParkedEvent(
       queued += 1;
       continue;
     }
-    const dependent = await ctx.issues.get(summary.id, companyId);
+    // Q2: a per-dependent read failure must not abort the event (the
+    // handler's contract: per-dependent failures are queued for the
+    // sweep). Queue this dependent with the existing marker convention,
+    // count the attempt against the cap, and continue so later
+    // dependents are still processed and state is still persisted.
+    let dependent: Issue | null;
+    try {
+      dependent = await ctx.issues.get(summary.id, companyId);
+    } catch (err) {
+      const reasonForPending = buildParkedReason(root, parked.kind, trigger, atIso, event.eventId ?? null, summary.id, occurrenceId);
+      state.pending.push({ rootId, transition, dependentId: summary.id, marker: reasonForPending.marker, attempts: 1, queuedAt: atIso, lastError: String(err) });
+      queued += 1;
+      attempted += 1;
+      continue;
+    }
     if (!dependent || isTerminal(dependent) || dependent.status !== "blocked") {
       skipped += 1;
       continue;
@@ -824,7 +864,16 @@ export async function runParkedSweep(
       continue;
     }
     attempted.add(key);
-    const root = await ctx.issues.get(entry.rootId, companyId);
+    // Q2: a read failure (root or dependent) retains the entry in
+    // `remaining` instead of aborting the drain, so the queued wake
+    // survives for the next tick and later entries are still processed.
+    let root: Issue | null;
+    try {
+      root = await ctx.issues.get(entry.rootId, companyId);
+    } catch {
+      remaining.push(entry);
+      continue;
+    }
     const parked = root ? isParkedRoot(root) : null;
     if (!root || !parked) {
       dropped += 1;
@@ -840,7 +889,13 @@ export async function runParkedSweep(
       dropped += 1;
       continue;
     }
-    const dependent = await ctx.issues.get(entry.dependentId, companyId);
+    let dependent: Issue | null;
+    try {
+      dependent = await ctx.issues.get(entry.dependentId, companyId);
+    } catch {
+      remaining.push(entry);
+      continue;
+    }
     if (!dependent || isTerminal(dependent) || dependent.status !== "blocked") {
       dropped += 1;
       continue;
