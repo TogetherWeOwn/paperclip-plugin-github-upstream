@@ -20,7 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "GitHub Upstream",
   description:
-    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card per new tag, and tracked issue/PR/discussion polls wake the owning card on real change. Also: review-guard stamps tier-appropriate review stages (QA always; Security for sensitive, including low/ordinary paths while content triggers cannot be ruled out) on code cards reaching in_review (TWO-5794, TWO-5879), and parked-blocker propagation wakes blocked dependents of a freshly parked root (TWO-5818).",
+    "Notices upstream GitHub changes without LLM calls: release polls create intake cards, and tracked item polls wake owning cards on real change. Review-guard stamps review stages (QA always; Security for sensitive, including low/ordinary paths while content triggers cannot be ruled out). Parked-blocker propagation wakes blocked dependents of a freshly parked root.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
