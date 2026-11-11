@@ -103,10 +103,22 @@ Exactly one auth mode must be configured; anything else fails the scan closed (n
 | `chiefOfStaffAgentId` | Chief of Staff | Owner of the `Ungated upstream post` flag cards. |
 | `maxCreatesPerTick` | `2` | Per-scan-run cap on created cards. Overflow is deferred to the next tick, never dropped. |
 | `maxWakesPerTick` | `5` | Per-scan-run cap on wakes (a create counts as a wake too). Overflow is deferred to the next tick, never dropped. |
+| `parkedPropagationEnabled` | `false` | Parked-blocker propagation (TWO-5818). Off by default; see below. |
+| `parkedMaxWakesPerEvent` | `25` | Per parked-propagation event/tick cap on propagated dependents. Overflow is queued for the next sweep tick, never dropped. |
+
+## Parked-blocker propagation (`parkedPropagationEnabled`)
+
+When enabled, the plugin subscribes to `issue.updated` (the same subscription as the review-guard): when a card that blocks others is parked — moved to `backlog` or `cancelled`, or marked NO-GO/deferred in its title/description — each blocked dependent's assignee is woken with the parked root and its revisit trigger, so the dependent is re-dispositioned instead of staying `blocked` forever.
+
+The revisit trigger is derived deterministically from the root: a `revisit:`/`unblocks when:`/`checkpoint:`/`review on:` line in the description, then `monitorNextCheckAt`, then the unblock descriptor action, and honestly reported as absent when none exists. Dependents are enumerated with `issues.relations.get` (`blocks`). Each non-terminal dependent gets one marker-guarded audit comment plus a wake, deduplicated per (root transition, dependent): a re-park to a different parked status opens a new transition, and un-parking closes the window. Terminal (`done`/`cancelled`/`archived`) dependents are skipped, and a dependent with no agent assignee still gets the audit comment but no wake. Fan-out past `parkedMaxWakesPerEvent` is queued and drained by the `parked-propagation-scan` job (`*/15`), which re-validates each entry (root still parked, dependent non-terminal) and gives up after 3 attempts. The plugin never calls `issues.update` on dependents: no status, assignee or stage is ever changed by propagation, and its own writes never park anything, so its events cannot loop back into propagation.
+
+Known SDK gap (worked around, not bypassed): `issues.requestWakeup` is tried first but the host refuses to wake a card with unresolved blockers — any `blockedBy` entry not `done` — and a parked root is by definition not `done`, so the issue-scoped wake always throws for freshly parked dependents (the test-harness mirror throws `Issue is blocked by unresolved blockers`, and likewise refuses `backlog`/`done`/`cancelled` dependents). The plugin therefore falls back to `agents.invoke`, which checks only the agent's own status and actually wakes the blocked assignee with the parked root, its revisit trigger and a re-disposition instruction. Plugin-attributed comments never wake anyone (SDK contract), which is why the comment alone is not the wake.
+
+`dryRun` also covers propagation: with it set, the event handler logs and writes nothing.
 
 ## Capabilities
 
-`companies.read`, `issues.read`, `issue.subtree.read`, `issues.create`, `issues.update`, `issue.comments.create`, `issues.wakeup`, `jobs.schedule`, `http.outbound`, `secrets.read-ref`, `plugin.state.read`, `plugin.state.write`, `events.subscribe`, `ui.page.register`, `project.workspaces.read`, `execution.workspaces.read`.
+`companies.read`, `issues.read`, `issue.subtree.read`, `issues.create`, `issues.update`, `issue.comments.create`, `issues.wakeup`, `jobs.schedule`, `http.outbound`, `secrets.read-ref`, `plugin.state.read`, `plugin.state.write`, `events.subscribe`, `ui.page.register`, `project.workspaces.read`, `execution.workspaces.read`, `issue.relations.read`, `issue.comments.read`, `agents.invoke`.
 
 ## Dry run
 

@@ -6,6 +6,7 @@ export const RELEASE_JOB_KEY = "release-scan";
 export const ITEM_JOB_KEY = "item-scan";
 export const AUDIT_JOB_KEY = "audit-scan";
 export const REVIEW_GUARD_JOB_KEY = "review-guard-scan";
+export const PARKED_JOB_KEY = "parked-propagation-scan";
 
 /** Origin kinds written by this plugin. The IssuesList page filters on the shared prefix. */
 export const ORIGIN_KIND_PREFIX = "plugin:togetherweown.github-upstream:";
@@ -18,7 +19,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "GitHub Upstream",
   description:
-    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card per new tag, and tracked issue/PR/discussion polls wake the owning card on real change. Subscribes to issue events and sweeps in_review to stamp tier-appropriate review stages (QA always; Security for sensitive per .github/review-tiers.yml) onto code cards with no reviewer (TWO-5794, TWO-5879).",
+    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card per new tag, and tracked issue/PR/discussion polls wake the owning card on real change. Also: review-guard stamps tier-appropriate review stages (QA always; Security for sensitive per .github/review-tiers.yml) on code cards reaching in_review (TWO-5794, TWO-5879), and parked-blocker propagation wakes blocked dependents of a freshly parked root (TWO-5818).",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -38,6 +39,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "ui.page.register",
     "project.workspaces.read",
     "execution.workspaces.read",
+    "issue.relations.read",
+    "issue.comments.read",
+    "agents.invoke",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -83,6 +87,13 @@ const manifest: PaperclipPluginManifestV1 = {
       description:
         "Hourly deterministic audit: search for recent upstream issues, PRs, discussions, comments and reviews by our account, and flag any post with no approved gate card by labelling its follow-through card upstream:ungated and opening a card for the Chief of Staff.",
       schedule: "11 * * * *",
+    },
+    {
+      jobKey: PARKED_JOB_KEY,
+      displayName: "Drain parked-propagation queue",
+      description:
+        "Next-tick self-heal for parked-blocker propagation (TWO-5818): drains the pending wakes queued by the issue.updated subscription after fan-out overflow, re-validating that each root is still parked and each dependent non-terminal.",
+      schedule: "*/15 * * * *",
     },
   ],
   instanceConfigSchema: {
@@ -295,6 +306,19 @@ const manifest: PaperclipPluginManifestV1 = {
         default: 5,
         description:
           "Per-scan-run cap on wakes. A create assigns an agent, so it counts as a wake too. Overflow is deferred to the next tick, never dropped.",
+      },
+      parkedPropagationEnabled: {
+        type: "boolean",
+        default: false,
+        description:
+          "Parked-blocker propagation (TWO-5818): when a card that blocks others moves to backlog, cancelled, or a NO-GO/deferred disposition, wake each blocked dependent's assignee with the parked root and its revisit trigger (comment + wake only; the plugin never changes a dependent's status, assignee or stages). Off by default.",
+      },
+      parkedMaxWakesPerEvent: {
+        type: "integer",
+        minimum: 0,
+        default: 25,
+        description:
+          "Per parked-propagation event/tick cap on propagated dependents. Overflow is queued and drained on the next parked-propagation-scan tick, never dropped.",
       },
     },
   },

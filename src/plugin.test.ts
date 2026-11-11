@@ -52,6 +52,11 @@ describe("plugin wiring", () => {
         "ui.page.register",
         "project.workspaces.read",
         "execution.workspaces.read",
+        "events.subscribe",
+        "issue.relations.read",
+        "issue.comments.read",
+        "issue.comments.create",
+        "agents.invoke",
       ]),
     );
     const jobs = Object.fromEntries((manifest.jobs ?? []).map((j) => [j.jobKey, j.schedule]));
@@ -90,6 +95,8 @@ describe("plugin wiring", () => {
       "chiefOfStaffAgentId",
       "maxCreatesPerTick",
       "maxWakesPerTick",
+      "parkedPropagationEnabled",
+      "parkedMaxWakesPerEvent",
     ]) {
       expect(manifest.instanceConfigSchema?.properties).toHaveProperty(key);
     }
