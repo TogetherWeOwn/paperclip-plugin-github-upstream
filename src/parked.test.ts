@@ -97,6 +97,20 @@ describe("isParkedRoot", () => {
     ).toBeNull();
   });
 
+  it("does not let a following 'To ...' line veto an explicit NO-GO disposition", () => {
+    // A sentence-initial "To" on the next line is not the go-to compound.
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "Decision: NO-GO\nTo revisit when upstream lands", archivedAt: null })?.kind,
+    ).toBe("no-go");
+  });
+
+  it("does not let a new paragraph veto a standalone Deferred disposition", () => {
+    // A blank line is a paragraph boundary, not a wrapped line.
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "Deferred\n\nExecution scheduled for Q3", archivedAt: null })?.kind,
+    ).toBe("deferred");
+  });
+
   it("does not park on 'Deferred to <team>' delegation", () => {
     expect(
       isParkedRoot({ status: "todo", title: "Deferred to the platform team", description: null, archivedAt: null }),

@@ -171,16 +171,23 @@ const LIVE_TEXT_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked
  * woken. Archived roots likewise never park.
  */
 // "deferred rendering/loading/..." is an adjective, never a disposition.
-// The veto spans wrapped lines WITHIN one field (\s+, not [ \t]): a line
-// break inside the description (`deferred\nrendering`) must not escape
-// the veto. Per-field checking keeps the title/description boundary
-// separate (D2: title `Deferred` + description `Execution...`).
-const DEFERRED_NOUN = String.raw`(?!\s+(?:rendering|loading|display|paint|execution|initialization)\b)`;
+// The veto spans a SINGLE wrapped line break WITHIN one field (spaces, or
+// one line break plus spaces — not `\s+`): a line break inside the
+// description (`deferred\nrendering`) must not escape the veto, but a
+// blank line is a paragraph boundary (`Deferred\n\nExecution...` is a
+// standalone disposition plus a new paragraph, so it must still park).
+// Per-field checking keeps the title/description boundary separate (D2:
+// title `Deferred` + description `Execution...`).
+const DEFERRED_NOUN = String.raw`(?!(?:[ \t]+|[ \t]*(?:\r\n|\n|\r)[ \t]*)(?:rendering|loading|display|paint|execution|initialization)\b)`;
 // "no go-to" / "no go to ..." is the go-to compound, never a NO-GO.
 // The lookahead permits GO followed by a separator that is not `to`.
-// Per-field checking keeps the title/description boundary separate (D2:
-// title `NO-GO` + description `To revisit...` must not veto).
-const NO_GO_NOT_GOTO = String.raw`(?![ \t\n\-]?to\b)`;
+// The separator is same-line only ([ \t\-]?, no `\n`): a following
+// line's sentence-initial "To ..." (`Decision: NO-GO\nTo revisit...`)
+// is a new sentence, not the go-to compound, so it must not veto an
+// explicit disposition. Per-field checking additionally keeps the
+// title/description boundary separate (D2: title `NO-GO` + description
+// `To revisit...` must not veto).
+const NO_GO_NOT_GOTO = String.raw`(?![ \t\-]?to\b)`;
 
 const NO_GO_RES: RegExp[] = [
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
