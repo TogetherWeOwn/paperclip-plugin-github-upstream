@@ -66,6 +66,10 @@ export interface UpstreamConfig {
   /** Per-scan-run spend caps. A create also assigns an agent, so it counts as a wake too. */
   maxCreatesPerTick: number;
   maxWakesPerTick: number;
+  /** Parked-blocker propagation (TWO-5818): wake blocked dependents when a root is parked. Off by default. */
+  parkedPropagationEnabled: boolean;
+  /** Bound on wakes+comments per parked event/tick; overflow is queued for the next tick's sweep. */
+  parkedMaxWakesPerEvent: number;
 }
 
 export const DEFAULT_RELEASE_REPOS = ["router-for-me/CLIProxyAPI", "paperclipai/paperclip"];
@@ -142,6 +146,7 @@ const intOr = (value: unknown, fallback: number): number =>
 
 export const DEFAULT_MAX_CREATES_PER_TICK = 2;
 export const DEFAULT_MAX_WAKES_PER_TICK = 5;
+export const DEFAULT_PARKED_MAX_WAKES_PER_EVENT = 25;
 
 /**
  * GitHub numeric IDs (App ID, installation ID): digits only, so a pasted
@@ -248,6 +253,8 @@ export function resolveConfig(raw: Record<string, unknown>): UpstreamConfig {
         : DEFAULT_CHIEF_OF_STAFF_ASSIGNEE,
     maxCreatesPerTick: intOr(raw.maxCreatesPerTick, DEFAULT_MAX_CREATES_PER_TICK),
     maxWakesPerTick: intOr(raw.maxWakesPerTick, DEFAULT_MAX_WAKES_PER_TICK),
+    parkedPropagationEnabled: raw.parkedPropagationEnabled === true,
+    parkedMaxWakesPerEvent: intOr(raw.parkedMaxWakesPerEvent, DEFAULT_PARKED_MAX_WAKES_PER_EVENT),
   };
 }
 
