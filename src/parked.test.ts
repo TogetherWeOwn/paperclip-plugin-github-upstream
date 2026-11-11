@@ -19,12 +19,16 @@ const COMPANY = "c-parked";
 const AGENT = "agent-assignee-1";
 
 async function setup(config: Record<string, unknown> = {}) {
-  const harness = createTestHarness({ manifest, config: { parkedPropagationEnabled: true, ...config } });
+  const mergedConfig = { parkedPropagationEnabled: true, ...config };
+  const harness = createTestHarness({ manifest, config: mergedConfig });
   harness.seed({
     companies: [{ id: COMPANY, name: "TWO", issuePrefix: "TWO" } as never],
     agents: [{ id: AGENT, companyId: COMPANY, status: "idle" } as never],
   });
   await plugin.definition.setup(harness.ctx);
+  // Scheduled jobs read config only for companies the host has delivered
+  // via configChanged (TWO-5876 / TWO-5921); mirror that delivery here.
+  await plugin.definition.onConfigChanged?.(mergedConfig, { companyId: COMPANY });
   return harness;
 }
 
