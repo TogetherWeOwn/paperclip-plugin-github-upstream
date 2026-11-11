@@ -19,6 +19,24 @@ const MAP = {
 };
 
 describe("parseReviewTierMap", () => {
+  it("accepts the canonical v1 schema including empty tiers", () => {
+    expect(parseReviewTierMap(`version: 1
+default_tier: sensitive # default
+tiers:
+  low: ["docs/**"]
+  ordinary: [] # audited modules
+  sensitive:
+    - "src/auth/**"
+`)).toEqual({ low: ["docs/**"], ordinary: [], sensitive: ["src/auth/**"] });
+    expect(parseReviewTierMap("version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n")).toEqual({ low: [], ordinary: [], sensitive: [] });
+  });
+
+  it("rejects unknown versions and ambiguous or incomplete schemas", () => {
+    const valid = "version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n";
+    for (const invalid of [valid.replace("version: 1", "version: 2"), valid.replace("sensitive\ntiers", "low\ntiers"), valid.replace("  low: []\n", ""), valid + "low: []\n", valid.replace("  low: []", "  low: []\n    - docs/**"), "low: [docs/**]\n  - src/**\n", "low: [null]\n", "low:\n  - \"bad\n"]) {
+      expect(() => parseReviewTierMap(invalid)).toThrow();
+    }
+  });
   it("parses block lists and inline lists", () => {
     const text = `# tiers
 low:
@@ -175,7 +193,33 @@ const tierForIssue = async (harness: ReturnType<typeof createTestHarness>, issue
 const newHarness = () => createTestHarness({ manifest, config: {} });
 
 describe("resolveReviewTier (real git checkout)", () => {
-  it("tiers a docs-only change low and an auth change sensitive", async () => {
+  it.each([
+    ["endpoint and input parsing", "export const parseRequest = (s) => JSON.parse(s);"],
+    ["auth and session", "export const authorize = () => true;"],
+    ["crypto and keys", "export const key = 'key';"],
+    ["credentials", "export const credential = 'placeholder';"],
+    ["permissions", "export const permit = () => true;"],
+    ["tenant and personal data", "export const tenant = { personalData: true };"],
+    ["schema and migrations", "ALTER TABLE users ADD COLUMN name TEXT;"],
+    ["dependencies", "dependencies: new-package"],
+    ["CI and workflows", "workflow: deploy"],
+    ["weakened tests", "// removed assertions and snapshots"],
+    ["no recognizable keywords", "const x = 1;"],
+  ])("fails closed for %s on low and ordinary paths", async (_category, contents) => {
+    const repo = makeRepo(true);
+    try {
+      const harness = newHarness();
+      const issue = { id: "i-1", companyId: COMPANY, projectId: PROJECT, projectWorkspaceId: WORKSPACE, status: "in_review" };
+      commitFile(repo, "README.md", contents);
+      expect((await tierForIssue(harness, issue, repo)).tier).toBe("sensitive");
+      git(repo, ["reset", "--hard", "main"]);
+      commitFile(repo, "src/ui/change.ts", contents);
+      expect((await tierForIssue(harness, issue, repo)).tier).toBe("sensitive");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+  it("fails closed for a docs-only change and preserves a sensitive auth change", async () => {
     const repo = makeRepo(true);
     try {
       const harness = newHarness();
@@ -187,7 +231,9 @@ describe("resolveReviewTier (real git checkout)", () => {
       expect(empty.tier).toBe("sensitive");
       expect(empty.reason).toContain("empty diff");
       commitFile(repo, "README.md", "# docs\n");
-      expect((await tierForIssue(harness, issue, repo)).tier).toBe("low");
+      const docs = await tierForIssue(harness, issue, repo);
+      expect(docs.tier).toBe("sensitive");
+      expect(docs.reason).toContain("content triggers");
       commitFile(repo, "src/auth/login.ts", "export {};\n");
       const sensitive = await tierForIssue(harness, issue, repo);
       expect(sensitive.tier).toBe("sensitive");
@@ -246,7 +292,7 @@ describe("resolveReviewTier (real git checkout)", () => {
       // read-only invocations could trigger it.
       git(repo, ["config", "core.fsmonitor", hook]);
       const result = await tierForIssue(harness, issue, repo);
-      expect(result.tier).toBe("low");
+      expect(result.tier).toBe("sensitive");
       expect(existsSync(marker)).toBe(false);
     } finally {
       rmSync(repo, { recursive: true, force: true });
