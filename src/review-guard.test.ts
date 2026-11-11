@@ -681,10 +681,38 @@ describe("review-guard tiering (TWO-5879)", () => {
     await expect(
       ensureReviewPolicy(harness.ctx, COMPANY, issue as never, resolveConfig(GUARD_CONFIG), LOW),
     ).rejects.toThrow("comment blew up");
+    // Tier moved to Ordinary: the pending Low audit posts, then the call
+    // falls through (no upgrade needed for Ordinary) to has-stages.
     const retry = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, resolveConfig(GUARD_CONFIG), ORDINARY);
-    expect(retry).toEqual({ applied: false, reason: "comment-retried" });
+    expect(retry).toEqual({ applied: false, reason: "has-stages" });
     expect(bodies[0]).toContain("tier low");
     expect(bodies[0]).toContain("Default review policy applied");
+  });
+
+  it("upgrades in the same call when a stranded pending audit meets a Sensitive head", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness);
+    const bodies: string[] = [];
+    let attempts = 0;
+    const origComment = harness.ctx.issues.createComment.bind(harness.ctx.issues);
+    harness.ctx.issues.createComment = (async (...args: Parameters<typeof origComment>) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("comment blew up");
+      bodies.push(String(args[1]));
+      return origComment(...args);
+    }) as typeof harness.ctx.issues.createComment;
+    // Stamp at Low fails to post its audit; the next head tiers Sensitive.
+    // The retry must not shield the card from its Security upgrade (QA
+    // could otherwise approve before a later sweep adds Security).
+    await expect(
+      ensureReviewPolicy(harness.ctx, COMPANY, issue as never, resolveConfig(GUARD_CONFIG), LOW),
+    ).rejects.toThrow("comment blew up");
+    const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, resolveConfig(GUARD_CONFIG), SENSITIVE);
+    expect(outcome).toEqual({ applied: true, stages: 2, commented: true, tier: "sensitive", upgraded: true });
+    expect(bodies[0]).toContain("tier low");
+    expect(bodies[1]).toContain("upgraded review policy");
+    expect(updates).toHaveLength(2);
   });
 
   it("retries a failed upgrade audit as an upgrade (not a default stamp)", async () => {

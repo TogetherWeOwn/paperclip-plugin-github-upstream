@@ -258,6 +258,9 @@ export async function ensureReviewPolicy(
 
   const applied = await readApplied(ctx, companyId);
   const prior = applied[issue.id];
+  // Records stamped before tiering carry no tier: treat them as matching so
+  // they neither re-comment nor block an upgrade check on security presence.
+  const tierChanged = prior?.tier !== undefined && prior.tier !== resolved.tier;
 
   if (hasLiveReviewStage(issue)) {
     // A pending record means a policy write landed but its audit comment
@@ -265,8 +268,10 @@ export async function ensureReviewPolicy(
     // failed upgrade still retries as an upgrade with its triggering path,
     // not as a default stamp) instead of hiding behind the live stage.
     // A tier change must not strand the pending audit: the retry runs
-    // regardless of the current tier, and any upgrade the new tier needs
-    // follows on the next event/sweep.
+    // regardless of the current tier. But it must not shield a Sensitive
+    // head from its upgrade either — QA could pass review before the next
+    // sweep adds Security — so on a tier change the retry falls through to
+    // the upgrade path below instead of returning here.
     if (prior && prior.commented === false && !dryRun) {
       const retrySource = prior.source ?? source;
       const stageCount = prior.stages;
@@ -277,7 +282,9 @@ export async function ensureReviewPolicy(
       );
       await writeApplied(ctx, companyId, { ...applied, [issue.id]: { ...prior, at: new Date().toISOString(), commented: true } });
       ctx.logger.info("review-guard retried audit comment", { companyId, issueId: issue.id });
-      return { applied: false, reason: "comment-retried" };
+      if (!tierChanged) return { applied: false, reason: "comment-retried" };
+      // Tier moved: keep going — the upgrade/unstall logic below runs now,
+      // in this call, not on some later event or sweep.
     }
     // Upgrade path: a later head tiers Sensitive while the card only carries
     // QA (or other) stages. Prepend the missing Security stages; never strip
