@@ -121,6 +121,16 @@ describe("isParkedRoot", () => {
     expect(
       isParkedRoot({ status: "todo", title: "x", description: "Deferred\n\nExecution scheduled for Q3", archivedAt: null })?.kind,
     ).toBe("deferred");
+    // Unicode line separators form a paragraph boundary too.
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "Deferred\u2028\u2028Execution scheduled for Q3", archivedAt: null })?.kind,
+    ).toBe("deferred");
+  });
+
+  it("still vetoes a CRLF-wrapped go-to compound in a predication", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "There is no go\r\nTo maintainer for this repo", archivedAt: null }),
+    ).toBeNull();
   });
 
   it("does not park on 'Deferred to <team>' delegation", () => {

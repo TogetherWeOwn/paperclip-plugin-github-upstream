@@ -179,7 +179,7 @@ const LIVE_TEXT_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked
 // standalone disposition plus a new paragraph, so it must still park).
 // Per-field checking keeps the title/description boundary separate (D2:
 // title `Deferred` + description `Execution...`).
-const DEFERRED_NOUN = String.raw`(?!(?:[^\S\r\n]+|[^\S\r\n]*(?:\r\n|\n|\r)[^\S\r\n]*)(?:rendering|loading|display|paint|execution|initialization)\b)`;
+const DEFERRED_NOUN = String.raw`(?!(?:[^\S\r\n\u2028\u2029]+|[^\S\r\n\u2028\u2029]*(?:\r\n|\n|\r|\u2028|\u2029)[^\S\r\n\u2028\u2029]*)(?:rendering|loading|display|paint|execution|initialization)\b)`;
 // "no go-to" / "no go to ..." is the go-to compound, never a NO-GO.
 // The lookahead permits GO followed by a separator that is not `to`.
 // Explicit dispositions (label, line prefix, comma list) use a
@@ -192,7 +192,7 @@ const DEFERRED_NOUN = String.raw`(?!(?:[^\S\r\n]+|[^\S\r\n]*(?:\r\n|\n|\r)[^\S\r
 // title/description boundary separate (D2: title `NO-GO` +
 // description `To revisit...` must not veto).
 const NO_GO_NOT_GOTO = String.raw`(?![ \t\-]?to\b)`;
-const NO_GO_NOT_GOTO_WRAP = String.raw`(?![ \t\n\-]?to\b)`;
+const NO_GO_NOT_GOTO_WRAP = String.raw`(?!(?:[ \t\-]?|[^\S\r\n]*(?:\r\n|\n|\r)[^\S\r\n]*)to\b)`;
 
 const NO_GO_RES: RegExp[] = [
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
