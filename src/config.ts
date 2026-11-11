@@ -13,6 +13,23 @@ export interface UpstreamConfig {
   /** Company secret binding for the GitHub token. Null means unconfigured: scans fail closed, never anonymous. */
   tokenSecretRef: EnvSecretRefBinding | null;
   /**
+   * Review-guard (TWO-5794): stamp the default review stages onto code cards
+   * that reach `in_review` (or are created as code work) without a live
+   * reviewer stage. Off by default; enabling also needs checkout of the
+   * reviewer agent IDs below, or the guard stays a no-op for that company.
+   */
+  reviewGuardEnabled: boolean;
+  /** Review-guard dry-run: log intended `issues.update` + audit comments without making them. */
+  reviewGuardDryRun: boolean;
+  /**
+   * Default review stage participants (agent IDs, in stage order), e.g.
+   * Security then QA. Empty means the guard never writes that company's
+   * cards: it never invents a reviewer.
+   */
+  defaultReviewAgentIds: string[];
+  /** Per-project review stage participants (project ID -> agent IDs), overriding `defaultReviewAgentIds`. */
+  reviewAgentIdsByProjectId: Record<string, string[]>;
+  /**
    * GitHub App auth (preferred over `tokenSecretRef`): the numeric App ID, as
    * a string. Empty means App auth is not configured.
    */
@@ -63,13 +80,26 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const stringArray = (value: unknown): string[] =>
-  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
+  Array.isArray(value)
+    ? [...new Set(value.filter((v): v is string => typeof v === "string" && v.length > 0))]
+    : [];
 
 const stringMap = (value: unknown): Record<string, string> => {
   if (!isRecord(value)) return {};
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(value)) {
     if (typeof v === "string" && v.length > 0) out[k] = v;
+  }
+  return out;
+};
+
+/** Project ID -> agent IDs (review-guard per-project override). Non-array entries and empty keys are dropped. */
+const stringArrayMap = (value: unknown): Record<string, string[]> => {
+  if (!isRecord(value)) return {};
+  const out: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(value)) {
+    const ids = stringArray(v);
+    if (k.length > 0 && ids.length > 0) out[k] = ids;
   }
   return out;
 };
@@ -172,6 +202,10 @@ export function resolveConfig(raw: Record<string, unknown>): UpstreamConfig {
   }
   return {
     tokenSecretRef: isSecretRefBinding(raw.tokenSecretRef) ? raw.tokenSecretRef : null,
+    reviewGuardEnabled: raw.reviewGuardEnabled === true,
+    reviewGuardDryRun: raw.reviewGuardDryRun === true,
+    defaultReviewAgentIds: stringArray(raw.defaultReviewAgentIds),
+    reviewAgentIdsByProjectId: stringArrayMap(raw.reviewAgentIdsByProjectId),
     appId: numericId(raw.appId),
     installationId: numericId(raw.installationId),
     appPrivateKeySecretRef: isSecretRefBinding(raw.appPrivateKeySecretRef) ? raw.appPrivateKeySecretRef : null,
