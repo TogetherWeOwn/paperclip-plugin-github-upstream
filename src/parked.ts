@@ -48,21 +48,34 @@ import { stateKey } from "./state.js";
  *   the audit comment, the wake/invoke, and the plugin's own state record.
  *   A test spies on `issues.update` and fails if any call targets a
  *   dependent (Devin 0007).
- * - Dedupe per (root transition, dependent): the `windows` record keys a
- *   propagation window by root + transition (`<status>:<kind>`); each
- *   dependent is recorded once per window. A re-park (backlog -> cancelled,
- *   or a text-only NO-GO -> deferred change at the same status) opens a new
- *   window with a fresh woken set. The comment marker and the `requestWakeup`
- *   idempotency key both include (root, transition, dependent), so neither
- *   host-side nor comment-side dedupe can confuse dependents or transitions
- *   (Security B5a, Devin 0004).
- * - Wake-path dedupe after state loss: the event path checks the marker
- *   BEFORE waking; if the comment for this (root, transition, dependent)
- *   already exists, the wake is skipped (`already`). State loss therefore
- *   cannot duplicate an invoke on the event path (B5b). The sweep passes
- *   `allowWakeIfCommented=true` so entries queued AFTER a failed wake
- *   (comment posted, invoke failed) still retry the wake; overflow entries
- *   queued before any comment have no marker and proceed normally.
+ * - Dedupe per (root transition occurrence, dependent): the `windows`
+ *   record keys a propagation window by root + transition occurrence
+ *   (`<status>:<kind>@<occurrenceId>`); each dependent is recorded once
+ *   per window. The occurrence id is the parked root's `updatedAt` at
+ *   window creation — it is stable across plugin-state loss (the root
+ *   row is unchanged), but changes on any later root update, so a
+ *   backlog -> todo -> backlog re-park (R2-2) is a fresh occurrence
+ *   with a fresh marker and idempotency key, while a state-loss retry
+ *   of the same continuous park regenerates the identical occurrence
+ *   and therefore the identical marker. A re-park (backlog -> cancelled,
+ *   a text-only NO-GO -> deferred change at the same status, or an
+ *   unpark/re-park cycle) opens a new window with a fresh woken set.
+ *   The comment marker and the `requestWakeup` idempotency key both
+ *   include (root, transition occurrence, dependent), so neither
+ *   host-side nor comment-side dedupe can confuse dependents,
+ *   transitions or occurrences (Security B5a, Devin 0004, R2-2).
+ * - Wake-delivery evidence (R2-2): the marker comment is posted ONLY
+ *   AFTER a successful wake (or for a comment-only dependent with no
+ *   agent to wake). Marker presence therefore means the wake was
+ *   delivered, not merely that a comment was attempted. A failed wake
+ *   posts no comment and is queued for the sweep, so a failed wake
+ *   followed by state loss remains retryable (no silent loss); a
+ *   successful wake followed by state loss is recognised by the
+ *   marker and is not duplicated (`already`, B5b). Known narrow
+ *   double-fault: a wake that succeeds but whose marker comment
+ *   write then fails leaves no marker, so a later retry may
+ *   duplicate that one wake — the window `woken` set prevents this
+ *   whenever plugin state survives.
  * - Only `blocked` dependents are propagated (B2). A dependent in
  *   `in_review`/`in_progress`/`todo`/`backlog` is skipped — waking its
  *   assignee (for `in_review`, the reviewer) with an owner instruction would
@@ -89,14 +102,20 @@ import { stateKey } from "./state.js";
  *   event is a cheap `not-parked` return. If a dependent is itself parked,
  *   its own events propagate from its own dedupe window — a genuine chain,
  *   bounded per root, not a self-loop.
- * - Concurrent handlers (Devin 0001): the state record is read-modify-write
- *   with no host CAS (SDK `state` exposes only get/set/delete). Writes go
- *   through `writeParkedStateConvergent`, which merges the caller's changes
- *   into the latest record (union of windows' woken sets within one
- *   transition, union of pending entries) and retries until the written
- *   entries survive a re-read (up to 3 attempts). Convergence plus the
- *   marker-guarded event wake gives: no silent loss of queued wakes, no
- *   duplicate invokes, and worst case one extra pending entry that the next
+ * - Concurrent handlers (Devin 0001, R2-1): the state record is
+ *   read-modify-write with no host CAS (SDK `state` exposes only
+ *   get/set/delete), and production state reads are copy-semantics (a
+ *   fresh copy per `get`), so a blind union merge would resurrect
+ *   deletions. Writes go through `writeParkedStateConvergent`, which
+ *   applies a DELTA merge against the snapshot the handler started
+ *   from (`base`): entries the handler deleted (unpark window close,
+ *   drained/dropped pending) are deleted from the latest record,
+ *   entries it added/modified are upserted, and entries a concurrent
+ *   handler added are preserved. It retries (up to 3 attempts) until
+ *   the stored record exactly matches the merged result. Delta
+ *   convergence plus marker-guarded wakes gives: no silent loss of
+ *   queued wakes, no resurrection of deletions, no duplicate
+ *   invokes, and worst case one extra pending entry that the next
  *   sweep drops on re-validation.
  */
 
@@ -177,6 +196,27 @@ export function extractRevisitTrigger(
   return null;
 }
 
+/**
+ * Durable occurrence id for one continuous park of a root (R2-2): the
+ * root's `updatedAt` at window creation. Stable across plugin-state
+ * loss (root row unchanged), distinct for any later park because the
+ * unpark/re-park cycle bumps `updatedAt`. Falls back to `atIso` when
+ * the host supplies no `updatedAt`.
+ */
+export function occurrenceIdForRoot(
+  root: { updatedAt?: Date | string | null },
+  atIso: string,
+): string {
+  const raw = root.updatedAt;
+  if (raw instanceof Date) return raw.toISOString();
+  if (typeof raw === "string" && raw.length > 0) return raw;
+  return atIso;
+}
+
+export function transitionFor(rootStatus: string, parkedKind: ParkedKind, occurrenceId: string): string {
+  return `${rootStatus}:${parkedKind}@${occurrenceId}`;
+}
+
 export interface ParkedReason {
   /** Structured, human-readable reason (comment body first line). NEVER sent as an agent prompt. */
   headline: string;
@@ -184,10 +224,12 @@ export interface ParkedReason {
   body: string;
   /** Marker embedded in every propagation comment; `listComments` checks for it. */
   marker: string;
-  /** Idempotency key for `requestWakeup`: (root, transition, dependent). */
+  /** Idempotency key for `requestWakeup`: (root, transition occurrence, dependent). */
   idempotencyKey: string;
-  /** Transition key `"<status>:<kind>"`: distinguishes windows and markers. */
+  /** Transition key `"<status>:<kind>@<occurrenceId>"`: distinguishes windows, occurrences and markers. */
   transition: string;
+  /** Durable occurrence id carried by the marker and idempotency key. */
+  occurrenceId: string;
 }
 
 /**
@@ -203,10 +245,12 @@ export function buildParkedReason(
   atIso: string,
   eventId: string | null,
   dependentId: string,
+  occurrenceId?: string,
 ): ParkedReason {
   const ident = root.identifier ?? root.id;
   const title = singleLine(root.title ?? "", 120);
-  const transition = `${root.status}:${parkedKind}`;
+  const occ = occurrenceId ?? "legacy";
+  const transition = transitionFor(root.status, parkedKind, occ);
   const headline =
     `Parked blocker: ${ident} (${transition})` +
     (title ? ` — "${title}"` : "") +
@@ -229,6 +273,7 @@ export function buildParkedReason(
     marker,
     idempotencyKey: `parked:${root.id}:${transition}:${dependentId}`,
     transition,
+    occurrenceId: occ,
   };
 }
 
@@ -288,6 +333,7 @@ interface PendingEntry {
 
 interface ParkedWindow {
   transition: string;
+  occurrenceId: string;
   firstSeenAt: string;
   woken: Record<string, string>;
 }
@@ -305,73 +351,152 @@ const writeStateRaw = async (ctx: PluginContext, companyId: string, state: Parke
   await ctx.state.set(stateKey(companyId, "parked-propagation"), state);
 };
 
+const cloneParkedState = (state: ParkedState): ParkedState =>
+  JSON.parse(JSON.stringify(state)) as ParkedState;
+
+const canonical = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+};
+
+const pendingKey = (e: PendingEntry): string => `${e.rootId}:${e.transition}:${e.dependentId}`;
+
 /**
- * Merge the caller's local edits into the latest stored record.
- * Windows: union of `woken` within the same transition; across transitions
- * keep the newer window (by `firstSeenAt`) without merging woken sets, so a
- * fresh transition is never polluted by the old window's dedupe.
- * Pending: union by (rootId, transition, dependentId), first-seen wins.
- * Merging (instead of last-write-wins) is what keeps a queued wake alive
- * when event and sweep handlers overlap (Devin 0001); a resurrected entry
- * is harmless because every entry is re-validated before use.
+ * Delta-merge the caller's local edits into the latest stored record,
+ * computed against `base` — the snapshot the handler started from
+ * (R2-1). Without `base` this is a plain union (legacy behaviour,
+ * kept for the pre-R2 unit tests); production writes always pass
+ * `base` so deletions are explicit:
+ * - Windows present in `base` but absent in `local` are DELETED from
+ *   the merged record (unpark window close). A blind union would
+ *   resurrect them on copy-semantics state reads.
+ * - Windows added/modified vs `base` are upserted: union of `woken`
+ *   within the same transition occurrence, newer window wins across
+ *   occurrences (by `firstSeenAt`), so a fresh occurrence is never
+ *   polluted by the old window's dedupe.
+ * - Windows unchanged vs `base` keep the latest version, preserving
+ *   a concurrent handler's `woken` additions.
+ * - Pending entries deleted vs `base` (drained/dropped by the sweep)
+ *   are removed from the merged record; added/modified entries are
+ *   upserted; concurrent additions are preserved. Merging (instead
+ *   of last-write-wins) keeps a queued wake alive when event and
+ *   sweep handlers overlap (Devin 0001).
  */
-export function mergeParkedState(local: ParkedState, latest: ParkedState): ParkedState {
-  const windows: Record<string, ParkedWindow> = {};
-  for (const [rootId, win] of Object.entries(latest.windows)) windows[rootId] = win;
+export function mergeParkedState(local: ParkedState, latest: ParkedState, base?: ParkedState): ParkedState {
+  if (!base) {
+    const windows: Record<string, ParkedWindow> = {};
+    for (const [rootId, win] of Object.entries(latest.windows)) windows[rootId] = win;
+    for (const [rootId, localWin] of Object.entries(local.windows)) {
+      const latestWin = latest.windows[rootId];
+      if (!latestWin) {
+        windows[rootId] = localWin;
+        continue;
+      }
+      if (localWin.transition === latestWin.transition) {
+        windows[rootId] = {
+          transition: latestWin.transition,
+          occurrenceId: localWin.occurrenceId ?? latestWin.occurrenceId,
+          firstSeenAt: latestWin.firstSeenAt < localWin.firstSeenAt ? latestWin.firstSeenAt : localWin.firstSeenAt,
+          woken: { ...latestWin.woken, ...localWin.woken },
+        };
+      } else {
+        windows[rootId] = localWin.firstSeenAt > latestWin.firstSeenAt ? localWin : latestWin;
+      }
+    }
+    const pendingByKey = new Map<string, PendingEntry>();
+    for (const entry of [...latest.pending, ...local.pending]) {
+      const key = pendingKey(entry);
+      if (!pendingByKey.has(key)) pendingByKey.set(key, entry);
+    }
+    return { windows, pending: [...pendingByKey.values()] };
+  }
+
+  const windows: Record<string, ParkedWindow> = cloneParkedState({ windows: latest.windows, pending: [] }).windows;
+  // Explicit deletions vs base.
+  for (const rootId of Object.keys(base.windows)) {
+    if (!(rootId in local.windows)) delete windows[rootId];
+  }
   for (const [rootId, localWin] of Object.entries(local.windows)) {
+    const baseWin = base.windows[rootId];
     const latestWin = latest.windows[rootId];
-    if (!latestWin) {
-      windows[rootId] = localWin;
+    if (!baseWin) {
+      if (!latestWin) {
+        windows[rootId] = cloneParkedState({ windows: { [rootId]: localWin }, pending: [] }).windows[rootId]!;
+      } else if (latestWin.transition === localWin.transition) {
+        windows[rootId] = {
+          transition: latestWin.transition,
+          occurrenceId: localWin.occurrenceId ?? latestWin.occurrenceId,
+          firstSeenAt: latestWin.firstSeenAt < localWin.firstSeenAt ? latestWin.firstSeenAt : localWin.firstSeenAt,
+          woken: { ...latestWin.woken, ...localWin.woken },
+        };
+      } else {
+        windows[rootId] = localWin.firstSeenAt > latestWin.firstSeenAt ? localWin : latestWin;
+      }
       continue;
     }
-    if (localWin.transition === latestWin.transition) {
+    if (canonical(baseWin) === canonical(localWin)) continue; // unchanged: keep latest
+    // Modified vs base.
+    if (!latestWin) {
+      windows[rootId] = localWin;
+    } else if (latestWin.transition === localWin.transition) {
       windows[rootId] = {
         transition: latestWin.transition,
+        occurrenceId: localWin.occurrenceId ?? latestWin.occurrenceId,
         firstSeenAt: latestWin.firstSeenAt < localWin.firstSeenAt ? latestWin.firstSeenAt : localWin.firstSeenAt,
         woken: { ...latestWin.woken, ...localWin.woken },
       };
     } else {
-      windows[rootId] = localWin.firstSeenAt > latestWin.firstSeenAt ? localWin : latestWin;
+      windows[rootId] = localWin.firstSeenAt >= latestWin.firstSeenAt ? localWin : latestWin;
     }
   }
+
   const pendingByKey = new Map<string, PendingEntry>();
-  for (const entry of [...latest.pending, ...local.pending]) {
-    const key = `${entry.rootId}:${entry.transition}:${entry.dependentId}`;
-    if (!pendingByKey.has(key)) pendingByKey.set(key, entry);
+  for (const entry of latest.pending) pendingByKey.set(pendingKey(entry), entry);
+  const localKeys = new Set(local.pending.map(pendingKey));
+  for (const entry of base.pending) {
+    if (!localKeys.has(pendingKey(entry))) pendingByKey.delete(pendingKey(entry));
+  }
+  for (const entry of local.pending) {
+    const key = pendingKey(entry);
+    const baseEntry = base.pending.find((e) => pendingKey(e) === key);
+    if (!baseEntry) {
+      pendingByKey.set(key, entry);
+    } else if (canonical(baseEntry) !== canonical(entry)) {
+      pendingByKey.set(key, entry);
+    }
+    // Unchanged vs base: keep the latest version (concurrent attempts).
   }
   return { windows, pending: [...pendingByKey.values()] };
 }
 
 /**
- * Convergent write: re-read, merge, write, and verify the written entries
- * survived (a concurrent writer may have landed between our read and
- * write). Retries up to 3 times; on persistent divergence the last merged
- * write is left for the next tick's self-heal. Exported for tests to prove
- * the merge keeps both handlers' entries.
+ * Convergent write (R2-1): re-read, delta-merge the caller's edits
+ * (vs `base`, the snapshot the handler started from) into the latest
+ * record, write, and verify the stored record exactly matches the
+ * merged result — including that deletions stayed deleted. Retries
+ * up to 3 times, recomputing the delta against the freshest record
+ * each time; on persistent divergence the last merged write is left
+ * for the next tick's self-heal. Callers MUST pass the pre-mutation
+ * snapshot as `base`; without it deletions cannot be distinguished
+ * from "not seen" under copy-semantics reads. Exported for tests.
  */
 export async function writeParkedStateConvergent(
   ctx: PluginContext,
   companyId: string,
   local: ParkedState,
+  base?: ParkedState,
 ): Promise<ParkedState> {
-  let current = local;
+  const snapshot = base ? cloneParkedState(base) : undefined;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const latest = await readState(ctx, companyId);
-    const merged = mergeParkedState(current, latest);
+    const merged = mergeParkedState(local, latest, snapshot);
     await writeStateRaw(ctx, companyId, merged);
     const verify = await readState(ctx, companyId);
-    const hasAllWindows = Object.keys(merged.windows).every((rootId) => {
-      const want = merged.windows[rootId];
-      const got = verify.windows[rootId];
-      if (!got) return false;
-      if (got.transition !== want.transition) return false;
-      return Object.keys(want.woken).every((dep) => got.woken[dep] !== undefined);
-    });
-    const hasAllPending = merged.pending.every((e) =>
-      verify.pending.some((p) => p.rootId === e.rootId && p.transition === e.transition && p.dependentId === e.dependentId),
-    );
-    if (hasAllWindows && hasAllPending) return verify;
-    current = mergeParkedState(current, verify);
+    if (canonical(verify) === canonical(merged)) return verify;
   }
   return readState(ctx, companyId);
 }
@@ -397,15 +522,19 @@ function eventIssueId(event: PluginEvent): string | null {
 }
 
 /**
- * One dependent: audit comment + tiered wake.
+ * One dependent: tiered wake FIRST, then the audit marker comment
+ * (R2-2). The marker is wake-delivery evidence: it is posted only
+ * after a successful wake, so its presence proves delivery and its
+ * absence proves the wake still needs a retry.
  * Returns:
- * - "woke" | "invoke": wake delivered (issue wake or agent invoke).
- * - "comment-only": comment posted, no agent assignee to wake.
- * - "already": the (root, transition, dependent) marker already exists and,
- *   on the event path, the wake is intentionally skipped so state loss
- *   cannot duplicate an invoke (B5b). The sweep passes
- *   `allowWakeIfCommented=true` to retry wakes queued after a failure.
- * - "failed": transient failure; caller queues for the next tick.
+ * - "woke" | "invoke": wake delivered (issue wake or agent invoke),
+ *   marker comment posted (best-effort after delivery).
+ * - "comment-only": marker comment posted, no agent assignee to wake.
+ * - "already": the (root, transition occurrence, dependent) marker
+ *   already exists, so the wake was already delivered; the wake is
+ *   skipped so state loss cannot duplicate an invoke (B5b).
+ * - "failed": wake failed (no marker posted) or the marker check
+ *   itself failed; caller queues for the next tick.
  */
 async function propagateToDependent(
   ctx: PluginContext,
@@ -415,42 +544,57 @@ async function propagateToDependent(
   dryRun: boolean,
   safePrompt: string,
   safeReason: string,
-  allowWakeIfCommented: boolean,
+  // Retained for call-site compatibility; wake-first ordering makes
+  // event and sweep identical — a marker always means delivered.
+  _allowWakeIfCommented?: boolean,
 ): Promise<{ kind: "woke" | "invoke" | "comment-only" | "already" | "failed"; error: string | null }> {
   if (dryRun) return { kind: "comment-only", error: null };
-  let alreadyCommented = false;
+  let alreadyDelivered = false;
   try {
     const existing = await ctx.issues.listComments(dependent.id, companyId);
-    alreadyCommented = existing.some((c) => c.body.includes(reason.marker));
-    if (!alreadyCommented) {
-      await ctx.issues.createComment(dependent.id, reason.body, companyId);
-    }
+    alreadyDelivered = existing.some((c) => c.body.includes(reason.marker));
   } catch (err) {
     return { kind: "failed", error: String(err) };
   }
-  if (alreadyCommented && !allowWakeIfCommented) {
-    return { kind: "already", error: null };
-  }
+  if (alreadyDelivered) return { kind: "already", error: null };
+
   const agentId = dependent.assigneeAgentId;
-  if (!agentId) return { kind: "comment-only", error: null };
-  try {
-    const result = await ctx.issues.requestWakeup(dependent.id, companyId, {
-      reason: safeReason,
-      idempotencyKey: reason.idempotencyKey,
-    });
-    if (result.queued === false) throw new Error("wakeup not queued");
-    return { kind: "woke", error: null };
-  } catch {
-    // Expected for freshly parked dependents (unresolved blockers refuse the
-    // issue wake). Fall back to invoking the assignee directly with the
-    // safe, data-free prompt — never the headline.
+  let wakeKind: "woke" | "invoke" | "comment-only" = "comment-only";
+  if (agentId) {
     try {
-      await ctx.agents.invoke(agentId, companyId, { prompt: safePrompt, reason: safeReason });
-      return { kind: "invoke", error: null };
-    } catch (err) {
-      return { kind: "failed", error: String(err) };
+      const result = await ctx.issues.requestWakeup(dependent.id, companyId, {
+        reason: safeReason,
+        idempotencyKey: reason.idempotencyKey,
+      });
+      if (result.queued === false) throw new Error("wakeup not queued");
+      wakeKind = "woke";
+    } catch {
+      // Expected for freshly parked dependents (unresolved blockers refuse the
+      // issue wake). Fall back to invoking the assignee directly with the
+      // safe, data-free prompt — never the headline.
+      try {
+        await ctx.agents.invoke(agentId, companyId, { prompt: safePrompt, reason: safeReason });
+        wakeKind = "invoke";
+      } catch (err) {
+        // No marker is posted on failure, so the queued retry (and a
+        // state-loss retry) will attempt the wake again (R2-2).
+        return { kind: "failed", error: String(err) };
+      }
     }
   }
+  // Wake delivered (or nothing to wake): now post the marker comment.
+  // If this write fails, the wake is already delivered — report
+  // success rather than queueing a duplicate wake (see header).
+  try {
+    await ctx.issues.createComment(dependent.id, reason.body, companyId);
+  } catch (err) {
+    ctx.logger.error("parked-blocker propagation: wake delivered but marker comment failed", {
+      companyId,
+      dependentId: dependent.id,
+      error: String(err),
+    });
+  }
+  return { kind: wakeKind, error: null };
 }
 
 const isTerminal = (issue: Pick<Issue, "status" | "archivedAt">): boolean =>
@@ -477,12 +621,14 @@ export async function handleParkedEvent(
   if (!root) return { status: "not-found" };
   const parked = isParkedRoot(root);
   const state = await readState(ctx, companyId);
+  const base = cloneParkedState(state);
   if (!parked) {
-    // Unparked root: close its window so a future park is a fresh transition.
+    // Unparked root: close its window so a future park is a fresh occurrence.
+    // The delta write makes this deletion stick under copy-semantics reads.
     if (state.windows[rootId]) {
       delete state.windows[rootId];
       state.pending = state.pending.filter((p) => p.rootId !== rootId);
-      await writeParkedStateConvergent(ctx, companyId, state);
+      await writeParkedStateConvergent(ctx, companyId, state, base);
     }
     return { status: "not-parked" };
   }
@@ -493,10 +639,11 @@ export async function handleParkedEvent(
 
   const nowMs = now();
   const atIso = new Date(nowMs).toISOString();
-  const transition = `${root.status}:${parked.kind}`;
+  const occurrenceId = occurrenceIdForRoot(root, atIso);
+  const transition = transitionFor(root.status, parked.kind, occurrenceId);
   let window = state.windows[rootId];
   if (!window || window.transition !== transition) {
-    window = { transition, firstSeenAt: atIso, woken: {} };
+    window = { transition, occurrenceId, firstSeenAt: atIso, woken: {} };
     state.windows[rootId] = window;
     // A new transition supersedes pending entries queued for the previous
     // parked transition (Devin 0002): they would be dropped by the sweep
@@ -512,7 +659,7 @@ export async function handleParkedEvent(
     const relations = await ctx.issues.relations.get(rootId, companyId);
     blocks = relations.blocks;
   } catch (err) {
-    await writeParkedStateConvergent(ctx, companyId, state);
+    await writeParkedStateConvergent(ctx, companyId, state, base);
     return { status: "error", detail: String(err) };
   }
 
@@ -521,8 +668,9 @@ export async function handleParkedEvent(
   let propagated = 0;
   let skipped = 0;
   let queued = 0;
-  // Attempts count against the cap (B4): a failed propagate still posted a
-  // comment, exactly like the sweep's attempted-set cap.
+  // Attempts count against the cap (B4), exactly like the sweep's
+  // attempted-set cap. A failed wake posts no marker comment (R2-2)
+  // but still consumes cap.
   let attempted = 0;
 
   for (const summary of blocks) {
@@ -542,7 +690,7 @@ export async function handleParkedEvent(
       continue;
     }
     if (attempted >= cap) {
-      const reasonForPending = buildParkedReason(root, parked.kind, trigger, atIso, event.eventId ?? null, summary.id);
+      const reasonForPending = buildParkedReason(root, parked.kind, trigger, atIso, event.eventId ?? null, summary.id, occurrenceId);
       state.pending.push({ rootId, transition, dependentId: summary.id, marker: reasonForPending.marker, attempts: 0, queuedAt: atIso, lastError: null });
       queued += 1;
       continue;
@@ -552,7 +700,7 @@ export async function handleParkedEvent(
       skipped += 1;
       continue;
     }
-    const reason = buildParkedReason(root, parked.kind, trigger, atIso, event.eventId ?? null, dependent.id);
+    const reason = buildParkedReason(root, parked.kind, trigger, atIso, event.eventId ?? null, dependent.id, occurrenceId);
     const safePrompt = buildSafeInvokePrompt(root, parked.kind, dependent);
     const safeReason = buildSafeInvokeReason(root, parked.kind, dependent);
     const result = await propagateToDependent(ctx, companyId, dependent, reason, false, safePrompt, safeReason, false);
@@ -572,7 +720,7 @@ export async function handleParkedEvent(
     attempted += 1;
   }
 
-  await writeParkedStateConvergent(ctx, companyId, state);
+  await writeParkedStateConvergent(ctx, companyId, state, base);
   if (propagated > 0 || queued > 0) {
     ctx.logger.info("parked-blocker propagation", { companyId, rootId, status: root.status, propagated, skipped, queued });
   }
@@ -594,6 +742,7 @@ export async function runParkedSweep(
   config: ParkedConfig,
 ): Promise<{ drained: number; dropped: number; remaining: number }> {
   const state = await readState(ctx, companyId);
+  const base = cloneParkedState(state);
   if (state.pending.length === 0) return { drained: 0, dropped: 0, remaining: 0 };
   if (!config.parkedPropagationEnabled || config.dryRun) return { drained: 0, dropped: 0, remaining: state.pending.length };
 
@@ -618,7 +767,8 @@ export async function runParkedSweep(
       dropped += 1;
       continue;
     }
-    if (`${root.status}:${parked.kind}` !== entry.transition) {
+    const baseTransition = `${root.status}:${parked.kind}`;
+    if (entry.transition !== baseTransition && !entry.transition.startsWith(`${baseTransition}@`)) {
       dropped += 1;
       continue;
     }
@@ -645,7 +795,8 @@ export async function runParkedSweep(
       continue;
     }
     const trigger = extractRevisitTrigger(root);
-    const reason = buildParkedReason(root, parked.kind, trigger, atIso, null, dependent.id);
+    const occurrenceId = entry.transition.includes("@") ? entry.transition.slice(entry.transition.indexOf("@") + 1) : "legacy";
+    const reason = buildParkedReason(root, parked.kind, trigger, atIso, null, dependent.id, occurrenceId);
     const safePrompt = buildSafeInvokePrompt(root, parked.kind, dependent);
     const safeReason = buildSafeInvokeReason(root, parked.kind, dependent);
     const result = await propagateToDependent(ctx, companyId, dependent, reason, false, safePrompt, safeReason, true);
@@ -663,12 +814,12 @@ export async function runParkedSweep(
     if (existingWindow && existingWindow.transition === entry.transition) {
       existingWindow.woken[entry.dependentId] = result.kind;
     } else {
-      state.windows[entry.rootId] = { transition: entry.transition, firstSeenAt: atIso, woken: { [entry.dependentId]: result.kind } };
+      state.windows[entry.rootId] = { transition: entry.transition, occurrenceId, firstSeenAt: atIso, woken: { [entry.dependentId]: result.kind } };
     }
     drained += 1;
   }
 
   state.pending = remaining;
-  await writeParkedStateConvergent(ctx, companyId, state);
+  await writeParkedStateConvergent(ctx, companyId, state, base);
   return { drained, dropped, remaining: remaining.length };
 }

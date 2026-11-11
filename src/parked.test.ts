@@ -10,7 +10,10 @@ import {
   extractRevisitTrigger,
   isParkedRoot,
   mergeParkedState,
+  occurrenceIdForRoot,
+  writeParkedStateConvergent,
 } from "./parked.js";
+import { stateKey } from "./state.js";
 
 const COMPANY = "c-parked";
 const AGENT = "agent-assignee-1";
@@ -93,8 +96,8 @@ describe("buildParkedReason", () => {
     expect(reason.headline).toContain("backlog");
     expect(reason.headline).toContain("when upstream lands");
     expect(reason.body).toContain(reason.marker);
-    expect(reason.idempotencyKey).toBe("parked:root-1:backlog:backlog:dep-1");
-    expect(reason.transition).toBe("backlog:backlog");
+    expect(reason.idempotencyKey).toBe("parked:root-1:backlog:backlog@legacy:dep-1");
+    expect(reason.transition).toBe("backlog:backlog@legacy");
     expect(reason.body).toContain("Wake/comment only");
   });
 
@@ -461,6 +464,70 @@ describe("parked-blocker propagation (event path)", () => {
     expect(invokes).toBe(2);
   });
 
+  it("re-wakes on a same-status re-park after an unpark (R2-2 backlog->todo->backlog)", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Unpark (todo) then re-park at the SAME status/kind: a fresh
+    // occurrence, so a fresh marker and a fresh wake. The 5ms pauses
+    // give each root update a distinct updatedAt (the occurrence id),
+    // as separate production updates always do.
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "todo" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "backlog" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(2);
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
+  });
+
+  it("remains retryable when a wake fails and plugin state is then lost (R2-2)", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    let fail = true;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      if (fail) throw new Error("agent paused");
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Wake-first ordering (R2-2): a failed wake posts NO marker, so
+    // there is no wake-delivery evidence to mistake for delivery.
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(0);
+    // State lost (window + pending gone, double fault after failure).
+    await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "parked-propagation" }, { windows: {}, pending: [] });
+    fail = false;
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(2);
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(1);
+  });
+
   it("counts failed wakes toward the per-event cap (B4)", async () => {
     const harness = await setup({ parkedMaxWakesPerEvent: 1 });
     const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
@@ -479,15 +546,22 @@ describe("parked-blocker propagation (event path)", () => {
       blockedByIssueIds: [root.id],
     });
     // Every invoke fails: the event must still stop after one attempt.
+    let invokes = 0;
     harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
       throw new Error("agent paused");
     }) as typeof harness.ctx.agents.invoke;
 
     await emitRootUpdate(harness, root.id);
 
+    // Wake-first (R2-2): failed wakes post no marker comment, so the
+    // cap is proven by attempt count, not by comment count.
+    expect(invokes).toBe(1);
     const aComments = await harness.ctx.issues.listComments(depA.id, COMPANY);
     const bComments = await harness.ctx.issues.listComments(depB.id, COMPANY);
-    expect(aComments.length + bComments.length).toBe(1);
+    expect(aComments.length + bComments.length).toBe(0);
+    void depA;
+    void depB;
   });
 
   it("re-propagates on a re-park and not after un-parking", async () => {
@@ -652,15 +726,31 @@ describe("parked-blocker propagation (event path)", () => {
   });
 });
 
+/** Wrap the harness state store in copy semantics (JSON round-trip per read). */
+function withCopySemantics(harness: TestHarness) {
+  const origGet = harness.ctx.state.get.bind(harness.ctx.state);
+  harness.ctx.state.get = (async (...args: unknown[]) => {
+    const value = await (origGet as (...a: unknown[]) => Promise<unknown>)(...args);
+    return value == null ? value : (JSON.parse(JSON.stringify(value)) as unknown);
+  }) as typeof harness.ctx.state.get;
+}
+
+async function readStoredParked(harness: TestHarness) {
+  return (await harness.ctx.state.get(stateKey(COMPANY, "parked-propagation"))) as {
+    windows: Record<string, unknown>;
+    pending: unknown[];
+  } | null;
+}
+
 describe("mergeParkedState (Devin 0001)", () => {
   it("unions windows and pending across handlers instead of losing queued wakes", () => {
     const local = {
-      windows: { rootA: { transition: "backlog:backlog", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depA: "invoke" } } },
-      pending: [{ rootId: "rootA", transition: "backlog:backlog", dependentId: "depB", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
+      windows: { rootA: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depA: "invoke" } } },
+      pending: [{ rootId: "rootA", transition: "backlog:backlog@o1", dependentId: "depB", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
     };
     const latest = {
-      windows: { rootB: { transition: "backlog:backlog", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depC: "invoke" } } },
-      pending: [{ rootId: "rootB", transition: "backlog:backlog", dependentId: "depD", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
+      windows: { rootB: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depC: "invoke" } } },
+      pending: [{ rootId: "rootB", transition: "backlog:backlog@o1", dependentId: "depD", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
     };
     const merged = mergeParkedState(local, latest);
     expect(merged.windows.rootA?.woken.depA).toBe("invoke");
@@ -670,16 +760,141 @@ describe("mergeParkedState (Devin 0001)", () => {
 
   it("unions woken sets within one transition but keeps a fresh window across transitions", () => {
     const local = {
-      windows: { root: { transition: "cancelled:cancelled", firstSeenAt: "2026-11-11T00:00:02.000Z", woken: {} } },
+      windows: { root: { transition: "cancelled:cancelled@o2", occurrenceId: "o2", firstSeenAt: "2026-11-11T00:00:02.000Z", woken: {} } },
       pending: [],
     };
     const latest = {
-      windows: { root: { transition: "backlog:backlog", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depA: "invoke" } } },
+      windows: { root: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depA: "invoke" } } },
       pending: [],
     };
     const merged = mergeParkedState(local, latest);
-    expect(merged.windows.root?.transition).toBe("cancelled:cancelled");
+    expect(merged.windows.root?.transition).toBe("cancelled:cancelled@o2");
     expect(merged.windows.root?.woken).toEqual({});
+  });
+
+  it("occurrence id is the root updatedAt, stable across reads (R2-2)", () => {
+    const at = new Date("2026-11-11T01:00:00.000Z");
+    expect(occurrenceIdForRoot({ updatedAt: at }, "2026-11-11T02:00:00.000Z")).toBe("2026-11-11T01:00:00.000Z");
+    expect(occurrenceIdForRoot({ updatedAt: "2026-11-11T01:00:00.000Z" }, "2026-11-11T02:00:00.000Z")).toBe("2026-11-11T01:00:00.000Z");
+  });
+
+  it("delta merge honours explicit deletions against base (R2-1)", () => {
+    const base = {
+      windows: { root: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depA: "invoke" } } },
+      pending: [{ rootId: "root", transition: "backlog:backlog@o1", dependentId: "depB", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
+    };
+    // Local = unpark/drain: window deleted, pending drained.
+    const local = { windows: {}, pending: [] };
+    const merged = mergeParkedState(local, base, base);
+    expect(merged.windows).toEqual({});
+    expect(merged.pending).toEqual([]);
+  });
+
+  it("delta merge preserves a concurrent handler's additions while applying deletions (R2-1c)", () => {
+    const base = {
+      windows: { rootA: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: {} } },
+      pending: [{ rootId: "rootA", transition: "backlog:backlog@o1", dependentId: "depOld", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
+    };
+    const local = { windows: {}, pending: [] }; // unpark rootA + drain depOld
+    const latest = {
+      windows: {
+        rootA: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: {} },
+        rootB: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:01.000Z", woken: { depC: "invoke" } },
+      },
+      pending: [
+        { rootId: "rootA", transition: "backlog:backlog@o1", dependentId: "depOld", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null },
+        { rootId: "rootB", transition: "backlog:backlog@o1", dependentId: "depD", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:01.000Z", lastError: null },
+      ],
+    };
+    const merged = mergeParkedState(local, latest, base);
+    expect(merged.windows.rootA).toBeUndefined();
+    expect(merged.windows.rootB?.woken.depC).toBe("invoke");
+    expect(merged.pending.map((p) => p.dependentId)).toEqual(["depD"]);
+  });
+});
+
+describe("copy-semantics state (R2-1)", () => {
+  it("unpark closes the window in stored state", async () => {
+    const harness = await setup();
+    withCopySemantics(harness);
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    harness.ctx.agents.invoke = (async () => ({ runId: "run-1" })) as typeof harness.ctx.agents.invoke;
+    void dep;
+    await emitRootUpdate(harness, root.id);
+    expect(Object.keys((await readStoredParked(harness))?.windows ?? {})).toContain(root.id);
+    await harness.ctx.issues.update(root.id, { status: "in_progress" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    const stored = await readStoredParked(harness);
+    expect(stored?.windows[root.id]).toBeUndefined();
+    expect(stored?.pending).toEqual([]);
+  });
+
+  it("a drained pending entry stays gone in stored state", async () => {
+    const harness = await setup({ parkedMaxWakesPerEvent: 1 });
+    withCopySemantics(harness);
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const depA = await harness.ctx.issues.create({
+      companyId: COMPANY, title: "Dependent A", status: "blocked", assigneeAgentId: AGENT, blockedByIssueIds: [root.id],
+    });
+    const depB = await harness.ctx.issues.create({
+      companyId: COMPANY, title: "Dependent B", status: "blocked", assigneeAgentId: AGENT, blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+    void depA;
+    void depB;
+    await emitRootUpdate(harness, root.id);
+    expect((await readStoredParked(harness))?.pending).toHaveLength(1);
+    await harness.runJob(PARKED_JOB_KEY);
+    const stored = await readStoredParked(harness);
+    expect(stored?.pending).toEqual([]);
+    expect(invokes).toBe(2);
+    await harness.runJob(PARKED_JOB_KEY);
+    expect(invokes).toBe(2);
+    expect((await readStoredParked(harness))?.pending).toEqual([]);
+  });
+
+  it("overlapping handlers lose no queued wake under copy semantics", async () => {
+    const harness = await setup();
+    withCopySemantics(harness);
+    // Two handlers that both started from the same base: handler 1
+    // queues depB for rootA, handler 2 parks rootB. Sequential
+    // convergent writes must retain both (and handler 1's drain of
+    // depOld must stick).
+    const base = {
+      windows: { rootA: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: {} } },
+      pending: [{ rootId: "rootA", transition: "backlog:backlog@o1", dependentId: "depOld", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:00.000Z", lastError: null }],
+    };
+    await harness.ctx.state.set(stateKey(COMPANY, "parked-propagation"), JSON.parse(JSON.stringify(base)));
+    const handler1Local = {
+      windows: { rootA: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: { depA: "invoke" } } },
+      pending: [{ rootId: "rootA", transition: "backlog:backlog@o1", dependentId: "depB", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:01.000Z", lastError: null }],
+    };
+    await writeParkedStateConvergent(harness.ctx, COMPANY, handler1Local, base);
+    // Handler 2 started from the same base (its rootB window is new,
+    // it also drained depOld from its own local view).
+    const handler2Local = {
+      windows: {
+        rootA: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:00.000Z", woken: {} },
+        rootB: { transition: "backlog:backlog@o1", occurrenceId: "o1", firstSeenAt: "2026-11-11T00:00:02.000Z", woken: { depC: "invoke" } },
+      },
+      pending: [{ rootId: "rootB", transition: "backlog:backlog@o1", dependentId: "depD", marker: "m", attempts: 0, queuedAt: "2026-11-11T00:00:02.000Z", lastError: null }],
+    };
+    await writeParkedStateConvergent(harness.ctx, COMPANY, handler2Local, base);
+    const stored = await readStoredParked(harness);
+    expect((stored?.windows.rootA as { woken: Record<string, string> } | undefined)?.woken.depA).toBe("invoke");
+    expect((stored?.windows.rootB as { woken: Record<string, string> } | undefined)?.woken.depC).toBe("invoke");
+    expect((stored?.pending as { dependentId: string }[]).map((p) => p.dependentId).sort()).toEqual(["depB", "depD"]);
   });
 });
 
