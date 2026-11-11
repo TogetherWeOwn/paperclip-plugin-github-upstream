@@ -51,31 +51,42 @@ import { stateKey } from "./state.js";
  * - Dedupe per (root transition occurrence, dependent): the `windows`
  *   record keys a propagation window by root + transition occurrence
  *   (`<status>:<kind>@<occurrenceId>`); each dependent is recorded once
- *   per window. The occurrence id is the parked root's `updatedAt` at
- *   window creation — it is stable across plugin-state loss (the root
- *   row is unchanged), but changes on any later root update, so a
- *   backlog -> todo -> backlog re-park (R2-2) is a fresh occurrence
- *   with a fresh marker and idempotency key, while a state-loss retry
- *   of the same continuous park regenerates the identical occurrence
- *   and therefore the identical marker. A re-park (backlog -> cancelled,
- *   a text-only NO-GO -> deferred change at the same status, or an
- *   unpark/re-park cycle) opens a new window with a fresh woken set.
- *   The comment marker and the `requestWakeup` idempotency key both
- *   include (root, transition occurrence, dependent), so neither
- *   host-side nor comment-side dedupe can confuse dependents,
- *   transitions or occurrences (Security B5a, Devin 0004, R2-2).
- * - Wake-delivery evidence (R2-2): the marker comment is posted ONLY
- *   AFTER a successful wake (or for a comment-only dependent with no
- *   agent to wake). Marker presence therefore means the wake was
- *   delivered, not merely that a comment was attempted. A failed wake
- *   posts no comment and is queued for the sweep, so a failed wake
- *   followed by state loss remains retryable (no silent loss); a
- *   successful wake followed by state loss is recognised by the
- *   marker and is not duplicated (`already`, B5b). Known narrow
- *   double-fault: a wake that succeeds but whose marker comment
- *   write then fails leaves no marker, so a later retry may
- *   duplicate that one wake — the window `woken` set prevents this
- *   whenever plugin state survives.
+ *   per window. The occurrence id is minted from the parked root's
+ *   `updatedAt` at window creation and then STORED in the window: while
+ *   the root stays in the same `(status:kind)` park the window (and its
+ *   occurrence) is reused, so an ordinary edit (a title typo) never
+ *   opens a fresh window or re-wakes dependents (Devin 0001-new). An
+ *   unpark/re-park cycle (backlog -> todo -> backlog, R2-2) closes the
+ *   window, so the next park mints a fresh occurrence with fresh
+ *   markers and idempotency keys; a state-loss retry of the same
+ *   continuous park (no intervening edit) regenerates the identical
+ *   occurrence and therefore the identical markers. A re-park
+ *   (backlog -> cancelled, a text-only NO-GO -> deferred change at the
+ *   same status, or an unpark/re-park cycle) opens a new window with a
+ *   fresh woken set. The comment markers and the `requestWakeup`
+ *   idempotency key all include (root, transition occurrence,
+ *   dependent), so neither host-side nor comment-side dedupe can
+ *   confuse dependents, transitions or occurrences (Security B5a,
+ *   Devin 0004, R2-2). Known residual: plugin state loss plus an
+ *   intervening ordinary edit of the parked root (two faults) can
+ *   mint a fresh occurrence and duplicate one round of wakes — the
+ *   duplicate wake is a safe, idempotent re-disposition instruction,
+ *   never a state mutation.
+ * - Wake ordering and delivery evidence (R2-2 + Devin 0002-new):
+ *   the audit comment (root + revisit trigger, read as card data) is
+ *   posted BEFORE any wake, so a promptly-running assignee finds the
+ *   promised context on the dependent card. The audit comment alone
+ *   is NOT wake-delivery evidence. A separate delivery marker
+ *   (`parked-blocker-delivered`) is posted only AFTER a successful
+ *   wake, and only it short-circuits a later wake as `already`, so a
+ *   failed wake followed by state loss remains retryable (no silent
+ *   loss), while a successful wake followed by state loss is
+ *   recognised by the delivery marker and is not duplicated (B5b).
+ *   Comment-only dependents (no agent assignee) get the single audit
+ *   comment. Known narrow double-fault: a wake that succeeds but
+ *   whose delivery-marker write then fails leaves no delivery
+ *   marker, so a later retry may duplicate that one wake — the
+ *   window `woken` set prevents this whenever plugin state survives.
  * - Only `blocked` dependents are propagated (B2). A dependent in
  *   `in_review`/`in_progress`/`todo`/`backlog` is skipped — waking its
  *   assignee (for `in_review`, the reviewer) with an owner instruction would
@@ -197,11 +208,14 @@ export function extractRevisitTrigger(
 }
 
 /**
- * Durable occurrence id for one continuous park of a root (R2-2): the
- * root's `updatedAt` at window creation. Stable across plugin-state
- * loss (root row unchanged), distinct for any later park because the
- * unpark/re-park cycle bumps `updatedAt`. Falls back to `atIso` when
- * the host supplies no `updatedAt`.
+ * Occurrence id MINTED when a propagation window is opened (R2-2):
+ * the root's `updatedAt` at that moment. Stable across plugin-state
+ * loss when the root was not edited meanwhile (root row unchanged),
+ * and distinct for any later park because the unpark/re-park cycle
+ * bumps `updatedAt`. The minted id is then stored in the window and
+ * reused while the park continues (Devin 0001-new) — only window
+ * creation calls this. Falls back to `atIso` when the host supplies
+ * no `updatedAt`.
  */
 export function occurrenceIdForRoot(
   root: { updatedAt?: Date | string | null },
@@ -220,15 +234,21 @@ export function transitionFor(rootStatus: string, parkedKind: ParkedKind, occurr
 export interface ParkedReason {
   /** Structured, human-readable reason (comment body first line). NEVER sent as an agent prompt. */
   headline: string;
-  /** Full comment body, including the loop-safety marker. */
+  /** Audit comment body (root + revisit trigger), posted BEFORE any wake. */
   body: string;
-  /** Marker embedded in every propagation comment; `listComments` checks for it. */
+  /** Marker embedded in the audit comment; presence means context exists, NOT that the wake was delivered. */
+  auditMarker: string;
+  /** One-line delivery record body, posted only after a successful wake. */
+  deliveryBody: string;
+  /** Marker embedded in the delivery record; presence means the wake was delivered. */
+  deliveryMarker: string;
+  /** Alias of `deliveryMarker`, kept for pending entries and callers. */
   marker: string;
   /** Idempotency key for `requestWakeup`: (root, transition occurrence, dependent). */
   idempotencyKey: string;
   /** Transition key `"<status>:<kind>@<occurrenceId>"`: distinguishes windows, occurrences and markers. */
   transition: string;
-  /** Durable occurrence id carried by the marker and idempotency key. */
+  /** Durable occurrence id carried by the markers and idempotency key. */
   occurrenceId: string;
 }
 
@@ -255,9 +275,10 @@ export function buildParkedReason(
     `Parked blocker: ${ident} (${transition})` +
     (title ? ` — "${title}"` : "") +
     ` — revisit: ${revisitTrigger ?? "none recorded on the parked root"}`;
-  const marker = `<!-- parked-blocker: rootId=${root.id} transition=${transition} dependentId=${dependentId} -->`;
+  const auditMarker = `<!-- parked-blocker-audit: rootId=${root.id} transition=${transition} dependentId=${dependentId} -->`;
+  const deliveryMarker = `<!-- parked-blocker-delivered: rootId=${root.id} transition=${transition} dependentId=${dependentId} -->`;
   const body = [
-    marker,
+    auditMarker,
     headline,
     "",
     "This dependent is blocked by the parked root above, which will not unblock it until re-dispositioned. " +
@@ -267,10 +288,14 @@ export function buildParkedReason(
       (eventId ? `, event ${eventId}` : "") +
       `, at ${atIso}. Wake/comment only: the plugin changed no status, assignee or stage.`,
   ].join("\n");
+  const deliveryBody = `${deliveryMarker}\nParked-blocker propagation: the assignee of this card was woken for the parked blocker above (transition ${transition}).`;
   return {
     headline,
     body,
-    marker,
+    auditMarker,
+    deliveryBody,
+    deliveryMarker,
+    marker: deliveryMarker,
     idempotencyKey: `parked:${root.id}:${transition}:${dependentId}`,
     transition,
     occurrenceId: occ,
@@ -522,19 +547,25 @@ function eventIssueId(event: PluginEvent): string | null {
 }
 
 /**
- * One dependent: tiered wake FIRST, then the audit marker comment
- * (R2-2). The marker is wake-delivery evidence: it is posted only
- * after a successful wake, so its presence proves delivery and its
- * absence proves the wake still needs a retry.
+ * One dependent (R2-2 + Devin 0002-new): audit comment FIRST, then
+ * the wake, then the delivery marker. The audit comment makes the
+ * parked root + revisit trigger readable before the assignee can
+ * run; it is NOT delivery evidence. The delivery marker is posted
+ * only after a successful wake, so its presence proves delivery and
+ * its absence proves the wake still needs a retry — a failed wake
+ * keeps the audit comment but no delivery marker, so the queued
+ * retry (and a state-loss retry) wakes again instead of treating
+ * the audit comment as proof of delivery.
  * Returns:
  * - "woke" | "invoke": wake delivered (issue wake or agent invoke),
- *   marker comment posted (best-effort after delivery).
- * - "comment-only": marker comment posted, no agent assignee to wake.
- * - "already": the (root, transition occurrence, dependent) marker
- *   already exists, so the wake was already delivered; the wake is
- *   skipped so state loss cannot duplicate an invoke (B5b).
- * - "failed": wake failed (no marker posted) or the marker check
- *   itself failed; caller queues for the next tick.
+ *   delivery marker posted (best-effort after delivery).
+ * - "comment-only": audit comment ensured, no agent assignee to wake.
+ * - "already": the delivery marker for this (root, transition
+ *   occurrence, dependent) already exists, so the wake was already
+ *   delivered; the wake is skipped so state loss cannot duplicate
+ *   an invoke (B5b).
+ * - "failed": comment check/write or wake failed; caller queues
+ *   for the next tick.
  */
 async function propagateToDependent(
   ctx: PluginContext,
@@ -544,51 +575,71 @@ async function propagateToDependent(
   dryRun: boolean,
   safePrompt: string,
   safeReason: string,
-  // Retained for call-site compatibility; wake-first ordering makes
-  // event and sweep identical — a marker always means delivered.
   _allowWakeIfCommented?: boolean,
 ): Promise<{ kind: "woke" | "invoke" | "comment-only" | "already" | "failed"; error: string | null }> {
   if (dryRun) return { kind: "comment-only", error: null };
   let alreadyDelivered = false;
+  let auditPresent = false;
   try {
     const existing = await ctx.issues.listComments(dependent.id, companyId);
-    alreadyDelivered = existing.some((c) => c.body.includes(reason.marker));
+    alreadyDelivered = existing.some((c) => c.body.includes(reason.deliveryMarker));
+    auditPresent = existing.some((c) => c.body.includes(reason.auditMarker));
   } catch (err) {
     return { kind: "failed", error: String(err) };
   }
   if (alreadyDelivered) return { kind: "already", error: null };
 
   const agentId = dependent.assigneeAgentId;
-  let wakeKind: "woke" | "invoke" | "comment-only" = "comment-only";
-  if (agentId) {
+  if (!agentId) {
+    // Comment-only: the single audit comment is the whole record.
+    if (auditPresent) return { kind: "comment-only", error: null };
     try {
-      const result = await ctx.issues.requestWakeup(dependent.id, companyId, {
-        reason: safeReason,
-        idempotencyKey: reason.idempotencyKey,
-      });
-      if (result.queued === false) throw new Error("wakeup not queued");
-      wakeKind = "woke";
-    } catch {
-      // Expected for freshly parked dependents (unresolved blockers refuse the
-      // issue wake). Fall back to invoking the assignee directly with the
-      // safe, data-free prompt — never the headline.
-      try {
-        await ctx.agents.invoke(agentId, companyId, { prompt: safePrompt, reason: safeReason });
-        wakeKind = "invoke";
-      } catch (err) {
-        // No marker is posted on failure, so the queued retry (and a
-        // state-loss retry) will attempt the wake again (R2-2).
-        return { kind: "failed", error: String(err) };
-      }
+      await ctx.issues.createComment(dependent.id, reason.body, companyId);
+    } catch (err) {
+      return { kind: "failed", error: String(err) };
+    }
+    return { kind: "comment-only", error: null };
+  }
+
+  // Audit context first: a promptly-running assignee must find the
+  // parked root + revisit trigger on the card before any wake.
+  if (!auditPresent) {
+    try {
+      await ctx.issues.createComment(dependent.id, reason.body, companyId);
+    } catch (err) {
+      return { kind: "failed", error: String(err) };
     }
   }
-  // Wake delivered (or nothing to wake): now post the marker comment.
-  // If this write fails, the wake is already delivered — report
-  // success rather than queueing a duplicate wake (see header).
+
+  let wakeKind: "woke" | "invoke" = "invoke";
   try {
-    await ctx.issues.createComment(dependent.id, reason.body, companyId);
+    const result = await ctx.issues.requestWakeup(dependent.id, companyId, {
+      reason: safeReason,
+      idempotencyKey: reason.idempotencyKey,
+    });
+    if (result.queued === false) throw new Error("wakeup not queued");
+    wakeKind = "woke";
+  } catch {
+    // Expected for freshly parked dependents (unresolved blockers refuse the
+    // issue wake). Fall back to invoking the assignee directly with the
+    // safe, data-free prompt — never the headline.
+    try {
+      await ctx.agents.invoke(agentId, companyId, { prompt: safePrompt, reason: safeReason });
+      wakeKind = "invoke";
+    } catch (err) {
+      // No delivery marker is posted on failure, so the queued retry
+      // (and a state-loss retry) will attempt the wake again even
+      // though the audit comment already exists (R2-2).
+      return { kind: "failed", error: String(err) };
+    }
+  }
+  // Wake delivered: now post the delivery marker. If this write
+  // fails, the wake is already delivered — report success rather
+  // than queueing a duplicate wake (see header).
+  try {
+    await ctx.issues.createComment(dependent.id, reason.deliveryBody, companyId);
   } catch (err) {
-    ctx.logger.error("parked-blocker propagation: wake delivered but marker comment failed", {
+    ctx.logger.error("parked-blocker propagation: wake delivered but delivery marker failed", {
       companyId,
       dependentId: dependent.id,
       error: String(err),
@@ -639,10 +690,22 @@ export async function handleParkedEvent(
 
   const nowMs = now();
   const atIso = new Date(nowMs).toISOString();
-  const occurrenceId = occurrenceIdForRoot(root, atIso);
-  const transition = transitionFor(root.status, parked.kind, occurrenceId);
+  const baseTransition = `${root.status}:${parked.kind}`;
+  // Window reuse (Devin 0001-new): while the root stays in the same
+  // (status:kind) park, the existing window — and its stored
+  // occurrence — is reused, so an ordinary edit (which bumps
+  // `updatedAt`) never opens a fresh window or re-wakes dependents.
+  // Only a genuinely new park (no window, differing status/kind, or
+  // a window closed by an unpark) mints a fresh occurrence.
   let window = state.windows[rootId];
-  if (!window || window.transition !== transition) {
+  let occurrenceId: string;
+  let transition: string;
+  if (window && window.transition.startsWith(`${baseTransition}@`)) {
+    occurrenceId = window.occurrenceId;
+    transition = window.transition;
+  } else {
+    occurrenceId = occurrenceIdForRoot(root, atIso);
+    transition = transitionFor(root.status, parked.kind, occurrenceId);
     window = { transition, occurrenceId, firstSeenAt: atIso, woken: {} };
     state.windows[rootId] = window;
     // A new transition supersedes pending entries queued for the previous
@@ -669,7 +732,7 @@ export async function handleParkedEvent(
   let skipped = 0;
   let queued = 0;
   // Attempts count against the cap (B4), exactly like the sweep's
-  // attempted-set cap. A failed wake posts no marker comment (R2-2)
+  // attempted-set cap. A failed wake posts no delivery marker (R2-2)
   // but still consumes cap.
   let attempted = 0;
 

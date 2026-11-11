@@ -95,7 +95,9 @@ describe("buildParkedReason", () => {
     expect(reason.headline).toContain("TWO-100");
     expect(reason.headline).toContain("backlog");
     expect(reason.headline).toContain("when upstream lands");
-    expect(reason.body).toContain(reason.marker);
+    expect(reason.body).toContain(reason.auditMarker);
+    expect(reason.deliveryBody).toContain(reason.deliveryMarker);
+    expect(reason.marker).toBe(reason.deliveryMarker);
     expect(reason.idempotencyKey).toBe("parked:root-1:backlog:backlog@legacy:dep-1");
     expect(reason.transition).toBe("backlog:backlog@legacy");
     expect(reason.body).toContain("Wake/comment only");
@@ -190,7 +192,8 @@ describe("safe invoke prompt (B1 prompt injection)", () => {
     expect(reasons[0]).not.toContain("ignore re-disposition");
     // Audit trail still carries the data (read as card data, not instructions).
     const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
-    expect(comments).toHaveLength(1);
+    // Audit (first) carries the hostile data; delivery record second.
+    expect(comments).toHaveLength(2);
     expect(comments[0]?.body).toContain("ignore re-disposition");
   });
 });
@@ -219,7 +222,8 @@ describe("parked-blocker propagation (event path)", () => {
     await emitRootUpdate(harness, root.id);
 
     const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
-    expect(comments).toHaveLength(1);
+    // Audit comment (first, pre-wake) + delivery record (second).
+    expect(comments).toHaveLength(2);
     expect(comments[0]?.body).toContain("Parked blocker:");
     expect(comments[0]?.body).toContain("upstream release");
     // The host refuses issue-scoped wakes for unresolved blockers; the
@@ -252,7 +256,7 @@ describe("parked-blocker propagation (event path)", () => {
 
     expect(updateSpy.mock.calls.filter((c) => String(c[0]) === dep.id)).toHaveLength(0);
     expect(updateSpy).not.toHaveBeenCalled();
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(1);
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
   });
 
   it("does not wake non-blocked dependents (B2)", async () => {
@@ -325,7 +329,7 @@ describe("parked-blocker propagation (event path)", () => {
     await emitRootUpdate(harness, root.id);
 
     expect(invokes).toBe(1);
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(1);
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
   });
 
   it("skips terminal dependents", async () => {
@@ -452,12 +456,13 @@ describe("parked-blocker propagation (event path)", () => {
     expect(invokes).toBe(1);
     const aAfterEvent = await harness.ctx.issues.listComments(depA.id, COMPANY);
     const bAfterEvent = await harness.ctx.issues.listComments(depB.id, COMPANY);
-    expect(aAfterEvent.length + bAfterEvent.length).toBe(1);
+    // A: audit + delivery; B: not yet attempted (queued, no audit).
+    expect(aAfterEvent.length + bAfterEvent.length).toBe(2);
 
     await harness.runJob(PARKED_JOB_KEY);
     expect(invokes).toBe(2);
-    expect(await harness.ctx.issues.listComments(depA.id, COMPANY)).toHaveLength(1);
-    expect(await harness.ctx.issues.listComments(depB.id, COMPANY)).toHaveLength(1);
+    expect(await harness.ctx.issues.listComments(depA.id, COMPANY)).toHaveLength(2);
+    expect(await harness.ctx.issues.listComments(depB.id, COMPANY)).toHaveLength(2);
 
     // Draining is idempotent: a second tick does not re-wake.
     await harness.runJob(PARKED_JOB_KEY);
@@ -494,7 +499,10 @@ describe("parked-blocker propagation (event path)", () => {
     await harness.ctx.issues.update(root.id, { status: "backlog" }, COMPANY);
     await emitRootUpdate(harness, root.id);
     expect(invokes).toBe(2);
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
+    // Two parks x (audit + delivery).
+    const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(2);
+    expect(comments).toHaveLength(4);
   });
 
   it("remains retryable when a wake fails and plugin state is then lost (R2-2)", async () => {
@@ -517,15 +525,23 @@ describe("parked-blocker propagation (event path)", () => {
 
     await emitRootUpdate(harness, root.id);
     expect(invokes).toBe(1);
-    // Wake-first ordering (R2-2): a failed wake posts NO marker, so
-    // there is no wake-delivery evidence to mistake for delivery.
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(0);
+    // Audit-first ordering (R2-2 + Devin 0002-new): the failed wake
+    // leaves the audit comment but NO delivery marker, so nothing on
+    // the card is wake-delivery evidence and the retry is not skipped.
+    const afterFailure = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(afterFailure).toHaveLength(1);
+    expect(afterFailure[0]?.body).toContain("parked-blocker-audit");
+    expect(afterFailure[0]?.body).not.toContain("parked-blocker-delivered");
     // State lost (window + pending gone, double fault after failure).
     await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "parked-propagation" }, { windows: {}, pending: [] });
     fail = false;
     await emitRootUpdate(harness, root.id);
     expect(invokes).toBe(2);
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(1);
+    // Retry sees the audit (no duplicate audit) and posts delivery.
+    const afterRetry = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(afterRetry).toHaveLength(2);
+    expect(afterRetry.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(1);
+    expect(afterRetry.filter((c) => c.body.includes("parked-blocker-delivered"))).toHaveLength(1);
   });
 
   it("counts failed wakes toward the per-event cap (B4)", async () => {
@@ -554,12 +570,13 @@ describe("parked-blocker propagation (event path)", () => {
 
     await emitRootUpdate(harness, root.id);
 
-    // Wake-first (R2-2): failed wakes post no marker comment, so the
-    // cap is proven by attempt count, not by comment count.
+    // Audit-first (Devin 0002-new): the failed attempt posts the
+    // audit comment but no delivery marker, so the cap is proven by
+    // attempt count, not by comment delivery count.
     expect(invokes).toBe(1);
     const aComments = await harness.ctx.issues.listComments(depA.id, COMPANY);
     const bComments = await harness.ctx.issues.listComments(depB.id, COMPANY);
-    expect(aComments.length + bComments.length).toBe(0);
+    expect(aComments.length + bComments.length).toBe(1);
     void depA;
     void depB;
   });
@@ -592,7 +609,8 @@ describe("parked-blocker propagation (event path)", () => {
     await harness.ctx.issues.update(root.id, { status: "cancelled" }, COMPANY);
     await emitRootUpdate(harness, root.id);
     expect(invokes).toBe(2);
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
+    // Two parks x (audit + delivery).
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(4);
   });
 
   it("re-propagates a same-status NO-GO to deferred text change (Devin 0004)", async () => {
@@ -619,8 +637,10 @@ describe("parked-blocker propagation (event path)", () => {
     await emitRootUpdate(harness, root.id);
     expect(invokes).toBe(2);
     const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
-    expect(comments).toHaveLength(2);
-    expect(comments[1]?.body).toContain("deferred");
+    expect(comments).toHaveLength(4);
+    const audits = comments.filter((c) => c.body.includes("Parked blocker:"));
+    expect(audits).toHaveLength(2);
+    expect(audits[1]?.body).toContain("deferred");
   });
 
   it("wakes still-queued dependents across a direct re-park (Devin 0002)", async () => {
@@ -658,8 +678,9 @@ describe("parked-blocker propagation (event path)", () => {
     await harness.runJob(PARKED_JOB_KEY);
     // B is woken by the sweep under the new transition, not dropped.
     expect(invokes).toBe(3);
-    expect(await harness.ctx.issues.listComments(depA.id, COMPANY)).toHaveLength(2);
-    expect(await harness.ctx.issues.listComments(depB.id, COMPANY)).toHaveLength(1);
+    // A woken on both parks (audit + delivery each); B on the sweep.
+    expect(await harness.ctx.issues.listComments(depA.id, COMPANY)).toHaveLength(4);
+    expect(await harness.ctx.issues.listComments(depB.id, COMPANY)).toHaveLength(2);
     void depB;
   });
 
@@ -695,7 +716,7 @@ describe("parked-blocker propagation (event path)", () => {
     // B must not be woken: the relation is gone.
     expect(invokes).toBe(1);
     expect(await harness.ctx.issues.listComments(depB.id, COMPANY)).toHaveLength(0);
-    expect(await harness.ctx.issues.listComments(depA.id, COMPANY)).toHaveLength(1);
+    expect(await harness.ctx.issues.listComments(depA.id, COMPANY)).toHaveLength(2);
   });
 
   it("does not duplicate the invoke after state loss (B5b)", async () => {
@@ -716,13 +737,65 @@ describe("parked-blocker propagation (event path)", () => {
     }) as typeof harness.ctx.agents.invoke;
     await emitRootUpdate(harness, root.id);
     expect(invokes).toBe(1);
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(1);
-    // State lost, but the marker check prevents a duplicate comment AND a
-    // duplicate invoke on retry (wake path is deduped too, not just comments).
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
+    // State lost, but the delivery-marker check prevents a duplicate
+    // comment AND a duplicate invoke on retry (wake path is deduped
+    // too, not just comments).
     await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, stateKey: "parked-propagation" }, { windows: {}, pending: [] });
     await emitRootUpdate(harness, root.id);
-    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(1);
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
     expect(invokes).toBe(1);
+  });
+
+  it("does not re-wake on an ordinary edit while the root stays parked (Devin 0001-new)", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Ordinary edit: title typo, same status/kind. The window (and
+    // its stored occurrence) is reused, so no fresh window opens.
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { title: "Parked root (typo fixed)" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(comments).toHaveLength(2);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(1);
+  });
+
+  it("posts the audit comment before invoking the assignee (Devin 0002-new)", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog", description: "revisit: when upstream lands" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    // At invoke time, the audit comment must already be readable.
+    let auditVisibleAtInvoke = false;
+    harness.ctx.agents.invoke = (async () => {
+      const visible = await harness.ctx.issues.listComments(dep.id, COMPANY);
+      auditVisibleAtInvoke = visible.some((c) => c.body.includes("parked-blocker-audit") && c.body.includes("when upstream lands"));
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(auditVisibleAtInvoke).toBe(true);
   });
 });
 
