@@ -89,6 +89,27 @@ describe("isParkedRoot", () => {
   it("lets an explicit label override the incidental-adjective exclusion (D3)", () => {
     expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: deferred execution until Q3", archivedAt: null })?.kind).toBe("deferred");
   });
+
+  it("does not park on a wrapped-line noun after 'deferred' (Devin 4533158195)", () => {
+    // A line break inside the description must not escape the noun veto.
+    expect(
+      isParkedRoot({ status: "todo", title: "Dashboard work", description: "The launch is deferred\nrendering work, see below", archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("does not park on 'Deferred to <team>' delegation", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "Deferred to the platform team", description: null, archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("still parks the D1-D3 preservation examples", () => {
+    expect(isParkedRoot({ status: "todo", title: "Deferred until Q3", description: null, archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "todo", title: "Deferred", description: "Execution scheduled for later", archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "todo", title: "x", description: "Decision: deferred execution until Q3", archivedAt: null })?.kind).toBe("deferred");
+    expect(isParkedRoot({ status: "in_progress", title: "deferred rendering", description: null, archivedAt: null })).toBeNull();
+    expect(isParkedRoot({ status: "todo", title: "no go-to", description: null, archivedAt: null })).toBeNull();
+  });
 });
 
 describe("extractRevisitTrigger", () => {
