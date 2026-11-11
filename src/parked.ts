@@ -192,7 +192,7 @@ const DEFERRED_NOUN = String.raw`(?!(?:[^\S\r\n\u2028\u2029]+|[^\S\r\n\u2028\u20
 // title/description boundary separate (D2: title `NO-GO` +
 // description `To revisit...` must not veto).
 const NO_GO_NOT_GOTO = String.raw`(?![ \t\-]?to\b)`;
-const NO_GO_NOT_GOTO_WRAP = String.raw`(?!(?:[ \t\-]?|[^\S\r\n]*(?:\r\n|\n|\r)[^\S\r\n]*)to\b)`;
+const NO_GO_NOT_GOTO_WRAP = String.raw`(?!(?:[ \t\-]?|[^\S\r\n\u2028\u2029]*(?:\r\n|\n|\r)[^\S\r\n\u2028\u2029]*)to\b)`;
 
 const NO_GO_RES: RegExp[] = [
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),

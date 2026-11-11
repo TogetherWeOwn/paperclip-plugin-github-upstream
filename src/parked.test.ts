@@ -133,6 +133,12 @@ describe("isParkedRoot", () => {
     ).toBeNull();
   });
 
+  it("does not let a mixed paragraph break veto a no-go predication", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "The launch is no go\n\u2028To revisit in Q3", archivedAt: null })?.kind,
+    ).toBe("no-go");
+  });
+
   it("does not park on 'Deferred to <team>' delegation", () => {
     expect(
       isParkedRoot({ status: "todo", title: "Deferred to the platform team", description: null, archivedAt: null }),
