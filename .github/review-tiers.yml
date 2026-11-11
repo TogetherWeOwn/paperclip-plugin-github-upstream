@@ -1,27 +1,34 @@
-# Risk-tiered review map for paperclip-plugin-github-upstream (owner-
-# approved risk-tiered review; schema v1, canonical policy in the
-# adopting parent card's "plan" document).
+# Path-based risk tiers for the review-guard (TWO-5879), and the human
+# risk-tiered review map for this repo (owner-approved risk-tiered review,
+# policy in the adopting parent card's "plan" document).
 #
-# Classification rules (identical in every repo):
-#   1. A PR's tier is the HIGHEST tier of any changed file
-#      (sensitive > ordinary > low). On overlap, sensitive wins.
-#      A file matching no glob below defaults to sensitive.
-#   2. Content triggers escalate to sensitive regardless of path:
+# Runtime contract (parsed by src/review-tiers.ts — unknown top-level keys
+# throw, so the machine-readable lists below stay exactly low/ordinary/
+# sensitive; the human policy is documented in these comments):
+#   - QA reviews every change; Security is added for sensitive or
+#     unclassified paths. Sensitive wins when lists overlap.
+#   - A PR's tier is the HIGHEST tier of any changed file
+#     (sensitive > ordinary > low). A file matching no glob below
+#     defaults to sensitive. Editing this file itself is always
+#     sensitive, whatever the map says.
+#
+# Human classification rules (restated from the bootstrap map):
+#   1. Content triggers escalate to sensitive regardless of path:
 #      new/changed public endpoint or input parsing; auth/authz/session
 #      logic; crypto or key handling; secrets/credentials; permission
 #      checks; tenant-isolation or personal-data handling; SQL/schema/
 #      migrations; dependency or lockfile changes; CI/workflow changes;
 #      weakened test assertions, deleted tests/snapshots, or lowered
 #      gates in test files (so test paths are low only for additive tests).
-#   3. The author records the tier in the PR attestation (`risk_tier`);
+#   2. The author records the tier in the PR attestation (`risk_tier`);
 #      QA verifies it against this file and the diff. Any doubt
 #      escalates. QA may pull in Security on any PR.
-#   4. Review per tier: low -> QA; ordinary -> QA;
+#   3. Review per tier: low -> QA; ordinary -> QA;
 #      sensitive/unclassified -> Security -> QA.
-#   5. This file itself, and any change to it, is always sensitive
-#      (review-policy enforcement). No glob in the sensitive floor
-#      below may be moved to low/ordinary without the Security
-#      Engineer's approval recorded on that PR.
+#   4. This file itself, and any change to it, is always sensitive
+#      (review-policy enforcement). No glob in the sensitive floor may
+#      be moved to low/ordinary without the Security Engineer's
+#      approval recorded on that PR.
 #
 # Sensitive floor (never downgraded): CI/workflows, this file, CODEOWNERS;
 # dependency manifests and lockfiles (incl. dev deps), build tools and
@@ -29,7 +36,7 @@
 # parsing, tenant isolation, personal data, DB schema/migrations;
 # runtime/network/IAM config, infra and deploy/release paths; agent
 # instructions/skills/tool permissions. Every new top-level path is
-# sensitive until explicitly classified here (default_tier below).
+# sensitive until explicitly classified here.
 #
 # Low is allowlist-only: docs copy, static non-sensitive fixtures,
 # additive unit tests (content triggers still apply).
@@ -38,85 +45,23 @@
 # no trust-boundary effect. Anything unlisted is sensitive by default —
 # when in doubt, leave it unlisted.
 #
-# Layout inventory (actual top-level paths in this repo):
-#   src            plugin worker: GitHub App auth, scans, review-guard, UI
-#   src/ui         host-registered React page (renders untrusted titles)
-#   bin            published dry-run CLI entrypoint (executes plugin code)
-#   scripts        build script that writes the shipped UI bundle
-#   .github        workflows + this file
-#   root           package.json/lock, tsconfig, vitest config, root ci.yml
-#
-# This plugin authenticates to GitHub and the Paperclip control plane and
-# creates/wakes/updates cards: nearly all of src/ is intentionally left
-# unlisted (= sensitive). Only the pure UI aggregator earns ordinary.
-
-version: 1
-default_tier: sensitive
-
-tiers:
-  low:
-    # Docs copy (prose only; no AGENTS.md or agent instruction files exist
-    # here — anything added later is unclassified => sensitive).
-    - "README.md"
-    - "CHANGELOG.md"
-    - "LICENSE"
-    # Additive unit tests only (weakened/deleted tests, lowered gates or
-    # assertion changes escalate to sensitive per rule 2). Repo tests live
-    # in src/ only; a future tests/ or test/ top-level tree is unclassified
-    # => sensitive until explicitly mapped here.
-    - "src/*.test.ts"
-    - "src/**/*.test.ts"
-    - "src/**/*.test.tsx"
-
-  ordinary:
-    # Audited modules only (justified in the bootstrap PR body):
-    # - src/summary.ts: pure aggregation of already-stored plugin state
-    #   into the tab's metric counts; no I/O, network, auth, secrets,
-    #   writes, or trust-boundary effect.
-    - "src/summary.ts"
-
-  sensitive:
-    # Review-policy enforcement.
-    - ".github/workflows/**"
-    - ".github/review-tiers.yml"
-    - "CODEOWNERS"
-    - "**/CODEOWNERS"
-    # Dependency manifests and lockfiles, incl. dev deps.
-    - "package.json"
-    - "**/package.json"
-    - "package-lock.json"
-    - "**/package-lock.json"
-    - "npm-shrinkwrap.json"
-    - "pnpm-lock.yaml"
-    - "yarn.lock"
-    # Build tools, type/test/build config, and install/build scripts.
-    - "ci.yml"
-    - "tsconfig.json"
-    - "tsconfig.build.json"
-    - "**/tsconfig*.json"
-    - "vitest.config.ts"
-    - ".npmrc"
-    - "scripts/**"
-    # Published CLI entrypoint: loads the built worker and executes the
-    # scan code with a caller-supplied token.
-    - "bin/**"
-    # Auth/session/crypto/secrets surfaces.
-    - "src/github-app.ts"     # GitHub App RS256 JWT + installation tokens
-    - "src/config.ts"         # secret-ref bindings + auth config parsing
-    - ".env*"
-    # Network boundary: all outbound GitHub API access.
-    - "src/github.ts"
-    # Untrusted GitHub content handling and cross-system writes.
-    - "src/mapping.ts"        # parses/sanitizes untrusted upstream text+URLs
-    - "src/items.ts"          # issue/PR/discussion ingest -> card writes/wakes
-    - "src/releases.ts"       # release ingest -> card creation
-    - "src/audit.ts"          # audit flags driven by untrusted upstream data
-    - "src/dryrun.ts"         # runs scan code with caller-supplied token/state
-    # Review-policy enforcement module (stamps review stages onto cards).
-    - "src/review-guard.ts"
-    # Capability/permission boundary and host-facing surfaces.
-    - "src/manifest.ts"       # declared plugin capabilities (issues.update, …)
-    - "src/plugin.ts"         # job/event/data registration
-    - "src/index.ts"          # public package entrypoint (re-exports auth)
-    - "src/worker.ts"         # worker entrypoint
-    - "src/ui/**"             # renders untrusted upstream titles in host UI
+# Runtime tier lists (the plugin's read-only copy of the policy above —
+# classifying a path lower here than the policy allows requires the
+# Security Engineer approval in rule 4):
+low:
+  - "**/*.md"
+  - "LICENSE"
+ordinary:
+  - "src/ui/**"
+  - "src/*.test.ts"
+  - "bin/**"
+sensitive:
+  - "src/review-guard.ts"
+  - "src/review-tiers.ts"
+  - "src/config.ts"
+  - "src/manifest.ts"
+  - "src/github*.ts"
+  - "src/*scan*.ts"
+  - ".github/**"
+  - "package*.json"
+  - "scripts/**"
