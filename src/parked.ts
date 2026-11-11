@@ -116,7 +116,9 @@ import { stateKey } from "./state.js";
  * - Disabled housekeeping (missed-unpark fix): the `disabled` return
  *   is NOT state-free. While `parkedPropagationEnabled` is off, the
  *   handler still reads the root and, when the root is no longer
- *   parked, closes its window (and drops its pending entries) — with
+ *   parked or its (status:kind) no longer matches the window's
+ *   transition (a kind change is a new park on the enabled path),
+ *   closes its window (and drops its pending entries) — with
  *   no wakes and no comments. Without this, an unpark + re-park at
  *   the same `(status:kind)` while disabled left the old window (and
  *   its `woken` set) in place, and the re-park after re-enabling
@@ -740,7 +742,19 @@ export async function handleParkedEvent(
       // unknown, so keep the window (under-waking, never spurious).
       return { status: "disabled" };
     }
-    if (root && isParkedRoot(root)) return { status: "disabled" };
+    const parked = root ? isParkedRoot(root) : null;
+    // A still-parked root keeps its window UNLESS its (status:kind) no
+    // longer matches the window's transition: a kind change is a new
+    // park under the enabled path (backlog -> cancelled opens a fresh
+    // window there), so the stale window is closed here as
+    // housekeeping only. Without this, backlog -> cancelled -> backlog
+    // while disabled would reuse the old backlog window on re-enable
+    // and skip wakes for the genuinely new park (Devin review on
+    // PR #16). Same (status:kind) keeps the ordinary-edit no-re-wake
+    // invariant untouched.
+    if (parked && state.windows[rootId]!.transition.startsWith(`${root!.status}:${parked.kind}@`)) {
+      return { status: "disabled" };
+    }
     const base = cloneParkedState(state);
     delete state.windows[rootId];
     state.pending = state.pending.filter((p) => p.rootId !== rootId);

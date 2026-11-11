@@ -575,6 +575,45 @@ describe("parked-blocker propagation (event path)", () => {
     expect(comments).toHaveLength(4);
   });
 
+  it("wakes again after a backlog -> cancelled -> backlog round-trip while disabled", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Disable, then backlog -> cancelled -> backlog while disabled (no
+    // unpark). The kind-change event while disabled must close the stale
+    // backlog window (housekeeping only, no wake), so the return to
+    // backlog is not mistaken for the same continuous park on re-enable.
+    harness.setConfig({ parkedPropagationEnabled: false });
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "cancelled" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "backlog" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    harness.setConfig({ parkedPropagationEnabled: true });
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(2);
+    const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(2);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-delivered"))).toHaveLength(2);
+  });
+
   it("does not re-wake on an ordinary edit across a disable/enable cycle while continuously parked", async () => {
     const harness = await setup();
     const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
