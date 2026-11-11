@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
-import manifest, { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
+import manifest, { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY, REVIEW_GUARD_JOB_KEY } from "./manifest.js";
 import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
 import { runItemScan } from "./items.js";
@@ -41,12 +41,14 @@ describe("plugin wiring", () => {
         "issue.subtree.read",
         "issues.create",
         "issues.update",
+        "issue.comments.create",
         "issues.wakeup",
         "jobs.schedule",
         "http.outbound",
         "secrets.read-ref",
         "plugin.state.read",
         "plugin.state.write",
+        "events.subscribe",
         "ui.page.register",
       ]),
     );
@@ -54,8 +56,13 @@ describe("plugin wiring", () => {
     expect(jobs[RELEASE_JOB_KEY]).toBe("*/10 * * * *");
     expect(jobs[ITEM_JOB_KEY]).toBe("*/15 * * * *");
     expect(jobs[AUDIT_JOB_KEY]).toBe("11 * * * *");
+    expect(jobs[REVIEW_GUARD_JOB_KEY]).toBe("*/15 * * * *");
     for (const key of [
       "tokenSecretRef",
+      "reviewGuardEnabled",
+      "reviewGuardDryRun",
+      "defaultReviewAgentIds",
+      "reviewAgentIdsByProjectId",
       "appId",
       "installationId",
       "appPrivateKeySecretRef",

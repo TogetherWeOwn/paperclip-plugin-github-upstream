@@ -5,6 +5,7 @@ export const PLUGIN_VERSION = "0.1.0";
 export const RELEASE_JOB_KEY = "release-scan";
 export const ITEM_JOB_KEY = "item-scan";
 export const AUDIT_JOB_KEY = "audit-scan";
+export const REVIEW_GUARD_JOB_KEY = "review-guard-scan";
 
 /** Origin kinds written by this plugin. The IssuesList page filters on the shared prefix. */
 export const ORIGIN_KIND_PREFIX = "plugin:togetherweown.github-upstream:";
@@ -17,7 +18,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "GitHub Upstream",
   description:
-    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card for each new tag after the install baseline, and ETag-tracked issue/PR/discussion polls wake the owning follow-through card on real change.",
+    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card for each new tag after the install baseline, and ETag-tracked issue/PR/discussion polls wake the owning follow-through card on real change. Subscribes to issue create/update events and sweeps `in_review` to stamp default review stages onto code cards that would otherwise wait with no reviewer (TWO-5794).",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -26,12 +27,14 @@ const manifest: PaperclipPluginManifestV1 = {
     "issue.subtree.read",
     "issues.create",
     "issues.update",
+    "issue.comments.create",
     "issues.wakeup",
     "jobs.schedule",
     "http.outbound",
     "secrets.read-ref",
     "plugin.state.read",
     "plugin.state.write",
+    "events.subscribe",
     "ui.page.register",
   ],
   entrypoints: {
@@ -63,6 +66,13 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Scan tracked upstream items",
       description:
         "ETag-conditional GETs for each tracked upstream issue/PR/discussion. On a real change (updated_at, comment/review count, check conclusion, head SHA, state/merged) the owning card is woken with a deterministic one-line reason. Our own comments and pushes sync labels/headers but never wake.",
+      schedule: "*/15 * * * *",
+    },
+    {
+      jobKey: REVIEW_GUARD_JOB_KEY,
+      displayName: "Sweep in-review cards for a live reviewer stage",
+      description:
+        "Backstop for the review-guard event subscription: lists every `in_review` card and stamps the configured default review stages (plus an audit comment) onto any code card (bound to a project workspace) that has none. Event subscriptions handle new cards immediately; the sweep catches missed events and pre-install cards.",
       schedule: "*/15 * * * *",
     },
     {
@@ -187,6 +197,31 @@ const manifest: PaperclipPluginManifestV1 = {
         default: {},
         description:
           "Paperclip label IDs keyed by label name. The plugin has no labels read API, so only names present here can be kept in sync (gh:repo/*, gh:type/*, gh:state/*, gh:ci/*).",
+      },
+      reviewGuardEnabled: {
+        type: "boolean",
+        default: false,
+        description:
+          "Review-guard (TWO-5794): stamp the configured default review stages onto code cards (bound to a project workspace) that reach in_review, or are created as code work, without a live reviewer stage. Off by default.",
+      },
+      reviewGuardDryRun: {
+        type: "boolean",
+        default: false,
+        description: "Review-guard dry-run: log intended review-policy stamps and audit comments without making them.",
+      },
+      defaultReviewAgentIds: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description:
+          "Review-guard: default reviewer stage participants (agent IDs, in stage order — e.g. Security then QA). Empty means the guard never writes that company's cards: it never invents a reviewer.",
+      },
+      reviewAgentIdsByProjectId: {
+        type: "object",
+        additionalProperties: { type: "array", items: { type: "string" } },
+        default: {},
+        description:
+          "Review-guard: per-project reviewer stage overrides, keyed by project ID. A project entry wins over defaultReviewAgentIds for that project's cards.",
       },
       dryRun: {
         type: "boolean",

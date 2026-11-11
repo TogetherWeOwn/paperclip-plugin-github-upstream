@@ -3,8 +3,9 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveConfig } from "./config.js";
 import { runAuditScan } from "./audit.js";
 import { runItemScan, type ItemMap } from "./items.js";
-import { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY } from "./manifest.js";
+import { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY, REVIEW_GUARD_JOB_KEY } from "./manifest.js";
 import { runReleaseScan } from "./releases.js";
+import { handleReviewEvent, runReviewGuardSweep } from "./review-guard.js";
 import { recordRunStats, stateKey, type RunStats } from "./state.js";
 import { EMPTY_SUMMARY, SUMMARY_DATA_KEY, summarizeItems } from "./summary.js";
 
@@ -18,6 +19,17 @@ const plugin = definePlugin({
     });
     ctx.jobs.register(AUDIT_JOB_KEY, async () => {
       await scanAll(ctx, "audit");
+    });
+    // Review-guard (TWO-5794): the events path stamps new code cards
+    // without a live reviewer stage immediately; the sweep is the backstop.
+    ctx.jobs.register(REVIEW_GUARD_JOB_KEY, async () => {
+      await sweepReviewGuard(ctx);
+    });
+    ctx.events.on("issue.created", async (event) => {
+      await handleReviewEvent(ctx, event);
+    });
+    ctx.events.on("issue.updated", async (event) => {
+      await handleReviewEvent(ctx, event);
     });
     ctx.data.register(SUMMARY_DATA_KEY, async (params) => {
       const companyId = typeof params.companyId === "string" ? params.companyId : "";
@@ -60,6 +72,27 @@ async function scanAll(ctx: PluginContext, job: "release" | "items" | "audit"): 
       });
     } catch (err) {
       ctx.logger.error("github-upstream scan failed", { companyId: company.id, job, error: String(err) });
+    }
+  }
+}
+
+async function sweepReviewGuard(ctx: PluginContext): Promise<void> {
+  // No plugin-state RunStats for the sweep: it is not a GitHub sync, and its
+  // cost model (a list page + at most a few writes) does not fit the
+  // GitHub-run counters. The `review-guard.applied` state record and the
+  // per-sweep log line are the audit trail.
+  const companies = await ctx.companies.list();
+  for (const company of companies) {
+    try {
+      const raw = await ctx.config.get(company.id);
+      // Fail closed, same as the scans: no config row, no writes.
+      if (!raw || Object.keys(raw).length === 0) {
+        ctx.logger.info("review-guard sweep skipped: no plugin config for company", { companyId: company.id });
+        continue;
+      }
+      await runReviewGuardSweep(ctx, company.id, resolveConfig(raw));
+    } catch (err) {
+      ctx.logger.error("review-guard sweep failed", { companyId: company.id, error: String(err) });
     }
   }
 }

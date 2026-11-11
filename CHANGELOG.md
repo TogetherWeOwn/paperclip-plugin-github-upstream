@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Review-guard (TWO-5794): a new `review-guard-scan` job plus `issue.created` / `issue.updated` event subscriptions stamp the configured default review stages (Security then QA by default, per-project override supported) onto any code card (bound to a project workspace) that reaches `in_review` — or is created as code work — without a live reviewer stage, with an audit comment each time. Cards with stages or `auto` mode are never touched; the guard is off by default and inert until reviewer agent IDs are configured, and `reviewGuardDryRun` logs intentions without writing. New capabilities: `events.subscribe`, `issue.comments.create`.
+
 - Track follow-through owners one program level below the tracker, sharing the same owner set with audit and discovery to avoid duplicates. Explicit item origins stay authoritative when ordinary subtasks exist; only identity-bearing children identify a program without an item origin. Gate titles use a delimiter-aware match in both ownership and audit, so “gateway” items remain owners and cannot count as gate approvals. Nested owners' gates remain valid audit evidence.
 - Rebind cached item ownership and initialize the new owner's origin/header/labels even on an unchanged upstream response, without an ownership-only wake. Dry runs leave the live ownership repair unconsumed.
 - Clarify the mapping contract: an unquoted GitHub URL in the description (or an existing plugin origin) identifies an item. Remove the work-product-only fallback, which could not work with the host's raw subtree issue rows. Add a description link to work-product-only cards before relying on plugin tracking.

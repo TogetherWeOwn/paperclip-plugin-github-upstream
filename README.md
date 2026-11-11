@@ -2,13 +2,14 @@
 
 A [Paperclip](https://github.com/paperclipai/paperclip) plugin that notices upstream GitHub changes **deterministically, with zero LLM calls**, and only then creates or wakes a Paperclip card. It exists so follow-through work on upstream PRs/issues/discussions and release intake happens because the upstream changed, not because an agent went polling.
 
-Three scheduled jobs do all the noticing:
+Four scheduled jobs do all the noticing:
 
 | job | schedule | what it does |
 |---|---|---|
 | `release-scan` | `*/10 * * * *` | `GET /repos/{owner}/{repo}/releases/latest` with `If-None-Match` per configured repo. A `304` means do nothing; a new tag creates exactly one release-intake card (`originKind: plugin:togetherweown.github-upstream:release`, `originId: {owner}/{repo}@{tag}`). |
 | `item-scan` | `*/15 * * * *` | ETag-conditional `GET`s for every tracked upstream issue/PR (`issues/{n}`, plus `pulls/{n}`, `pulls/{n}/reviews` and `commits/{head}/check-runs` while checks are pending) and one GraphQL query per tracked discussion. On a real change the owning follow-through card is woken with a deterministic one-line reason and idempotency key `upstream:{owner}/{repo}#{n}:{fingerprint}`. |
 | `audit-scan` | `11 * * * *` | Hourly upstream-gate audit (see below): deterministic search for recent upstream posts by our account, flagging any post with no approved gate card. This is an audit trail, not a block. |
+| `review-guard-scan` | `*/15 * * * *` | Review-guard backstop: every `in_review` card is checked for a live reviewer stage, and code cards without one are stamped via `issues.update` with an audit comment. The `issue.created`/`issue.updated` event subscriptions handle new cards immediately; the sweep catches missed events and pre-install cards. |
 
 A real change is one of: `updated_at`, comment count, review count, latest review state, check conclusion, head SHA, `state`/`merged`, draft flag. Labels (`gh:repo/*`, `gh:type/*`, `gh:state/*`, `gh:ci/*`, `gh:awaiting/*`) and a `<!-- github-upstream: … -->` description header are synced on change.
 
@@ -50,6 +51,15 @@ Known, accepted gaps: the plugin SDK exposes no execution-decision reads, so v1 
 
 Every REST read is ETag-conditional: unchanged answers are `304`s that cost no quota. Check-run reads stop once checks settle. Search has no `304` path, so the audit makes a bounded set of search calls per run (orgs × logins × 4, plus one GraphQL discussion search each) and ETag-conditional per-item reads after that. The plugin honors `X-RateLimit-Remaining`/`Retry-After`, backs off into plugin state, and records per-run `200`/`304` counts so the operator can see the sync costs nearly nothing. It never calls the CLIProxy management API (the HTTP layer only allows `api.github.com`).
 
+## Review-guard (no `in_review` card without a reviewer)
+
+There is no project/company default `executionPolicy` in Paperclip: a code card created without review stages sits in `in_review` with no reviewer, and at 2026-11-11 00:05Z that held for 17 of 114 `in_review` cards. The review-guard closes that gap deterministically, with zero LLM calls, at two speeds:
+
+- **Events (immediate):** the plugin subscribes to `issue.created` and `issue.updated` (`events.subscribe`). A card bound to a project workspace (a repo) that is created or updated with no live reviewer stage is stamped via `issues.update` (`executionPolicy`: `normal` mode, one `review` stage per configured reviewer agent, in order) and gets an audit comment: `Default review policy applied by review-guard: …`. Cards created as code work are stamped at creation, so the policy is already present when they reach `in_review`.
+- **Sweep (backstop):** `review-guard-scan` every 15 minutes lists `in_review` cards and stamps any code card still missing stages — covering missed events and cards that predate the install. Idempotence is structural: a card with stages (or `auto` mode, an explicit opt-out) is never touched, so the guard's own `issues.update` re-event is a no-op, and the `review-guard.applied` state record dedupes the audit comment across event/sweep races.
+
+The guard is off by default and fails closed without reviewer configuration: it never invents a reviewer. To enable at install, set `reviewGuardEnabled: true`, `defaultReviewAgentIds: [<Security agent ID>, <QA agent ID>]`, and optionally `reviewAgentIdsByProjectId` for per-project chains; turn on `reviewGuardDryRun` first to watch the logs. This is a plugin-tier fix (stock SDK, no core patch): the stock SDK's `issues.update` wire protocol freezes the patch as `Record<string, unknown>` and the host `updateIssueSchema` accepts `executionPolicy` (only `createdByUserId`/`responsibleUserId`/`watchdog` are omitted from the create base), while the SDK's typed `Pick<Issue, …>` is a creator-subset — the single cast is cited in `src/review-guard.ts`.
+
 ## Authentication
 
 Exactly one auth mode must be configured; anything else fails the scan closed (no anonymous reads, ever):
@@ -78,6 +88,10 @@ Exactly one auth mode must be configured; anything else fails the scan closed (n
 | `compareBases` | `{}` | Per-repo compare base for release cards, keyed by `owner/repo`. A first-seen tag equal to the base is the install baseline: recorded, never carded. Set it to the running versions at install so the first tick creates no intake cards. |
 | `labelIdByName` | `{}` | Paperclip label IDs keyed by name. Only names present here can be synced (there is no labels read API). Include the `gh:awaiting/us` and `gh:awaiting/maintainer` IDs for the awaiting facet and the GitHub-tab metric counts to stay in sync, plus the `upstream:ungated` ID or the audit cannot label follow-through cards. |
 | `dryRun` | `false` | Log intended creates/wakes/updates without making them. |
+| `reviewGuardEnabled` | `false` | Review-guard: stamp default review stages onto code cards reaching `in_review` (or created as code work) without a live reviewer. Off by default. |
+| `reviewGuardDryRun` | `false` | Review-guard dry-run: log intended stamps and audit comments without making them. |
+| `defaultReviewAgentIds` | `[]` | Review-guard: default reviewer stage participants (agent IDs, in stage order, e.g. Security then QA). Empty means the guard never writes that company's cards. |
+| `reviewAgentIdsByProjectId` | `{}` | Review-guard: per-project reviewer stage overrides, keyed by project ID; a project entry wins over `defaultReviewAgentIds`. |
 | `auditLogins` | `["Rick7C2"]` | GitHub logins the audit watches. `operatorLogin` and `ourLogins` are always included; append the App's bot login here (or to `ourLogins`). |
 | `auditOrgs` | `["router-for-me", "paperclipai"]` | Upstream orgs the audit searches per watched login. |
 | `auditRepos` | `[]` | Extra upstream repos (`owner/repo`) searched outside the audit orgs. |
@@ -87,7 +101,7 @@ Exactly one auth mode must be configured; anything else fails the scan closed (n
 
 ## Capabilities
 
-`companies.read`, `issues.read`, `issue.subtree.read`, `issues.create`, `issues.update`, `issues.wakeup`, `jobs.schedule`, `http.outbound`, `secrets.read-ref`, `plugin.state.read`, `plugin.state.write`, `ui.page.register`.
+`companies.read`, `issues.read`, `issue.subtree.read`, `issues.create`, `issues.update`, `issue.comments.create`, `issues.wakeup`, `jobs.schedule`, `http.outbound`, `secrets.read-ref`, `plugin.state.read`, `plugin.state.write`, `events.subscribe`, `ui.page.register`.
 
 ## Dry run
 
