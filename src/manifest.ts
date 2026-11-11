@@ -20,7 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "GitHub Upstream",
   description:
-    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card per new tag, and tracked issue/PR/discussion polls wake the owning card on real change. Also: review-guard stamps tier-appropriate review stages (QA always; Security for sensitive per .github/review-tiers.yml) on code cards reaching in_review (TWO-5794, TWO-5879), and parked-blocker propagation wakes blocked dependents of a freshly parked root (TWO-5818).",
+    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card per new tag, and tracked issue/PR/discussion polls wake the owning card on real change. Also: review-guard stamps tier-appropriate review stages (QA always; Security for sensitive, including low/ordinary paths while content triggers cannot be ruled out) on code cards reaching in_review (TWO-5794, TWO-5879), and parked-blocker propagation wakes blocked dependents of a freshly parked root (TWO-5818).",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -106,7 +106,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: REVIEW_GUARD_JOB_KEY,
       displayName: "Sweep in-review cards for a live reviewer stage",
       description:
-        "Backstop for the review-guard event subscription: lists every `in_review` card and stamps tier-appropriate review stages (QA on every change; Security added for sensitive or unclassified changes per .github/review-tiers.yml) plus an audit comment onto any code card (bound to a project workspace) that has none, upgrading QA-only cards when a newer head adds sensitive paths. Event subscriptions handle new cards immediately; the sweep catches missed events and pre-install cards.",
+        "Backstop for the review-guard event subscription: lists every `in_review` card and stamps tier-appropriate review stages (QA on every change; Security added for sensitive or unclassified changes; low/ordinary paths currently fail closed to sensitive because content triggers cannot be ruled out) plus an audit comment onto any code card (bound to a project workspace) that has none, upgrading QA-only cards when a newer head adds sensitive paths. Event subscriptions handle new cards immediately; the sweep catches missed events and pre-install cards.",
       schedule: "*/15 * * * *",
     },
     {
@@ -243,7 +243,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         default: false,
         description:
-          "Review-guard (TWO-5794, TWO-5879): stamp tier-appropriate review stages onto code cards (bound to a project workspace) that reach in_review, or are created as code work, without a live reviewer stage. QA runs on every change; Security is added for sensitive or unclassified changes per each repo's .github/review-tiers.yml (missing map, unreadable diff, or unmatched path fails closed to Sensitive). A pending stage is upgraded when a newer head adds sensitive paths and never downgraded. Off by default.",
+          "Review-guard (TWO-5794, TWO-5879): stamp tier-appropriate review stages onto code cards (bound to a project workspace) that reach in_review, or are created as code work, without a live reviewer stage. QA runs on every change; Security is added for sensitive or unclassified changes; low/ordinary paths currently fail closed to Sensitive because content triggers cannot be ruled out. A missing map, unreadable diff, or unmatched path also fails closed. A pending stage is upgraded when a newer head requires Security and never downgraded. Off by default.",
       },
       reviewGuardDryRun: {
         type: "boolean",
@@ -283,7 +283,7 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         default: [],
         description:
-          "Review-guard (TWO-5879): Security reviewer stage participants, added only for Sensitive/unknown tiers (Security then QA). When set, wins over the legacy chain's positional split; when empty, that split applies. With no usable Security reviewer a Sensitive card fails closed instead of downgrading to QA-only.",
+          "Review-guard (TWO-5879): Security reviewer stage participants, added for Sensitive/unknown tiers (Security then QA); low/ordinary paths currently fail closed to Sensitive because content triggers cannot be ruled out. When set, wins over the legacy chain's positional split; when empty, that split applies. With no usable Security reviewer a Sensitive card fails closed instead of downgrading to QA-only.",
       },
       reviewSecurityAgentIdsByProjectId: {
         type: "object",
