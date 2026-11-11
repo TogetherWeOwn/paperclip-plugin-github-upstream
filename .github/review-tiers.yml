@@ -61,12 +61,12 @@ tiers:
     - "CHANGELOG.md"
     - "LICENSE"
     # Additive unit tests only (weakened/deleted tests, lowered gates or
-    # assertion changes escalate to sensitive per rule 2).
+    # assertion changes escalate to sensitive per rule 2). Repo tests live
+    # in src/ only; a future tests/ or test/ top-level tree is unclassified
+    # => sensitive until explicitly mapped here.
     - "src/*.test.ts"
     - "src/**/*.test.ts"
     - "src/**/*.test.tsx"
-    - "tests/**"
-    - "test/**"
 
   ordinary:
     # Audited modules only (justified in the bootstrap PR body):
