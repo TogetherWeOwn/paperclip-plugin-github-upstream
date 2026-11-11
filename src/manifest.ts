@@ -7,6 +7,7 @@ export const ITEM_JOB_KEY = "item-scan";
 export const AUDIT_JOB_KEY = "audit-scan";
 export const REVIEW_GUARD_JOB_KEY = "review-guard-scan";
 export const PARKED_JOB_KEY = "parked-propagation-scan";
+export const DEFER_TOOL_NAME = "defer_blocked_card";
 
 /** Origin kinds written by this plugin. The IssuesList page filters on the shared prefix. */
 export const ORIGIN_KIND_PREFIX = "plugin:togetherweown.github-upstream:";
@@ -36,6 +37,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "plugin.state.read",
     "plugin.state.write",
     "events.subscribe",
+    "agent.tools.register",
     "ui.page.register",
     "project.workspaces.read",
     "execution.workspaces.read",
@@ -59,6 +61,32 @@ const manifest: PaperclipPluginManifestV1 = {
       },
     ],
   },
+  tools: [
+    {
+      name: DEFER_TOOL_NAME,
+      displayName: "Defer blocked card",
+      description:
+        "Move one blocked Paperclip card to backlog under plugin authority (status-only blocked -> backlog), for an already-decided deferral the native resume guard blocks. Requires a done decision card naming the target. Refuses terminal cards and cards with a pending review stage. Idempotent.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          targetIssueId: {
+            type: "string",
+            description: "UUID of the blocked card to defer.",
+          },
+          decisionIssueId: {
+            type: "string",
+            description: "UUID of the done decision card that names the target card and records the defer decision.",
+          },
+          revisitTrigger: {
+            type: "string",
+            description: "Observable revisit event or UTC date that reopens this deferral.",
+          },
+        },
+        required: ["targetIssueId", "decisionIssueId", "revisitTrigger"],
+      },
+    },
+  ],
   jobs: [
     {
       jobKey: RELEASE_JOB_KEY,

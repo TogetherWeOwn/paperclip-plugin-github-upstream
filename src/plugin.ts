@@ -1,6 +1,7 @@
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveConfig } from "./config.js";
+import { registerDeferTool } from "./defer.js";
 import { runAuditScan } from "./audit.js";
 import { runItemScan, type ItemMap } from "./items.js";
 import { AUDIT_JOB_KEY, ITEM_JOB_KEY, PARKED_JOB_KEY, RELEASE_JOB_KEY, REVIEW_GUARD_JOB_KEY } from "./manifest.js";
@@ -44,6 +45,7 @@ const plugin = definePlugin({
     deliveredCompanyIds.add(companyId);
   },
   async setup(ctx: PluginContext) {
+    registerDeferTool(ctx);
     ctx.jobs.register(RELEASE_JOB_KEY, async () => {
       await scanAll(ctx, "release");
     });
