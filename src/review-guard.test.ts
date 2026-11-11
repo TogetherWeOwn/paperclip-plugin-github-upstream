@@ -247,6 +247,67 @@ describe("review-guard events (real SDK contract)", () => {
     expect(outcome).toEqual({ applied: false, reason: "no-eligible-reviewers" });
   });
 
+  it("retries and deduplicates withheld-staffing audits, then audits a successful stamp", async () => {
+    const harness = await setup();
+    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+    const updates = spyUpdates(harness);
+    const bodies: string[] = [];
+    let attempts = 0;
+    const original = harness.ctx.issues.createComment.bind(harness.ctx.issues);
+    harness.ctx.issues.createComment = (async (...args: Parameters<typeof original>) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("comment failed");
+      bodies.push(String(args[1]));
+      return original(...args);
+    }) as typeof harness.ctx.issues.createComment;
+    const config = resolveConfig(GUARD_CONFIG);
+    await expect(ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config)).rejects.toThrow("comment failed");
+    await ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config);
+    await ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain("withheld review staffing");
+    expect(updates).toHaveLength(0);
+    await ensureReviewPolicy(harness.ctx, COMPANY, { ...issue, assigneeAgentId: EXTRA } as never, config);
+    expect(updates).toHaveLength(1);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toContain("Default review policy applied");
+  });
+
+  it("audits a manually added QA stage after staffing was withheld", async () => {
+    const harness = await setup();
+    const comments = spyComments(harness);
+    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+    const config = resolveConfig(GUARD_CONFIG);
+    await ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config);
+    const withQa = { ...issue, executionPolicy: buildReviewPolicy([QA]) };
+    await ensureReviewPolicy(harness.ctx, COMPANY, withQa as never, config);
+    await ensureReviewPolicy(harness.ctx, COMPANY, withQa as never, config);
+    expect(comments).toHaveLength(2);
+    expect(comments[0].body).toContain("withheld review staffing");
+    expect(comments[1].body).toContain("no eligible Security reviewer stage");
+  });
+
+  it("audits unconfigured staffing once", async () => {
+    const harness = await setup({ reviewGuardEnabled: true });
+    const comments = spyComments(harness);
+    const issue = seedIssue(harness);
+    const config = resolveConfig({ reviewGuardEnabled: true });
+    expect(await ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config)).toEqual({ applied: false, reason: "unconfigured" });
+    await ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("withheld review staffing");
+  });
+
+  it.each(["dryRun", "reviewGuardDryRun"])("does not audit withheld staffing in %s", async (flag) => {
+    const harness = await setup();
+    const comments = spyComments(harness);
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+    await ensureReviewPolicy(harness.ctx, COMPANY, issue as never, resolveConfig({ ...GUARD_CONFIG, [flag]: true }));
+    expect(comments).toHaveLength(0);
+    expect(updates).toHaveLength(0);
+  });
+
   it("also excludes the return assignee", async () => {
     const harness = await setup();
     const updates = spyUpdates(harness);

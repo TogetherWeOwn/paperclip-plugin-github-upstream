@@ -68,9 +68,9 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
       current = null;
       inTiers = false;
-      if (/^version:\s*1\s*(?:#.*)?$/.test(raw) && !versionSeen) versionSeen = true;
-      else if (/^default_tier:\s*sensitive\s*(?:#.*)?$/.test(raw) && !defaultSeen) defaultSeen = true;
-      else if (/^tiers:\s*(?:#.*)?$/.test(raw) && !tiersSeen) { tiersSeen = true; inTiers = true; }
+      if (/^version:\s*1\s*$/.test(raw) && !versionSeen) versionSeen = true;
+      else if (/^default_tier:\s*sensitive\s*$/.test(raw) && !defaultSeen) defaultSeen = true;
+      else if (/^tiers:\s*$/.test(raw) && !tiersSeen) { tiersSeen = true; inTiers = true; }
       else throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       continue;
     }
@@ -170,7 +170,8 @@ function dequote(value: string): string {
   }
   if (/^"[^"\\]*"$/.test(v) || /^'[^'\\]*'$/.test(v)) return v.slice(1, -1);
   // Accept only a deliberately small, unambiguous YAML plain-scalar subset.
-  if (!/^[A-Za-z0-9_.][A-Za-z0-9_./*?-]*$/.test(v) || /^(null|true|false|~|[0-9]+)$/i.test(v)) {
+  const yamlNumber = /^(?:0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*(?:\.[0-9_]*)?(?:e[-+]?[0-9]+)?|\.[0-9_]+(?:e[-+]?[0-9]+)?|\.(?:inf|nan))$/i;
+  if (!/^[A-Za-z0-9_.][A-Za-z0-9_./*?-]*$/.test(v) || /^(null|true|false|yes|no|on|off|~)$/i.test(v) || yamlNumber.test(v)) {
     throw new Error(`invalid tier map: ambiguous scalar ${JSON.stringify(value)}`);
   }
   return v;

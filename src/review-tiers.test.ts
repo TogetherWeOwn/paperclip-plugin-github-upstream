@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +29,23 @@ tiers:
     - "src/auth/**"
 `)).toEqual({ low: ["docs/**"], ordinary: [], sensitive: ["src/auth/**"] });
     expect(parseReviewTierMap("version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n")).toEqual({ low: [], ordinary: [], sensitive: [] });
+  });
+
+  it("validates v1 headers and requires the default even for empty tiers", () => {
+    const valid = "version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n";
+    expect(() => parseReviewTierMap(valid.replace("version: 1", "version: 1#not-v1"))).toThrow();
+    expect(() => parseReviewTierMap(valid.replace("sensitive\ntiers", "sensitive#x\ntiers"))).toThrow();
+    expect(() => parseReviewTierMap(valid.replace("default_tier: sensitive\n", ""))).toThrow(/incomplete v1/);
+    expect(parseReviewTierMap(valid.replace("version: 1", "version: 1 # version").replace("default_tier: sensitive", "default_tier: sensitive # default").replace("tiers:", "tiers: # lists"))).toEqual({ low: [], ordinary: [], sensitive: [] });
+  });
+
+  it("rejects numeric plain scalars but accepts quoted names and globs", () => {
+    for (const scalar of ["1", "1.5", "0x10", "0o10", "0b10", ".inf", ".nan", "1e3"]) {
+      for (const list of [`[${scalar}]`, `\n    - ${scalar}`]) {
+        expect(() => parseReviewTierMap(`version: 1\ndefault_tier: sensitive\ntiers:\n  low: ${list}\n  ordinary: []\n  sensitive: []\n`)).toThrow(/ambiguous scalar/);
+      }
+    }
+    expect(parseReviewTierMap('version: 1\ndefault_tier: sensitive\ntiers:\n  low: ["1.5", "0x10", 1*.md, docs/**]\n  ordinary: []\n  sensitive: []\n').low).toEqual(["1.5", "0x10", "1*.md", "docs/**"]);
   });
 
   it("accepts comments on v1 block keys and quoted items", () => {
@@ -227,10 +244,18 @@ describe("resolveReviewTier (real git checkout)", () => {
       const harness = newHarness();
       const issue = { id: "i-1", companyId: COMPANY, projectId: PROJECT, projectWorkspaceId: WORKSPACE, status: "in_review" };
       commitFile(repo, "README.md", contents);
-      expect((await tierForIssue(harness, issue, repo)).tier).toBe("sensitive");
+      const low = await tierForIssue(harness, issue, repo);
+      expect(low.tier).toBe("sensitive");
+      expect(low.changedPaths).toEqual(["README.md"]);
+      expect(low.reason).toContain("content triggers not established absent (path tier low)");
+      expect(low.headSha).toBe(git(repo, ["rev-parse", "HEAD"]).trim());
       git(repo, ["reset", "--hard", "main"]);
       commitFile(repo, "src/ui/change.ts", contents);
-      expect((await tierForIssue(harness, issue, repo)).tier).toBe("sensitive");
+      const ordinary = await tierForIssue(harness, issue, repo);
+      expect(ordinary.tier).toBe("sensitive");
+      expect(ordinary.changedPaths).toEqual(["src/ui/change.ts"]);
+      expect(ordinary.reason).toContain("content triggers not established absent (path tier ordinary)");
+      expect(ordinary.headSha).toBe(git(repo, ["rev-parse", "HEAD"]).trim());
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -309,10 +334,38 @@ describe("resolveReviewTier (real git checkout)", () => {
       git(repo, ["config", "core.fsmonitor", hook]);
       const result = await tierForIssue(harness, issue, repo);
       expect(result.tier).toBe("sensitive");
+      expect(result.changedPaths).toEqual(["README.md"]);
+      expect(result.reason).toContain("content triggers not established absent (path tier low)");
+      expect(result.headSha).toMatch(/^[0-9a-f]{40}$/);
       expect(existsSync(marker)).toBe(false);
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(hookDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when HEAD becomes unreadable after path discovery", async () => {
+    const repo = makeRepo(true);
+    const bin = mkdtempSync(join(tmpdir(), "review-git-wrapper-"));
+    const previousPath = process.env.PATH;
+    try {
+      commitFile(repo, "README.md", "# docs\n");
+      const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+      const log = join(bin, "calls");
+      const wrapper = join(bin, "git");
+      writeFileSync(wrapper, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\ncase " $* " in *' rev-parse HEAD '*) exit 1;; esac\nexec '${realGit}' "$@"\n`);
+      chmodSync(wrapper, 0o755);
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const result = await tierForIssue(newHarness(), { id: "i-1", companyId: COMPANY, projectId: PROJECT, projectWorkspaceId: WORKSPACE, status: "in_review" }, repo);
+      expect(result).toEqual({ tier: "sensitive", reason: "fail-closed: unreadable head", changedPaths: [], headSha: null });
+      const calls = readFileSync(log, "utf8");
+      expect(calls).toContain("ls-files --others --exclude-standard");
+      expect(calls).toContain("rev-parse HEAD");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
     }
   });
 
