@@ -60,7 +60,7 @@ sensitive:
     expect(() => parseReviewTierMap("low:\n")).toThrow(/no patterns/);
     expect(() => parseReviewTierMap("")).toThrow(/no patterns/);
     expect(() => parseReviewTierMap("low:\n  - ../escape\n")).toThrow(/unsafe pattern/);
-    expect(() => parseReviewTierMap("low:\n- a\n")).toThrow(/invalid tier map line/);
+    expect(() => parseReviewTierMap("low:\n- a\n")).toThrow(/invalid tier map: no patterns in block list/);
   });
 });
 
