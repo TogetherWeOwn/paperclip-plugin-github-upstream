@@ -86,6 +86,22 @@ function toResult<T>(res: Response, data: T | null, etag: string | null): GitHub
 }
 
 /**
+ * Shim for paperclipai/paperclip#13084. The plugin SDK's worker `http.fetch`
+ * rebuilds the host reply as `new Response(result.body, {status, ...})`, and
+ * the host serializes a 304's empty body as `""`. A non-null body on a
+ * null-body status makes that constructor throw this TypeError, so every
+ * genuine 304 reaches the plugin as an exception. Only this exact failure on a
+ * conditional request is mapped back to not-modified; 204/205, unconditional
+ * requests and every other TypeError still throw. The rebuilt reply's headers
+ * (rate-limit hints) are lost with it.
+ * REMOVE once the installed SDK rebuilds null-body statuses with a null body
+ * (open fix PRs paperclipai/paperclip#13133 / #17282).
+ */
+const SDK_NULL_BODY_304 = /status code 304\b/;
+export const isSdkNullBody304 = (err: unknown): boolean =>
+  err instanceof TypeError && SDK_NULL_BODY_304.test(err.message);
+
+/**
  * ETag-conditional GET. `etag` may be null (unconditional). The token is sent
  * as a Bearer header and never logged. Redirects are refused outright so the
  * `Authorization` header can never follow one. Throws only on network failure
@@ -105,7 +121,13 @@ export async function githubGet<T>(
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (etag) headers["If-None-Match"] = etag;
-  const res = await fetchImpl(url, { method: "GET", headers, redirect: "error" });
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { method: "GET", headers, redirect: "error" });
+  } catch (err) {
+    if (etag && isSdkNullBody304(err)) return toResult<T>(new Response(null, { status: 304 }), null, etag);
+    throw err;
+  }
   if (res.status === 304) return toResult<T>(res, null, etag);
   return toResult<T>(res, await parseJson<T>(res), firstHeader(res.headers, "etag"));
 }
