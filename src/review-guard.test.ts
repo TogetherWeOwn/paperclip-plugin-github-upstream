@@ -86,12 +86,22 @@ describe("review-guard helpers", () => {
     expect(hasLiveReviewStage({ executionPolicy: null })).toBe(false);
     expect(hasLiveReviewStage({ executionPolicy: { mode: "normal", commentRequired: true, stages: [] } })).toBe(false);
     expect(hasLiveReviewStage({ executionPolicy: { mode: "auto", commentRequired: true, stages: [] } })).toBe(true);
+    // A participant-less stage can never be decided, so it is not live.
     expect(
       hasLiveReviewStage({
         executionPolicy: {
           mode: "normal",
           commentRequired: true,
           stages: [{ id: randomUUID(), type: "review", approvalsNeeded: 1, participants: [] }],
+        },
+      }),
+    ).toBe(false);
+    expect(
+      hasLiveReviewStage({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{ id: randomUUID(), type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: SECURITY }] }],
         },
       }),
     ).toBe(true);
@@ -179,6 +189,113 @@ describe("review-guard events (real SDK contract)", () => {
     expect(updates).toHaveLength(0);
   });
 
+  it("never stamps the executor as their own reviewer", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+
+    await emitIssue(harness, "issue.created", issue.id);
+
+    expect(updates).toHaveLength(1);
+    const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([QA]);
+  });
+
+  it("fails closed (no stamp) when the executor is the only configured reviewer", async () => {
+    const harness = await setup({ reviewGuardEnabled: true, defaultReviewAgentIds: [SECURITY] });
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+
+    await emitIssue(harness, "issue.created", issue.id);
+    expect(updates).toHaveLength(0);
+
+    const outcome = await ensureReviewPolicy(
+      harness.ctx,
+      COMPANY,
+      (await harness.ctx.issues.get(issue.id, COMPANY)) as never,
+      resolveConfig({ reviewGuardEnabled: true, defaultReviewAgentIds: [SECURITY] }),
+    );
+    expect(outcome).toEqual({ applied: false, reason: "no-eligible-reviewers" });
+  });
+
+  it("also excludes the return assignee", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, { executionState: { returnAssignee: { type: "agent", agentId: QA } } });
+
+    await emitIssue(harness, "issue.created", issue.id);
+
+    expect(updates).toHaveLength(1);
+    const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY]);
+  });
+
+  it("dedupes duplicate configured reviewers into one stage", async () => {
+    const harness = await setup({ reviewGuardEnabled: true, defaultReviewAgentIds: [QA, QA] });
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness);
+
+    await emitIssue(harness, "issue.created", issue.id);
+
+    expect(updates).toHaveLength(1);
+    const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+    expect(policy.stages).toHaveLength(1);
+  });
+
+  it("skips terminal cards (done/cancelled)", async () => {
+    for (const status of ["done", "cancelled"] as const) {
+      const harness = await setup();
+      const updates = spyUpdates(harness);
+      const comments = spyComments(harness);
+      const issue = seedIssue(harness, { status });
+
+      await emitIssue(harness, "issue.updated", issue.id);
+      expect(updates).toHaveLength(0);
+      expect(comments).toHaveLength(0);
+    }
+  });
+
+  it("stamps a card whose only stage has no participants", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, {
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{ id: randomUUID(), type: "review", approvalsNeeded: 1, participants: [] }],
+      },
+    });
+
+    await emitIssue(harness, "issue.updated", issue.id);
+    expect(updates).toHaveLength(1);
+  });
+
+  it("preserves existing policy fields (e.g. monitor) when stamping", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const monitor = { nextCheckAt: new Date().toISOString(), notes: "keep", scheduledBy: "agent" } as never;
+    const issue = seedIssue(harness, { executionPolicy: { mode: "normal", commentRequired: false, stages: [], monitor } });
+
+    await emitIssue(harness, "issue.created", issue.id);
+
+    expect(updates).toHaveLength(1);
+    const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+    expect(policy.monitor).toEqual(monitor);
+    expect(policy.stages).toHaveLength(2);
+  });
+
+  it("audit comment names the company default when no project override applies", async () => {
+    const harness = await setup();
+    const comments = spyComments(harness);
+    const issue = seedIssue(harness);
+
+    await emitIssue(harness, "issue.created", issue.id);
+
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("company default");
+    expect(comments[0].body).not.toContain("project override");
+  });
+
   it("uses the per-project override when configured", async () => {
     const harness = await setup({
       ...GUARD_CONFIG,
@@ -187,9 +304,12 @@ describe("review-guard events (real SDK contract)", () => {
     const updates = spyUpdates(harness);
     const issue = seedIssue(harness);
 
+    const comments = spyComments(harness);
     await emitIssue(harness, "issue.created", issue.id);
     const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
     expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([EXTRA]);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain(`project override ${PROJECT}`);
   });
 
   it("dry-run writes nothing", async () => {
@@ -299,7 +419,7 @@ describe("review-guard config resolution", () => {
     });
     expect(config.reviewGuardEnabled).toBe(false);
     expect(config.reviewGuardDryRun).toBe(true);
-    expect(config.defaultReviewAgentIds).toEqual([QA, QA]);
+    expect(config.defaultReviewAgentIds).toEqual([QA]);
     expect(config.reviewAgentIdsByProjectId).toEqual({ [PROJECT]: [SECURITY] });
   });
 });

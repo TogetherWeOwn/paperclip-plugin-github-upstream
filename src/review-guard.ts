@@ -26,39 +26,68 @@ import { stateKey } from "./state.js";
  * Idempotence / loop safety: an `issue.updated` caused by the guard's own
  * `issues.update` re-enters the handler, sees a live reviewer stage (or
  * `auto` mode), and returns without writing. The `applied` plugin-state record
- * additionally dedupes the audit comment across event/sweep retries.
+ * additionally dedupes the audit comment across event/sweep retries. v1
+ * limitation (noted, not solved): the record is read-modify-write, so a
+ * concurrent event+sweep pair can both pass the dedupe check and duplicate
+ * one audit comment; the policy write itself is idempotent.
  */
 
 export type ReviewGuardOutcome =
   | { applied: true; stages: number; commented: boolean }
-  | { applied: false; reason: "disabled" | "not-code-card" | "has-stages" | "auto-mode" | "unconfigured" | "dry-run" };
+  | { applied: false; reason: "disabled" | "not-code-card" | "has-stages" | "auto-mode" | "unconfigured" | "dry-run" | "terminal" | "no-eligible-reviewers" };
 
 /** Code work = bound to a project workspace (a repo). Per TWO-5794, workspace presence is the signal. */
 export const isReviewCodeCard = (issue: Pick<Issue, "projectWorkspaceId">): boolean =>
   typeof issue.projectWorkspaceId === "string" && issue.projectWorkspaceId.length > 0;
 
-/** A card already has a live reviewer stage (or an explicit `auto` opt-out) that the guard must not touch. */
+/** A card already has a live reviewer stage (or an explicit `auto` opt-out) that the guard must not touch.
+ *  A stage with no participant carrying an `agentId`/`userId` can never be decided, so it is not live. */
 export const hasLiveReviewStage = (issue: Pick<Issue, "executionPolicy">): boolean => {
   const policy = issue.executionPolicy;
   if (!policy) return false;
   if (policy.mode === "auto") return true;
-  return Array.isArray(policy.stages) && policy.stages.length > 0;
+  return (
+    Array.isArray(policy.stages) &&
+    policy.stages.some((stage) =>
+      stage.participants.some((p) => (typeof p.agentId === "string" && p.agentId.length > 0) || (typeof p.userId === "string" && p.userId.length > 0)),
+    )
+  );
 };
 
-/** Per-project override wins; otherwise the company default. */
+const dedupe = (ids: string[]): string[] => [...new Set(ids)];
+
+/** Per-project override wins; otherwise the company default. Deduped, order preserved. */
+const pickReview = (
+  config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
+  issue: Pick<Issue, "projectId">,
+): { agentIds: string[]; source: string } => {
+  if (issue.projectId) {
+    const override = config.reviewAgentIdsByProjectId[issue.projectId];
+    if (override && override.length > 0) return { agentIds: dedupe(override), source: `project override ${issue.projectId}` };
+  }
+  return { agentIds: dedupe(config.defaultReviewAgentIds), source: "company default" };
+};
+
 export const pickReviewAgentIds = (
   config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
   issue: Pick<Issue, "projectId">,
-): string[] => {
-  if (issue.projectId) {
-    const override = config.reviewAgentIdsByProjectId[issue.projectId];
-    if (override && override.length > 0) return override;
+): string[] => pickReview(config, issue).agentIds;
+
+/** The card's executor must never be stamped as its own reviewer. */
+const executorAgentIds = (issue: Pick<Issue, "assigneeAgentId" | "executionState">): Set<string> => {
+  const ids = new Set<string>();
+  if (issue.assigneeAgentId) ids.add(issue.assigneeAgentId);
+  const returnAssignee = issue.executionState?.returnAssignee;
+  if (returnAssignee && typeof returnAssignee.agentId === "string" && returnAssignee.agentId.length > 0) {
+    ids.add(returnAssignee.agentId);
   }
-  return config.defaultReviewAgentIds;
+  return ids;
 };
 
-/** Host shape (`issueExecutionPolicySchema`): `normal` mode, one `review` stage per reviewer, `approvalsNeeded: 1`. */
-export const buildReviewPolicy = (agentIds: string[]): IssueExecutionPolicy => ({
+/** Host shape (`issueExecutionPolicySchema`): `normal` mode, one `review` stage per reviewer, `approvalsNeeded: 1`.
+ *  Existing policy fields (e.g. `monitor`) are preserved; only mode/comment/stages are stamped. */
+export const buildReviewPolicy = (agentIds: string[], existing?: IssueExecutionPolicy | null): IssueExecutionPolicy => ({
+  ...(existing ?? {}),
   mode: "normal",
   commentRequired: true,
   stages: agentIds.map((agentId) => ({
@@ -91,16 +120,25 @@ export async function ensureReviewPolicy(
   config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
 ): Promise<ReviewGuardOutcome> {
   if (!config.reviewGuardEnabled) return { applied: false, reason: "disabled" };
+  if (issue.status === "done" || issue.status === "cancelled") return { applied: false, reason: "terminal" };
   if (!isReviewCodeCard(issue)) return { applied: false, reason: "not-code-card" };
   const policy = issue.executionPolicy;
   if (policy && policy.mode === "auto") return { applied: false, reason: "auto-mode" };
   if (hasLiveReviewStage(issue)) return { applied: false, reason: "has-stages" };
 
-  const agentIds = pickReviewAgentIds(config, issue);
-  if (agentIds.length === 0) {
+  const { agentIds: picked, source } = pickReview(config, issue);
+  if (picked.length === 0) {
     // Fail closed when unconfigured: never invent a reviewer.
     ctx.logger.info("review-guard skipped: no review agent IDs configured for company", { companyId, issueId: issue.id });
     return { applied: false, reason: "unconfigured" };
+  }
+  const excluded = executorAgentIds(issue);
+  const agentIds = picked.filter((id) => !excluded.has(id));
+  if (agentIds.length === 0) {
+    // Fail closed: the executor must not review their own card, and no other
+    // configured reviewer remains. Never stamp a self-review stage.
+    ctx.logger.info("review-guard skipped: configured reviewers are the card executor", { companyId, issueId: issue.id });
+    return { applied: false, reason: "no-eligible-reviewers" };
   }
 
   if (config.reviewGuardDryRun) {
@@ -120,7 +158,7 @@ export async function ensureReviewPolicy(
   // Pick is a creator-subset, not the wire contract.
   const next = await ctx.issues.update(
     issue.id,
-    { executionPolicy: buildReviewPolicy(agentIds) } as never,
+    { executionPolicy: buildReviewPolicy(agentIds, issue.executionPolicy) } as never,
     companyId,
   );
   const stageCount = next.executionPolicy?.stages?.length ?? agentIds.length;
@@ -132,7 +170,7 @@ export async function ensureReviewPolicy(
   if (!alreadyStamped) {
     await ctx.issues.createComment(
       issue.id,
-      `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (config: ${issue.projectId ? `project override ${issue.projectId}` : "company default"}).`,
+      `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (config: ${source}).`,
       companyId,
     );
     commented = true;
@@ -200,7 +238,11 @@ export async function runReviewGuardSweep(
     if (rows.length === 0) break;
     for (const row of rows) {
       checked += 1;
-      const outcome = await ensureReviewPolicy(ctx, companyId, row, config);
+      // Re-read: a stage (or terminal status) added after the list page must
+      // win over the stale row. `ensureReviewPolicy` re-checks liveness on
+      // the fresh object immediately before it writes.
+      const fresh = await ctx.issues.get(row.id, companyId);
+      const outcome = await ensureReviewPolicy(ctx, companyId, fresh ?? row, config);
       if (outcome.applied) appliedCount += 1;
       else tally(outcome.reason);
     }

@@ -80,7 +80,9 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const stringArray = (value: unknown): string[] =>
-  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
+  Array.isArray(value)
+    ? [...new Set(value.filter((v): v is string => typeof v === "string" && v.length > 0))]
+    : [];
 
 const stringMap = (value: unknown): Record<string, string> => {
   if (!isRecord(value)) return {};
