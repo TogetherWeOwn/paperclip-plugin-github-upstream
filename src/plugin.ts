@@ -84,21 +84,28 @@ const plugin = definePlugin({
 });
 
 async function sweepParked(ctx: PluginContext): Promise<void> {
-  const companies = await ctx.companies.list();
-  for (const company of companies) {
+  // Fail closed without a delivered company: never fall back to a
+  // company-less `companies.list()` / `config.get()` the host gate rejects
+  // during scheduled jobs (TWO-5876, TWO-5921). Same captured-company
+  // pattern as `scanAll`/`sweepReviewGuard`.
+  if (deliveredCompanyIds.size === 0) {
+    ctx.logger.info("parked-blocker sweep skipped: no company config delivered");
+    return;
+  }
+  for (const companyId of capturedCompanyIds()) {
     try {
-      const raw = await ctx.config.get(company.id);
+      const raw = await ctx.config.get(companyId);
       // Fail closed: no config row, no writes (same as the scans).
       if (!raw || Object.keys(raw).length === 0) {
-        ctx.logger.info("parked-blocker sweep skipped: no plugin config for company", { companyId: company.id });
+        ctx.logger.info("parked-blocker sweep skipped: no plugin config for company", { companyId });
         continue;
       }
-      const result = await runParkedSweep(ctx, company.id, resolveConfig(raw));
+      const result = await runParkedSweep(ctx, companyId, resolveConfig(raw));
       if (result.drained > 0 || result.dropped > 0) {
-        ctx.logger.info("parked-blocker sweep finished", { companyId: company.id, ...result });
+        ctx.logger.info("parked-blocker sweep finished", { companyId, ...result });
       }
     } catch (err) {
-      ctx.logger.error("parked-blocker sweep failed", { companyId: company.id, error: String(err) });
+      ctx.logger.error("parked-blocker sweep failed", { companyId, error: String(err) });
     }
   }
 }

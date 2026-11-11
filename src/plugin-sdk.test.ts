@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { startWorkerRpcHost } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
-import manifest, { AUDIT_JOB_KEY, ITEM_JOB_KEY, RELEASE_JOB_KEY, REVIEW_GUARD_JOB_KEY } from "./manifest.js";
+import manifest, { AUDIT_JOB_KEY, ITEM_JOB_KEY, PARKED_JOB_KEY, RELEASE_JOB_KEY, REVIEW_GUARD_JOB_KEY } from "./manifest.js";
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const OTHER = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -135,8 +135,25 @@ const jobParams = (jobKey: string) => ({
   job: { jobKey, runId: "dddddddd-0000-4000-8000-000000000001", trigger: "schedule", scheduledAt: SCHEDULED_AT },
 });
 
+/**
+ * Every manifest-scheduled job key, derived from the manifest itself so a
+ * newly scheduled job is automatically guarded here — TWO-5921: the
+ * parked-propagation-scan sweep escaped because it was never in the list.
+ */
+const SCHEDULED_JOB_KEYS: string[] = [
+  ...new Set(((manifest.jobs ?? []) as { jobKey: string }[]).map((j) => j.jobKey)),
+];
+
 describe("scheduled jobs over the real SDK/host contract (TWO-5876)", () => {
-  for (const jobKey of [RELEASE_JOB_KEY, ITEM_JOB_KEY, AUDIT_JOB_KEY, REVIEW_GUARD_JOB_KEY]) {
+  it("guards every manifest-scheduled job, including parked-propagation-scan", () => {
+    expect(SCHEDULED_JOB_KEYS).toContain(PARKED_JOB_KEY);
+    expect(SCHEDULED_JOB_KEYS).toEqual(
+      expect.arrayContaining([RELEASE_JOB_KEY, ITEM_JOB_KEY, AUDIT_JOB_KEY, REVIEW_GUARD_JOB_KEY, PARKED_JOB_KEY]),
+    );
+    expect(new Set(SCHEDULED_JOB_KEYS).size).toBe(SCHEDULED_JOB_KEYS.length);
+  });
+
+  for (const jobKey of SCHEDULED_JOB_KEYS) {
     it(`${jobKey} reads config only for the delivered company and never lists companies`, async () => {
       const h = await upstreamHost();
       try {
@@ -169,7 +186,7 @@ describe("scheduled jobs over the real SDK/host contract (TWO-5876)", () => {
   });
 
   it("every scheduled job fails closed with zero reads and zero writes when no config was delivered", async () => {
-    for (const jobKey of [RELEASE_JOB_KEY, ITEM_JOB_KEY, AUDIT_JOB_KEY, REVIEW_GUARD_JOB_KEY]) {
+    for (const jobKey of SCHEDULED_JOB_KEYS) {
       const h = await upstreamHost();
       try {
         await h.send("initialize", "initialize", initializeParams);
