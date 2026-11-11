@@ -97,14 +97,22 @@ export const pickReviewAgentIds = (
 export const pickQaAgentIds = (
   config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId" | "reviewQaAgentIds" | "reviewQaAgentIdsByProjectId">,
   issue: Pick<Issue, "projectId">,
-): string[] => {
+): string[] => pickQa(config, issue).agentIds;
+
+/** QA staffing with its audit attribution: a per-project role override, the
+ *  company role list, or the legacy chain — named so the audit comment
+ *  identifies the configuration that actually staffed the card. */
+const pickQa = (
+  config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId" | "reviewQaAgentIds" | "reviewQaAgentIdsByProjectId">,
+  issue: Pick<Issue, "projectId">,
+): { agentIds: string[]; source: string } => {
   if (issue.projectId) {
     const override = config.reviewQaAgentIdsByProjectId[issue.projectId];
-    if (override && override.length > 0) return dedupe(override);
+    if (override && override.length > 0) return { agentIds: dedupe(override), source: `project override ${issue.projectId}` };
   }
-  if (config.reviewQaAgentIds.length > 0) return dedupe(config.reviewQaAgentIds);
-  const chain = pickReviewAgentIds(config, issue);
-  return chain.length >= 2 ? dedupe(chain.slice(1)) : dedupe(chain);
+  if (config.reviewQaAgentIds.length > 0) return { agentIds: dedupe(config.reviewQaAgentIds), source: "company default" };
+  const chain = pickReview(config, issue);
+  return { agentIds: chain.agentIds.length >= 2 ? dedupe(chain.agentIds.slice(1)) : dedupe(chain.agentIds), source: chain.source };
 };
 
 /**
@@ -115,14 +123,20 @@ export const pickQaAgentIds = (
 export const pickSecurityAgentIds = (
   config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId" | "reviewSecurityAgentIds" | "reviewSecurityAgentIdsByProjectId">,
   issue: Pick<Issue, "projectId">,
-): string[] => {
+): string[] => pickSecurity(config, issue).agentIds;
+
+/** Security staffing with its audit attribution (see {@link pickQa}). */
+const pickSecurity = (
+  config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId" | "reviewSecurityAgentIds" | "reviewSecurityAgentIdsByProjectId">,
+  issue: Pick<Issue, "projectId">,
+): { agentIds: string[]; source: string } => {
   if (issue.projectId) {
     const override = config.reviewSecurityAgentIdsByProjectId[issue.projectId];
-    if (override && override.length > 0) return dedupe(override);
+    if (override && override.length > 0) return { agentIds: dedupe(override), source: `project override ${issue.projectId}` };
   }
-  if (config.reviewSecurityAgentIds.length > 0) return dedupe(config.reviewSecurityAgentIds);
-  const chain = pickReviewAgentIds(config, issue);
-  return chain.length >= 2 ? [chain[0] as string] : [];
+  if (config.reviewSecurityAgentIds.length > 0) return { agentIds: dedupe(config.reviewSecurityAgentIds), source: "company default" };
+  const chain = pickReview(config, issue);
+  return { agentIds: chain.agentIds.length >= 2 ? [chain.agentIds[0] as string] : [], source: chain.source };
 };
 
 /** Agent IDs already carrying a live stage on the card, if any. */
@@ -174,7 +188,10 @@ export const buildUpgradedPolicy = (existing: IssueExecutionPolicy, securityAgen
   stages: [...buildReviewPolicy(securityAgentIds).stages, ...existing.stages],
 });
 
-type AppliedRecord = Record<string, { at: string; stages: number; commented?: boolean; source?: string; tier?: RiskTier }>;
+type AppliedRecord = Record<
+  string,
+  { at: string; stages: number; commented?: boolean; source?: string; tier?: RiskTier; pendingBody?: string }
+>;
 
 type ReviewGuardConfig = Pick<
   UpstreamConfig,
@@ -224,29 +241,38 @@ export async function ensureReviewPolicy(
   // the current head — not the tier at stamp time — decides staffing.
   const resolved = tiering ?? (await resolveReviewTier(ctx, companyId, issue));
   const needsSecurity = needsSecurityReview(resolved.tier);
-  const { source } = pickReview(config, issue);
+  // Audit attribution names the configuration that actually staffed this
+  // tier: the per-role selectors (project override, company role list, or
+  // legacy chain) — not just the legacy chain selector, which mislabels
+  // cards staffed by a per-project role override as "company default".
+  const qaPicked = pickQa(config, issue);
+  const securityPicked = pickSecurity(config, issue);
+  const source = needsSecurity
+    ? securityPicked.source === qaPicked.source
+      ? securityPicked.source
+      : `Security ${securityPicked.source}; QA ${qaPicked.source}`
+    : qaPicked.source;
   const excluded = executorAgentIds(issue);
-  const securityIds = pickSecurityAgentIds(config, issue).filter((id) => !excluded.has(id));
-  const qaIds = pickQaAgentIds(config, issue).filter((id) => !excluded.has(id));
+  const securityIds = securityPicked.agentIds.filter((id) => !excluded.has(id));
+  const qaIds = qaPicked.agentIds.filter((id) => !excluded.has(id));
 
   const applied = await readApplied(ctx, companyId);
   const prior = applied[issue.id];
-  // Records stamped before tiering carry no tier: treat them as matching so
-  // they neither re-comment nor block an upgrade check on security presence.
-  const tierChanged = prior?.tier !== undefined && prior.tier !== resolved.tier;
 
   if (hasLiveReviewStage(issue)) {
-    // A pending record for the same tier means the policy was stamped but
-    // the audit comment failed: retry the comment instead of hiding behind
-    // the live stage.
-    if (prior && prior.commented === false && !tierChanged && !dryRun) {
-      // The retry must attribute the original source, not whatever the
-      // config says now: the staged stages are the ones from stamp time.
+    // A pending record means a policy write landed but its audit comment
+    // failed: retry that exact audit text (persisted as pendingBody, so a
+    // failed upgrade still retries as an upgrade with its triggering path,
+    // not as a default stamp) instead of hiding behind the live stage.
+    // A tier change must not strand the pending audit: the retry runs
+    // regardless of the current tier, and any upgrade the new tier needs
+    // follows on the next event/sweep.
+    if (prior && prior.commented === false && !dryRun) {
       const retrySource = prior.source ?? source;
       const stageCount = prior.stages;
       await ctx.issues.createComment(
         issue.id,
-        `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${prior.tier ?? resolved.tier}; config: ${retrySource}).`,
+        prior.pendingBody ?? `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${prior.tier ?? resolved.tier}; config: ${retrySource}).`,
         companyId,
       );
       await writeApplied(ctx, companyId, { ...applied, [issue.id]: { ...prior, at: new Date().toISOString(), commented: true } });
@@ -279,15 +305,12 @@ export async function ensureReviewPolicy(
         });
         if (dryRun) return { applied: false, reason: "dry-run" };
         if (!(prior?.tier === resolved.tier && prior.commented === true)) {
+          const body = `Review-guard: Sensitive head (tier ${resolved.tier}: ${resolved.reason}) has no eligible Security reviewer stage — card remains without Security review until one is staffed. Not downgraded to QA-only silently (config: ${source}).`;
           await writeApplied(ctx, companyId, {
             ...applied,
-            [issue.id]: { at: new Date().toISOString(), stages: issue.executionPolicy?.stages?.length ?? 0, commented: false, source, tier: resolved.tier },
+            [issue.id]: { at: new Date().toISOString(), stages: issue.executionPolicy?.stages?.length ?? 0, commented: false, source, tier: resolved.tier, pendingBody: body },
           });
-          await ctx.issues.createComment(
-            issue.id,
-            `Review-guard: Sensitive head (tier ${resolved.tier}: ${resolved.reason}) has no eligible Security reviewer stage — card remains without Security review until one is staffed. Not downgraded to QA-only silently (config: ${source}).`,
-            companyId,
-          );
+          await ctx.issues.createComment(issue.id, body, companyId);
           await writeApplied(ctx, companyId, {
             ...applied,
             [issue.id]: { at: new Date().toISOString(), stages: issue.executionPolicy?.stages?.length ?? 0, commented: true, source, tier: resolved.tier },
@@ -311,15 +334,12 @@ export async function ensureReviewPolicy(
           companyId,
         );
         const stageCount = upgraded.executionPolicy?.stages?.length ?? securityIds.length + (issue.executionPolicy?.stages?.length ?? 0);
+        const body = `Review-guard upgraded review policy: added ${missing.length} Security stage${missing.length === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`;
         await writeApplied(ctx, companyId, {
           ...applied,
-          [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source, tier: resolved.tier },
+          [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source, tier: resolved.tier, pendingBody: body },
         });
-        await ctx.issues.createComment(
-          issue.id,
-          `Review-guard upgraded review policy: added ${missing.length} Security stage${missing.length === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`,
-          companyId,
-        );
+        await ctx.issues.createComment(issue.id, body, companyId);
         await writeApplied(ctx, companyId, {
           ...applied,
           [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true, source, tier: resolved.tier },
@@ -401,15 +421,12 @@ export async function ensureReviewPolicy(
   // retried by the next event/sweep (see the `hasLiveReviewStage` branch).
   let commented = false;
   if (!prior || prior.tier !== resolved.tier) {
+    const body = `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`;
     await writeApplied(ctx, companyId, {
       ...applied,
-      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source, tier: resolved.tier },
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source, tier: resolved.tier, pendingBody: body },
     });
-    await ctx.issues.createComment(
-      issue.id,
-      `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`,
-      companyId,
-    );
+    await ctx.issues.createComment(issue.id, body, companyId);
     commented = true;
     await writeApplied(ctx, companyId, {
       ...applied,

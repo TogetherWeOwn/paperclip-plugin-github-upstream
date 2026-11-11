@@ -664,6 +664,66 @@ describe("review-guard tiering (TWO-5879)", () => {
     expect(lowOutcome.applied).toBe(true);
   });
 
+  it("retries a stranded pending audit comment even when the tier moved", async () => {
+    const harness = await setup();
+    const issue = seedIssue(harness);
+    const bodies: string[] = [];
+    let attempts = 0;
+    const origComment = harness.ctx.issues.createComment.bind(harness.ctx.issues);
+    harness.ctx.issues.createComment = (async (...args: Parameters<typeof origComment>) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("comment blew up");
+      bodies.push(String(args[1]));
+      return origComment(...args);
+    }) as typeof harness.ctx.issues.createComment;
+    // Stamp at Low, comment fails; next call the head tiers Ordinary. The
+    // pending Low audit must still be retried (not stranded by tierChanged).
+    await expect(
+      ensureReviewPolicy(harness.ctx, COMPANY, issue as never, resolveConfig(GUARD_CONFIG), LOW),
+    ).rejects.toThrow("comment blew up");
+    const retry = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, resolveConfig(GUARD_CONFIG), ORDINARY);
+    expect(retry).toEqual({ applied: false, reason: "comment-retried" });
+    expect(bodies[0]).toContain("tier low");
+    expect(bodies[0]).toContain("Default review policy applied");
+  });
+
+  it("retries a failed upgrade audit as an upgrade (not a default stamp)", async () => {
+    const harness = await setup();
+    const issue = seedIssue(harness, { executionPolicy: buildReviewPolicy([QA]) });
+    const bodies: string[] = [];
+    let attempts = 0;
+    const origComment = harness.ctx.issues.createComment.bind(harness.ctx.issues);
+    harness.ctx.issues.createComment = (async (...args: Parameters<typeof origComment>) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("comment blew up");
+      bodies.push(String(args[1]));
+      return origComment(...args);
+    }) as typeof harness.ctx.issues.createComment;
+    await expect(
+      ensureReviewPolicy(harness.ctx, COMPANY, issue as never, resolveConfig(GUARD_CONFIG), SENSITIVE),
+    ).rejects.toThrow("comment blew up");
+    const retry = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, resolveConfig(GUARD_CONFIG), SENSITIVE);
+    expect(retry).toEqual({ applied: false, reason: "comment-retried" });
+    expect(bodies[0]).toContain("upgraded review policy");
+    expect(bodies[0]).toContain("src/auth/x.ts");
+    expect(bodies[0]).not.toContain("Default review policy applied");
+  });
+
+  it("attributes a per-project role override in the audit comment", async () => {
+    const harness = await setup();
+    const comments = spyComments(harness);
+    const issue = seedIssue(harness);
+    const config = resolveConfig({
+      ...GUARD_CONFIG,
+      reviewQaAgentIdsByProjectId: { [PROJECT]: [EXTRA] },
+    });
+    const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+    const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, config, LOW);
+    expect(outcome.applied).toBe(true);
+    expect(comments[0].body).toContain(`project override ${PROJECT}`);
+    expect(comments[0].body).not.toContain("config: company default");
+  });
+
   it("flags (never silently keeps QA-only) a Sensitive head whose QA-only card has no eligible Security reviewer", async () => {
     const harness = await setup();
     const updates = spyUpdates(harness);
