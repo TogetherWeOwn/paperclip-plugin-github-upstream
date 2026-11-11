@@ -22,6 +22,7 @@
 - Tab metrics skip card-less records and prune records for items that are no longer tracked, so the counts agree with the visible list.
 - Awaiting flips from config or label-map drift (no upstream change) sync labels/header quietly without waking.
 - Manifest declares `ui.page.register` for the GitHub page slot (the host install rejected 2ab13e1 without it); a new test mirrors the host's manifest/capability consistency check so CI catches this class of error. Manifest wording now says release-intake cards are created for new tags after the install baseline.
+- New `defer_blocked_card` agent tool: a status-only `blocked` -> `backlog` move under plugin authority, for already-decided deferrals the native resume guard blocks. It requires a `done` decision card naming the target, refuses terminal cards and cards with a pending review stage, posts an attributed audit comment (caller agent/run, decision ref, revisit trigger), preserves blocker edges/stages/monitors, and is idempotent. The calling agent is bound via the SDK's `ToolRunContext` (`agentId`/`runId`) and recorded as the issue-update actor, so the transition is attributed, not a guard bypass.
 
 ## 0.1.0
 

@@ -138,6 +138,11 @@ describe("plugin wiring", () => {
         expect(caps.has(required as never)).toBe(true);
       }
     }
+    if ((manifest.tools ?? []).length > 0) {
+      // The host validator requires agent.tools.register when tools declared.
+      expect(caps.has("agent.tools.register" as never)).toBe(true);
+      expect(manifest.tools?.some((t) => t.name === "defer_blocked_card")).toBe(true);
+    }
     for (const slot of manifest.ui?.slots ?? []) {
       const required = REQUIRED_UI_SLOT_CAPABILITIES[slot.type];
       expect(required).toBeDefined();

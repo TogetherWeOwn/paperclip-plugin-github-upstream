@@ -118,7 +118,11 @@ Known SDK gap (worked around, not bypassed): `issues.requestWakeup` is tried fir
 
 ## Capabilities
 
-`companies.read`, `issues.read`, `issue.subtree.read`, `issues.create`, `issues.update`, `issue.comments.create`, `issues.wakeup`, `jobs.schedule`, `http.outbound`, `secrets.read-ref`, `plugin.state.read`, `plugin.state.write`, `events.subscribe`, `ui.page.register`, `project.workspaces.read`, `execution.workspaces.read`, `issue.relations.read`, `issue.comments.read`, `agents.invoke`.
+`companies.read`, `issues.read`, `issue.subtree.read`, `issues.create`, `issues.update`, `issue.comments.create`, `issues.wakeup`, `jobs.schedule`, `http.outbound`, `secrets.read-ref`, `plugin.state.read`, `plugin.state.write`, `events.subscribe`, `agent.tools.register`, `ui.page.register`, `project.workspaces.read`, `execution.workspaces.read`, `issue.relations.read`, `issue.comments.read`, `agents.invoke`.
+
+## Agent tools
+
+- `defer_blocked_card` — move one `blocked` card to `backlog` under plugin authority for an already-decided deferral the native resume guard blocks. Inputs: `targetIssueId` (the blocked card), `decisionIssueId` (a `done` decision card whose title/description/comments name the target), `revisitTrigger` (the observable revisit event or UTC date). The caller is bound via the SDK's `ToolRunContext` (`agentId`/`runId`) and recorded as the issue-update actor; an audit comment on the target records caller, decision ref and revisit trigger. The update patch is status-only, so blocker edges, review stages and monitors are untouched; terminal cards and cards with a pending review stage are refused. Idempotent: a target already in `backlog` returns success without a new update or comment.
 
 ## Dry run
 
