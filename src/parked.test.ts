@@ -104,6 +104,18 @@ describe("isParkedRoot", () => {
     ).toBe("no-go");
   });
 
+  it("still vetoes a wrapped go-to compound in an incidental predication", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "There is no go\nTo maintainer for this repo", archivedAt: null }),
+    ).toBeNull();
+  });
+
+  it("does not park on 'deferred' + NBSP + noun (rich-text adjective)", () => {
+    expect(
+      isParkedRoot({ status: "todo", title: "x", description: "The dashboard is deferred\u00a0rendering work", archivedAt: null }),
+    ).toBeNull();
+  });
+
   it("does not let a new paragraph veto a standalone Deferred disposition", () => {
     // A blank line is a paragraph boundary, not a wrapped line.
     expect(

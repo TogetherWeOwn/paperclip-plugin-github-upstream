@@ -171,30 +171,35 @@ const LIVE_TEXT_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked
  * woken. Archived roots likewise never park.
  */
 // "deferred rendering/loading/..." is an adjective, never a disposition.
-// The veto spans a SINGLE wrapped line break WITHIN one field (spaces, or
-// one line break plus spaces — not `\s+`): a line break inside the
+// The veto spans a SINGLE wrapped line break WITHIN one field (same-line
+// whitespace `[^\S\r\n]`, incl. NBSP, or one line break plus such
+// whitespace — not `\s+`): a line break inside the
 // description (`deferred\nrendering`) must not escape the veto, but a
 // blank line is a paragraph boundary (`Deferred\n\nExecution...` is a
 // standalone disposition plus a new paragraph, so it must still park).
 // Per-field checking keeps the title/description boundary separate (D2:
 // title `Deferred` + description `Execution...`).
-const DEFERRED_NOUN = String.raw`(?!(?:[ \t]+|[ \t]*(?:\r\n|\n|\r)[ \t]*)(?:rendering|loading|display|paint|execution|initialization)\b)`;
+const DEFERRED_NOUN = String.raw`(?!(?:[^\S\r\n]+|[^\S\r\n]*(?:\r\n|\n|\r)[^\S\r\n]*)(?:rendering|loading|display|paint|execution|initialization)\b)`;
 // "no go-to" / "no go to ..." is the go-to compound, never a NO-GO.
 // The lookahead permits GO followed by a separator that is not `to`.
-// The separator is same-line only ([ \t\-]?, no `\n`): a following
-// line's sentence-initial "To ..." (`Decision: NO-GO\nTo revisit...`)
-// is a new sentence, not the go-to compound, so it must not veto an
-// explicit disposition. Per-field checking additionally keeps the
-// title/description boundary separate (D2: title `NO-GO` + description
-// `To revisit...` must not veto).
+// Explicit dispositions (label, line prefix, comma list) use a
+// same-line-only separator: a following line's sentence-initial
+// "To ..." (`Decision: NO-GO\nTo revisit...`) is a new sentence, not
+// the go-to compound, so it must not veto them. The incidental
+// predication (`is no go`) keeps the wrapped-line separator, so a
+// hard wrap inside the compound (`There is no go\nTo maintainer`)
+// is still vetoed. Per-field checking additionally keeps the
+// title/description boundary separate (D2: title `NO-GO` +
+// description `To revisit...` must not veto).
 const NO_GO_NOT_GOTO = String.raw`(?![ \t\-]?to\b)`;
+const NO_GO_NOT_GOTO_WRAP = String.raw`(?![ \t\n\-]?to\b)`;
 
 const NO_GO_RES: RegExp[] = [
   new RegExp(String.raw`\b(?:status|disposition|decision|state|outcome|parked)\s*[:=]\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
   // Line prefix: punctuation/EOL or explicit continuation (D1: `NO-GO for launch`).
   new RegExp(String.raw`(?:^|\n)[ \t]*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:[ \t]*(?:[:\-–—]|\.)|[ \t]+(?:for|on|until|because|pending)\b|[ \t]*$)`, "im"),
   new RegExp(String.raw`,\s*NO[-\s]?GO\b${NO_GO_NOT_GOTO}(?:\s+(?:for|on|until|because)\b|\s*(?:$|[.,;:!?)\]]|\n))`, "im"),
-  new RegExp(String.raw`\b(?:is|was|remains?|marked|set to)\s+NO[-\s]?GO\b${NO_GO_NOT_GOTO}`, "i"),
+  new RegExp(String.raw`\b(?:is|was|remains?|marked|set to)\s+NO[-\s]?GO\b${NO_GO_NOT_GOTO_WRAP}`, "i"),
 ];
 
 const DEFERRED_RES: RegExp[] = [
