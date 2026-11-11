@@ -34,7 +34,7 @@ import { stateKey } from "./state.js";
 
 export type ReviewGuardOutcome =
   | { applied: true; stages: number; commented: boolean }
-  | { applied: false; reason: "disabled" | "not-code-card" | "has-stages" | "auto-mode" | "unconfigured" | "dry-run" | "terminal" | "no-eligible-reviewers" };
+  | { applied: false; reason: "disabled" | "not-code-card" | "has-stages" | "auto-mode" | "unconfigured" | "dry-run" | "terminal" | "no-eligible-reviewers" | "comment-retried" };
 
 /** Code work = bound to a project workspace (a repo). Per TWO-5794, workspace presence is the signal. */
 export const isReviewCodeCard = (issue: Pick<Issue, "projectWorkspaceId">): boolean =>
@@ -98,7 +98,7 @@ export const buildReviewPolicy = (agentIds: string[], existing?: IssueExecutionP
   })),
 });
 
-type AppliedRecord = Record<string, { at: string; stages: number }>;
+type AppliedRecord = Record<string, { at: string; stages: number; commented?: boolean }>;
 
 const readApplied = async (ctx: PluginContext, companyId: string): Promise<AppliedRecord> =>
   ((await ctx.state.get(stateKey(companyId, "review-guard.applied"))) as AppliedRecord | null) ?? {};
@@ -117,14 +117,34 @@ export async function ensureReviewPolicy(
   ctx: PluginContext,
   companyId: string,
   issue: Issue,
-  config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
+  config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "dryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
 ): Promise<ReviewGuardOutcome> {
   if (!config.reviewGuardEnabled) return { applied: false, reason: "disabled" };
   if (issue.status === "done" || issue.status === "cancelled") return { applied: false, reason: "terminal" };
   if (!isReviewCodeCard(issue)) return { applied: false, reason: "not-code-card" };
   const policy = issue.executionPolicy;
   if (policy && policy.mode === "auto") return { applied: false, reason: "auto-mode" };
-  if (hasLiveReviewStage(issue)) return { applied: false, reason: "has-stages" };
+  // Either dry-run flag suppresses writes, matching the other scans.
+  const dryRun = config.reviewGuardDryRun || config.dryRun;
+  const applied = await readApplied(ctx, companyId);
+  const prior = applied[issue.id];
+  if (hasLiveReviewStage(issue)) {
+    // A pending record means the policy was stamped but the audit comment
+    // failed: retry the comment instead of hiding behind the live stage.
+    if (prior && prior.commented === false && !dryRun) {
+      const { source } = pickReview(config, issue);
+      const stageCount = prior.stages;
+      await ctx.issues.createComment(
+        issue.id,
+        `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (config: ${source}).`,
+        companyId,
+      );
+      await writeApplied(ctx, companyId, { ...applied, [issue.id]: { ...prior, at: new Date().toISOString(), commented: true } });
+      ctx.logger.info("review-guard retried audit comment", { companyId, issueId: issue.id });
+      return { applied: false, reason: "comment-retried" };
+    }
+    return { applied: false, reason: "has-stages" };
+  }
 
   const { agentIds: picked, source } = pickReview(config, issue);
   if (picked.length === 0) {
@@ -141,7 +161,7 @@ export async function ensureReviewPolicy(
     return { applied: false, reason: "no-eligible-reviewers" };
   }
 
-  if (config.reviewGuardDryRun) {
+  if (dryRun) {
     ctx.logger.info("review-guard dry-run: would stamp default review policy", {
       companyId,
       issueId: issue.id,
@@ -149,9 +169,6 @@ export async function ensureReviewPolicy(
     });
     return { applied: false, reason: "dry-run" };
   }
-
-  const applied = await readApplied(ctx, companyId);
-  const alreadyStamped = applied[issue.id] !== undefined;
 
   // Cast cites the module header: the wire protocol is `Record<string, unknown>`
   // and the host `updateIssueSchema` accepts `executionPolicy`; the SDK's typed
@@ -164,10 +181,15 @@ export async function ensureReviewPolicy(
   const stageCount = next.executionPolicy?.stages?.length ?? agentIds.length;
 
   // Audit-stamp once: if the state record is already there (event + sweep both
-  // raced the same card), skip the duplicate comment. If the comment fails, the
-  // record is not written, so the next sweep retries the stamp.
+  // raced the same card), skip the duplicate comment. The record is written
+  // as pending before the comment so a failed comment is retried by the next
+  // event/sweep (see the `hasLiveReviewStage` branch above).
   let commented = false;
-  if (!alreadyStamped) {
+  if (!prior) {
+    await writeApplied(ctx, companyId, {
+      ...applied,
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false },
+    });
     await ctx.issues.createComment(
       issue.id,
       `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (config: ${source}).`,
@@ -176,7 +198,7 @@ export async function ensureReviewPolicy(
     commented = true;
     await writeApplied(ctx, companyId, {
       ...applied,
-      [issue.id]: { at: new Date().toISOString(), stages: stageCount },
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true },
     });
   }
 
@@ -220,7 +242,7 @@ export const SWEEP_PAGE = 100;
 export async function runReviewGuardSweep(
   ctx: PluginContext,
   companyId: string,
-  config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
+  config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "dryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
 ): Promise<{ checked: number; applied: number; skipped: Record<string, number> }> {
   const skipped: Record<string, number> = {};
   const tally = (reason: string) => {
@@ -238,13 +260,20 @@ export async function runReviewGuardSweep(
     if (rows.length === 0) break;
     for (const row of rows) {
       checked += 1;
-      // Re-read: a stage (or terminal status) added after the list page must
-      // win over the stale row. `ensureReviewPolicy` re-checks liveness on
-      // the fresh object immediately before it writes.
-      const fresh = await ctx.issues.get(row.id, companyId);
-      const outcome = await ensureReviewPolicy(ctx, companyId, fresh ?? row, config);
-      if (outcome.applied) appliedCount += 1;
-      else tally(outcome.reason);
+      // One failing card must not abort the sweep for every later card
+      // (list order is stable, so the same card would fail every tick).
+      try {
+        // Re-read: a stage (or terminal status) added after the list page must
+        // win over the stale row. `ensureReviewPolicy` re-checks liveness on
+        // the fresh object immediately before it writes.
+        const fresh = await ctx.issues.get(row.id, companyId);
+        const outcome = await ensureReviewPolicy(ctx, companyId, fresh ?? row, config);
+        if (outcome.applied) appliedCount += 1;
+        else tally(outcome.reason);
+      } catch (err) {
+        tally("error");
+        ctx.logger.error("review-guard sweep row failed", { companyId, issueId: row.id, error: String(err) });
+      }
     }
     if (rows.length < SWEEP_PAGE) break;
     offset += rows.length;

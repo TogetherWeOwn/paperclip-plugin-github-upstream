@@ -10,6 +10,7 @@ import {
   hasLiveReviewStage,
   isReviewCodeCard,
   pickReviewAgentIds,
+  runReviewGuardSweep,
 } from "./review-guard.js";
 
 const COMPANY = "c-1";
@@ -312,6 +313,41 @@ describe("review-guard events (real SDK contract)", () => {
     expect(comments[0].body).toContain(`project override ${PROJECT}`);
   });
 
+  it("honors the plugin-wide dryRun flag too", async () => {
+    const harness = await setup({ ...GUARD_CONFIG, dryRun: true });
+    const updates = spyUpdates(harness);
+    const comments = spyComments(harness);
+    const issue = seedIssue(harness);
+
+    await emitIssue(harness, "issue.created", issue.id);
+    expect(updates).toHaveLength(0);
+    expect(comments).toHaveLength(0);
+  });
+
+  it("retries a failed audit comment on the next event", async () => {
+    const harness = await setup();
+    const config = resolveConfig(GUARD_CONFIG);
+    const issue = seedIssue(harness);
+    let attempts = 0;
+    const origComment = harness.ctx.issues.createComment.bind(harness.ctx.issues);
+    harness.ctx.issues.createComment = (async (...args: Parameters<typeof origComment>) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("comment blew up");
+      return origComment(...args);
+    }) as typeof harness.ctx.issues.createComment;
+
+    await expect(ensureReviewPolicy(harness.ctx, COMPANY, issue as never, config)).rejects.toThrow("comment blew up");
+    // The policy is stamped, but the comment failed: the next call must retry
+    // the comment even though the card now has live stages.
+    const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+    const retry = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, config);
+    expect(retry).toEqual({ applied: false, reason: "comment-retried" });
+    expect(attempts).toBe(2);
+    const third = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, config);
+    expect(third).toEqual({ applied: false, reason: "has-stages" });
+    expect(attempts).toBe(2);
+  });
+
   it("dry-run writes nothing", async () => {
     const harness = await setup({ ...GUARD_CONFIG, reviewGuardDryRun: true });
     const updates = spyUpdates(harness);
@@ -390,6 +426,22 @@ describe("review-guard sweep", () => {
 
     expect(updates).toHaveLength(1);
     expect(comments).toHaveLength(1);
+  });
+
+  it("one failing card does not abort the sweep for later cards", async () => {
+    const harness = await setup();
+    const bad = seedIssue(harness);
+    const good = seedIssue(harness);
+    const origUpdate = harness.ctx.issues.update.bind(harness.ctx.issues);
+    harness.ctx.issues.update = (async (issueId: string, patch: Record<string, unknown>, companyId: string) => {
+      if (issueId === bad.id) throw new Error("host rejected this card");
+      return origUpdate(issueId, patch as never, companyId);
+    }) as typeof harness.ctx.issues.update;
+
+    const summary = await runReviewGuardSweep(harness.ctx, COMPANY, resolveConfig(GUARD_CONFIG));
+    const stored = await harness.ctx.issues.get(good.id, COMPANY);
+    expect(stored?.executionPolicy?.stages).toHaveLength(2);
+    expect(summary.skipped.error).toBe(1);
   });
 
   it("ensureReviewPolicy reports why a card was skipped", async () => {
