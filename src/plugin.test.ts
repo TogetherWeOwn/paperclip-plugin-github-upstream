@@ -24,6 +24,10 @@ async function setup(config: Record<string, unknown> = {}) {
   const harness = createTestHarness({ manifest, config });
   harness.seed({ companies: [{ id: COMPANY, name: "TWO", issuePrefix: "TWO" } as never] });
   await plugin.definition.setup(harness.ctx);
+  // Scheduled jobs read config only for companies the host has delivered
+  // via configChanged (TWO-5876); mirror that delivery here. The harness
+  // itself never calls onConfigChanged, so deliver explicitly.
+  await plugin.definition.onConfigChanged?.(config, { companyId: COMPANY });
   return harness;
 }
 
