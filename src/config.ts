@@ -25,10 +25,30 @@ export interface UpstreamConfig {
    * Default review stage participants (agent IDs, in stage order), e.g.
    * Security then QA. Empty means the guard never writes that company's
    * cards: it never invents a reviewer.
+   *
+   * TWO-5879 role split: when the tiered role lists below are unset, this
+   * chain is split by position — the first ID is Security and the rest are
+   * QA — so installs that only configured the full chain keep their
+   * Sensitive staffing without a config migration. A single-ID chain reads
+   * as QA-only (Security unstaffed; Sensitive cards fail closed).
    */
   defaultReviewAgentIds: string[];
   /** Per-project review stage participants (project ID -> agent IDs), overriding `defaultReviewAgentIds`. */
   reviewAgentIdsByProjectId: Record<string, string[]>;
+  /**
+   * Tiered review staffing (TWO-5879): QA agents run on every tier;
+   * Security agents run only on Sensitive/unknown tiers. Explicitly setting
+   * either role list (or its per-project override) wins over the legacy
+   * positional split of `defaultReviewAgentIds`; a role left unset falls
+   * back to that split for that role alone.
+   */
+  reviewQaAgentIds: string[];
+  /** Per-project QA staffing (project ID -> agent IDs), overriding `reviewQaAgentIds`. */
+  reviewQaAgentIdsByProjectId: Record<string, string[]>;
+  /** Security staffing for Sensitive/unknown tiers; empty means Sensitive cards fail closed (never downgraded to QA-only). */
+  reviewSecurityAgentIds: string[];
+  /** Per-project Security staffing (project ID -> agent IDs), overriding `reviewSecurityAgentIds`. */
+  reviewSecurityAgentIdsByProjectId: Record<string, string[]>;
   /**
    * GitHub App auth (preferred over `tokenSecretRef`): the numeric App ID, as
    * a string. Empty means App auth is not configured.
@@ -206,6 +226,10 @@ export function resolveConfig(raw: Record<string, unknown>): UpstreamConfig {
     reviewGuardDryRun: raw.reviewGuardDryRun === true,
     defaultReviewAgentIds: stringArray(raw.defaultReviewAgentIds),
     reviewAgentIdsByProjectId: stringArrayMap(raw.reviewAgentIdsByProjectId),
+    reviewQaAgentIds: stringArray(raw.reviewQaAgentIds),
+    reviewQaAgentIdsByProjectId: stringArrayMap(raw.reviewQaAgentIdsByProjectId),
+    reviewSecurityAgentIds: stringArray(raw.reviewSecurityAgentIds),
+    reviewSecurityAgentIdsByProjectId: stringArrayMap(raw.reviewSecurityAgentIdsByProjectId),
     appId: numericId(raw.appId),
     installationId: numericId(raw.installationId),
     appPrivateKeySecretRef: isSecretRefBinding(raw.appPrivateKeySecretRef) ? raw.appPrivateKeySecretRef : null,

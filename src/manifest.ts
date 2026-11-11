@@ -18,7 +18,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "GitHub Upstream",
   description:
-    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card for each new tag after the install baseline, and ETag-tracked issue/PR/discussion polls wake the owning follow-through card on real change. Subscribes to issue create/update events and sweeps `in_review` to stamp default review stages onto code cards that would otherwise wait with no reviewer (TWO-5794).",
+    "Notices upstream GitHub changes deterministically, with zero LLM calls: ETag-conditional release polls create a release-intake card per new tag, and tracked issue/PR/discussion polls wake the owning card on real change. Subscribes to issue events and sweeps in_review to stamp tier-appropriate review stages (QA always; Security for sensitive per .github/review-tiers.yml) onto code cards with no reviewer (TWO-5794, TWO-5879).",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -36,6 +36,8 @@ const manifest: PaperclipPluginManifestV1 = {
     "plugin.state.write",
     "events.subscribe",
     "ui.page.register",
+    "project.workspaces.read",
+    "execution.workspaces.read",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -72,7 +74,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: REVIEW_GUARD_JOB_KEY,
       displayName: "Sweep in-review cards for a live reviewer stage",
       description:
-        "Backstop for the review-guard event subscription: lists every `in_review` card and stamps the configured default review stages (plus an audit comment) onto any code card (bound to a project workspace) that has none. Event subscriptions handle new cards immediately; the sweep catches missed events and pre-install cards.",
+        "Backstop for the review-guard event subscription: lists every `in_review` card and stamps tier-appropriate review stages (QA on every change; Security added for sensitive or unclassified changes per .github/review-tiers.yml) plus an audit comment onto any code card (bound to a project workspace) that has none, upgrading QA-only cards when a newer head adds sensitive paths. Event subscriptions handle new cards immediately; the sweep catches missed events and pre-install cards.",
       schedule: "*/15 * * * *",
     },
     {
@@ -202,26 +204,54 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         default: false,
         description:
-          "Review-guard (TWO-5794): stamp the configured default review stages onto code cards (bound to a project workspace) that reach in_review, or are created as code work, without a live reviewer stage. Off by default.",
+          "Review-guard (TWO-5794, TWO-5879): stamp tier-appropriate review stages onto code cards (bound to a project workspace) that reach in_review, or are created as code work, without a live reviewer stage. QA runs on every change; Security is added for sensitive or unclassified changes per each repo's .github/review-tiers.yml (missing map, unreadable diff, or unmatched path fails closed to Sensitive). A pending stage is upgraded when a newer head adds sensitive paths and never downgraded. Off by default.",
       },
       reviewGuardDryRun: {
         type: "boolean",
         default: false,
-        description: "Review-guard dry-run: log intended review-policy stamps and audit comments without making them.",
+        description: "Review-guard dry-run: log intended review-policy stamps, upgrades and audit comments without making them.",
       },
       defaultReviewAgentIds: {
         type: "array",
         items: { type: "string" },
         default: [],
         description:
-          "Review-guard: default reviewer stage participants (agent IDs, in stage order — e.g. Security then QA). Empty means the guard never writes that company's cards: it never invents a reviewer.",
+          "Review-guard: legacy reviewer chain (agent IDs, in stage order — e.g. Security then QA). Empty means the guard never writes that company's cards: it never invents a reviewer. When the tiered role lists below are unset, this chain is split by position (first ID Security, rest QA) so existing installs keep their Sensitive staffing.",
       },
       reviewAgentIdsByProjectId: {
         type: "object",
         additionalProperties: { type: "array", items: { type: "string" } },
         default: {},
         description:
-          "Review-guard: per-project reviewer stage overrides, keyed by project ID. A project entry wins over defaultReviewAgentIds for that project's cards.",
+          "Review-guard: per-project reviewer chain overrides, keyed by project ID. A project entry wins over defaultReviewAgentIds for that project's cards (split by position when tiered roles are unset).",
+      },
+      reviewQaAgentIds: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description:
+          "Review-guard (TWO-5879): QA reviewer stage participants. QA runs on every tier. When set, wins over the legacy chain's positional split; when empty, that split applies.",
+      },
+      reviewQaAgentIdsByProjectId: {
+        type: "object",
+        additionalProperties: { type: "array", items: { type: "string" } },
+        default: {},
+        description:
+          "Review-guard (TWO-5879): per-project QA reviewer overrides, keyed by project ID. A project entry wins over reviewQaAgentIds for that project's cards.",
+      },
+      reviewSecurityAgentIds: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description:
+          "Review-guard (TWO-5879): Security reviewer stage participants, added only for Sensitive/unknown tiers (Security then QA). When set, wins over the legacy chain's positional split; when empty, that split applies. With no usable Security reviewer a Sensitive card fails closed instead of downgrading to QA-only.",
+      },
+      reviewSecurityAgentIdsByProjectId: {
+        type: "object",
+        additionalProperties: { type: "array", items: { type: "string" } },
+        default: {},
+        description:
+          "Review-guard (TWO-5879): per-project Security reviewer overrides, keyed by project ID. A project entry wins over reviewSecurityAgentIds for that project's cards.",
       },
       dryRun: {
         type: "boolean",

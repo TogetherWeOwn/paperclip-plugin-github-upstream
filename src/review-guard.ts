@@ -2,14 +2,24 @@ import { randomUUID } from "node:crypto";
 import type { Issue, IssueExecutionPolicy } from "@paperclipai/shared";
 import type { PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import { resolveConfig, type UpstreamConfig } from "./config.js";
+import { needsSecurityReview, resolveReviewTier, type ResolvedTier, type RiskTier } from "./review-tiers.js";
 import { stateKey } from "./state.js";
 
 /**
- * Review-guard (TWO-5794): a code card must never sit in `in_review` with no
- * live reviewer. There is no project/company default `executionPolicy` — the
- * creator's stages (or lack of them) are all the card gets — so this guard
- * stamps the configured default stages onto code cards that reach `in_review`
- * (or are created as code work) without one, and stamps an audit comment.
+ * Review-guard (TWO-5794 + TWO-5879): a code card must never sit in
+ * `in_review` with no live reviewer. There is no project/company default
+ * `executionPolicy` — the creator's stages (or lack of them) are all the
+ * card gets — so this guard stamps the configured default stages onto code
+ * cards that reach `in_review` (or are created as code work) without one,
+ * and stamps an audit comment.
+ *
+ * TWO-5879 risk-tiers that staffing by the PR's changed paths (via each
+ * repo's `.github/review-tiers.yml`, matched against the workspace diff):
+ * QA runs on every tier, Security only on Sensitive/unknown. The tier is
+ * recomputed on every head — a push can add sensitive paths — so a card
+ * already stamped QA-only is upgraded (Security prepended, existing stage
+ * IDs preserved) when a later head tiers Sensitive. A pending Security
+ * stage is never downgraded when a later head tiers lower.
  *
  * SDK contract used (stock SDK, no core patch):
  * - `ctx.events.on("issue.created" | "issue.updated")` — needs `events.subscribe`.
@@ -22,18 +32,24 @@ import { stateKey } from "./state.js";
  *   `responsibleUserId`/`watchdog`) accepts `executionPolicy`. The patch is cast
  *   once, in `applyReviewPolicy`, with this citation.
  * - `ctx.issues.createComment` — needs `issue.comments.create`; the audit stamp.
+ * - Workspace metadata for the tier diff — needs `project.workspaces.read` and
+ *   `execution.workspaces.read` (`ctx.projects.getWorkspaceForIssue`,
+ *   `ctx.executionWorkspaces.get`). The checkout path and base ref come from
+ *   the host; only read-only `git` (merge-base, diff, ls-files, rev-parse)
+ *   runs there. Any lookup or git failure tiers Sensitive.
  *
  * Idempotence / loop safety: an `issue.updated` caused by the guard's own
  * `issues.update` re-enters the handler, sees a live reviewer stage (or
  * `auto` mode), and returns without writing. The `applied` plugin-state record
- * additionally dedupes the audit comment across event/sweep retries. v1
+ * additionally dedupes the audit comment across event/sweep retries, keyed by
+ * tier so a re-tiered head earns exactly one upgrade comment. v1
  * limitation (noted, not solved): the record is read-modify-write, so a
  * concurrent event+sweep pair can both pass the dedupe check and duplicate
  * one audit comment; the policy write itself is idempotent.
  */
 
 export type ReviewGuardOutcome =
-  | { applied: true; stages: number; commented: boolean }
+  | { applied: true; stages: number; commented: boolean; tier: RiskTier; upgraded: boolean }
   | { applied: false; reason: "disabled" | "not-code-card" | "has-stages" | "auto-mode" | "unconfigured" | "dry-run" | "terminal" | "no-eligible-reviewers" | "comment-retried" };
 
 /** Code work = bound to a project workspace (a repo). Per TWO-5794, workspace presence is the signal. */
@@ -73,6 +89,54 @@ export const pickReviewAgentIds = (
   issue: Pick<Issue, "projectId">,
 ): string[] => pickReview(config, issue).agentIds;
 
+/**
+ * QA staffing (TWO-5879): the explicit QA role list wins; otherwise the
+ * legacy chain's position split applies (everything after the first ID).
+ * A single-ID legacy chain reads as QA-only.
+ */
+export const pickQaAgentIds = (
+  config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId" | "reviewQaAgentIds" | "reviewQaAgentIdsByProjectId">,
+  issue: Pick<Issue, "projectId">,
+): string[] => {
+  if (issue.projectId) {
+    const override = config.reviewQaAgentIdsByProjectId[issue.projectId];
+    if (override && override.length > 0) return dedupe(override);
+  }
+  if (config.reviewQaAgentIds.length > 0) return dedupe(config.reviewQaAgentIds);
+  const chain = pickReviewAgentIds(config, issue);
+  return chain.length >= 2 ? dedupe(chain.slice(1)) : dedupe(chain);
+};
+
+/**
+ * Security staffing (TWO-5879): the explicit Security role list wins;
+ * otherwise the legacy chain's first ID is Security. A chain of fewer than
+ * two IDs leaves Security unstaffed (Sensitive cards fail closed).
+ */
+export const pickSecurityAgentIds = (
+  config: Pick<UpstreamConfig, "defaultReviewAgentIds" | "reviewAgentIdsByProjectId" | "reviewSecurityAgentIds" | "reviewSecurityAgentIdsByProjectId">,
+  issue: Pick<Issue, "projectId">,
+): string[] => {
+  if (issue.projectId) {
+    const override = config.reviewSecurityAgentIdsByProjectId[issue.projectId];
+    if (override && override.length > 0) return dedupe(override);
+  }
+  if (config.reviewSecurityAgentIds.length > 0) return dedupe(config.reviewSecurityAgentIds);
+  const chain = pickReviewAgentIds(config, issue);
+  return chain.length >= 2 ? [chain[0] as string] : [];
+};
+
+/** Agent IDs already carrying a live stage on the card, if any. */
+const stageAgentIds = (issue: Pick<Issue, "executionPolicy">): Set<string> => {
+  const ids = new Set<string>();
+  for (const stage of issue.executionPolicy?.stages ?? []) {
+    for (const p of stage.participants) {
+      if (typeof p.agentId === "string" && p.agentId.length > 0) ids.add(p.agentId);
+      if (typeof p.userId === "string" && p.userId.length > 0) ids.add(`user:${p.userId}`);
+    }
+  }
+  return ids;
+};
+
 /** The card's executor must never be stamped as its own reviewer. */
 const executorAgentIds = (issue: Pick<Issue, "assigneeAgentId" | "executionState">): Set<string> => {
   const ids = new Set<string>();
@@ -98,7 +162,32 @@ export const buildReviewPolicy = (agentIds: string[], existing?: IssueExecutionP
   })),
 });
 
-type AppliedRecord = Record<string, { at: string; stages: number; commented?: boolean; source?: string }>;
+/**
+ * Upgrade policy for a re-tiered head (TWO-5879): the fresh Security stages
+ * are prepended to the untouched existing stages, so an in-flight reviewer
+ * keeps their stage id (and any approval already recorded against it).
+ */
+export const buildUpgradedPolicy = (existing: IssueExecutionPolicy, securityAgentIds: string[]): IssueExecutionPolicy => ({
+  ...existing,
+  mode: "normal",
+  commentRequired: true,
+  stages: [...buildReviewPolicy(securityAgentIds).stages, ...existing.stages],
+});
+
+type AppliedRecord = Record<string, { at: string; stages: number; commented?: boolean; source?: string; tier?: RiskTier }>;
+
+type ReviewGuardConfig = Pick<
+  UpstreamConfig,
+  | "reviewGuardEnabled"
+  | "reviewGuardDryRun"
+  | "dryRun"
+  | "defaultReviewAgentIds"
+  | "reviewAgentIdsByProjectId"
+  | "reviewQaAgentIds"
+  | "reviewQaAgentIdsByProjectId"
+  | "reviewSecurityAgentIds"
+  | "reviewSecurityAgentIdsByProjectId"
+>;
 
 const readApplied = async (ctx: PluginContext, companyId: string): Promise<AppliedRecord> =>
   ((await ctx.state.get(stateKey(companyId, "review-guard.applied"))) as AppliedRecord | null) ?? {};
@@ -108,16 +197,20 @@ const writeApplied = async (ctx: PluginContext, companyId: string, applied: Appl
 };
 
 /**
- * Ensure one issue carries the default review policy. Returns what happened so
- * sweeps can count and tests can pin the contract. Never throws for a
- * legitimate no-op; plugin-internal failures (update/comment) propagate so the
- * host logs them and the sweep retries next tick.
+ * Ensure one issue carries the tier-appropriate review policy. Returns what
+ * happened so sweeps can count and tests can pin the contract. Never throws
+ * for a legitimate no-op; plugin-internal failures (update/comment)
+ * propagate so the host logs them and the sweep retries next tick.
+ *
+ * `tiering` overrides the live workspace tier for tests; production always
+ * resolves it from the card's current head via {@link resolveReviewTier}.
  */
 export async function ensureReviewPolicy(
   ctx: PluginContext,
   companyId: string,
   issue: Issue,
-  config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "dryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
+  config: ReviewGuardConfig,
+  tiering?: ResolvedTier,
 ): Promise<ReviewGuardOutcome> {
   if (!config.reviewGuardEnabled) return { applied: false, reason: "disabled" };
   if (issue.status === "done" || issue.status === "cancelled") return { applied: false, reason: "terminal" };
@@ -126,40 +219,159 @@ export async function ensureReviewPolicy(
   if (policy && policy.mode === "auto") return { applied: false, reason: "auto-mode" };
   // Either dry-run flag suppresses writes, matching the other scans.
   const dryRun = config.reviewGuardDryRun || config.dryRun;
+
+  // Re-tier on every call: a push can add sensitive paths, so the tier of
+  // the current head — not the tier at stamp time — decides staffing.
+  const resolved = tiering ?? (await resolveReviewTier(ctx, companyId, issue));
+  const needsSecurity = needsSecurityReview(resolved.tier);
+  const { source } = pickReview(config, issue);
+  const excluded = executorAgentIds(issue);
+  const securityIds = pickSecurityAgentIds(config, issue).filter((id) => !excluded.has(id));
+  const qaIds = pickQaAgentIds(config, issue).filter((id) => !excluded.has(id));
+
   const applied = await readApplied(ctx, companyId);
   const prior = applied[issue.id];
+  // Records stamped before tiering carry no tier: treat them as matching so
+  // they neither re-comment nor block an upgrade check on security presence.
+  const tierChanged = prior?.tier !== undefined && prior.tier !== resolved.tier;
+
   if (hasLiveReviewStage(issue)) {
-    // A pending record means the policy was stamped but the audit comment
-    // failed: retry the comment instead of hiding behind the live stage.
-    if (prior && prior.commented === false && !dryRun) {
+    // A pending record for the same tier means the policy was stamped but
+    // the audit comment failed: retry the comment instead of hiding behind
+    // the live stage.
+    if (prior && prior.commented === false && !tierChanged && !dryRun) {
       // The retry must attribute the original source, not whatever the
       // config says now: the staged stages are the ones from stamp time.
-      const source = prior.source ?? pickReview(config, issue).source;
+      const retrySource = prior.source ?? source;
       const stageCount = prior.stages;
       await ctx.issues.createComment(
         issue.id,
-        `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (config: ${source}).`,
+        `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${prior.tier ?? resolved.tier}; config: ${retrySource}).`,
         companyId,
       );
       await writeApplied(ctx, companyId, { ...applied, [issue.id]: { ...prior, at: new Date().toISOString(), commented: true } });
       ctx.logger.info("review-guard retried audit comment", { companyId, issueId: issue.id });
       return { applied: false, reason: "comment-retried" };
     }
+    // Upgrade path: a later head tiers Sensitive while the card only carries
+    // QA (or other) stages. Prepend the missing Security stages; never strip
+    // or reorder the stages already there. If Security is unstaffed (no
+    // config, or the executor is the Security reviewer) the existing stages
+    // stand — removing them would be a downgrade without an audit comment.
+    if (needsSecurity) {
+      const present = stageAgentIds(issue);
+      // Unfiltered Security staffing: an agent already on the card counts
+      // as Security even when the eligible list is empty (e.g. it was the
+      // executor). Without this, "already carries Security" below can only
+      // be true when securityIds is non-empty — the unstaffed case would
+      // silently fall through to the same log line (finding: silent QA-only).
+      const carriesSecurity = [...present].some((id) => pickSecurityAgentIds(config, issue).includes(id));
+      const missing = securityIds.filter((id) => !present.has(id));
+      if (!carriesSecurity && securityIds.length === 0) {
+        // Fail closed, loudly: a Sensitive head with no eligible Security
+        // stage cannot be silently left QA-only. Post an audit comment so
+        // QA/humans see the gap (deduped per tier via the applied record)
+        // instead of just logging that the head "already carries Security".
+        ctx.logger.info("review-guard kept existing stages: Sensitive head without an eligible Security reviewer", {
+          companyId,
+          issueId: issue.id,
+          tier: resolved.tier,
+        });
+        if (dryRun) return { applied: false, reason: "dry-run" };
+        if (!(prior?.tier === resolved.tier && prior.commented === true)) {
+          await writeApplied(ctx, companyId, {
+            ...applied,
+            [issue.id]: { at: new Date().toISOString(), stages: issue.executionPolicy?.stages?.length ?? 0, commented: false, source, tier: resolved.tier },
+          });
+          await ctx.issues.createComment(
+            issue.id,
+            `Review-guard: Sensitive head (tier ${resolved.tier}: ${resolved.reason}) has no eligible Security reviewer stage — card remains without Security review until one is staffed. Not downgraded to QA-only silently (config: ${source}).`,
+            companyId,
+          );
+          await writeApplied(ctx, companyId, {
+            ...applied,
+            [issue.id]: { at: new Date().toISOString(), stages: issue.executionPolicy?.stages?.length ?? 0, commented: true, source, tier: resolved.tier },
+          });
+        }
+        return { applied: false, reason: "no-eligible-reviewers" };
+      }
+      if (missing.length > 0) {
+        if (dryRun) {
+          ctx.logger.info("review-guard dry-run: would upgrade review policy with Security", {
+            companyId,
+            issueId: issue.id,
+            tier: resolved.tier,
+          });
+          return { applied: false, reason: "dry-run" };
+        }
+        // Cast cites the module header: see the stamp path below.
+        const upgraded = await ctx.issues.update(
+          issue.id,
+          { executionPolicy: buildUpgradedPolicy(issue.executionPolicy as IssueExecutionPolicy, missing) } as never,
+          companyId,
+        );
+        const stageCount = upgraded.executionPolicy?.stages?.length ?? securityIds.length + (issue.executionPolicy?.stages?.length ?? 0);
+        await writeApplied(ctx, companyId, {
+          ...applied,
+          [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source, tier: resolved.tier },
+        });
+        await ctx.issues.createComment(
+          issue.id,
+          `Review-guard upgraded review policy: added ${missing.length} Security stage${missing.length === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`,
+          companyId,
+        );
+        await writeApplied(ctx, companyId, {
+          ...applied,
+          [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true, source, tier: resolved.tier },
+        });
+        ctx.logger.info("review-guard upgraded review policy with Security", {
+          companyId,
+          issueId: issue.id,
+          stages: stageCount,
+          tier: resolved.tier,
+        });
+        return { applied: true, stages: stageCount, commented: true, tier: resolved.tier, upgraded: true };
+      }
+      ctx.logger.info("review-guard kept existing stages: Sensitive head already carries Security", {
+        companyId,
+        issueId: issue.id,
+        tier: resolved.tier,
+      });
+    } else {
+      // No downgrade: a lower tier never removes a pending Security stage.
+      ctx.logger.info("review-guard kept existing stages: lower tier never downgrades", {
+        companyId,
+        issueId: issue.id,
+        tier: resolved.tier,
+      });
+    }
     return { applied: false, reason: "has-stages" };
   }
 
-  const { agentIds: picked, source } = pickReview(config, issue);
-  if (picked.length === 0) {
+  // No live stages: stamp the tier's staffing (QA always; Security added for
+  // Sensitive/unknown). A Sensitive head with no usable Security reviewer
+  // fails closed — QA-only would silently skip security review.
+  const agentIds = dedupe(needsSecurity ? [...securityIds, ...qaIds] : [...qaIds]);
+  if (agentIds.length === 0) {
+    const staffed = pickSecurityAgentIds(config, issue).length + pickQaAgentIds(config, issue).length > 0;
+    if (staffed) {
+      // Fail closed: the executor must not review their own card, and no
+      // other configured reviewer remains. Never stamp a self-review stage.
+      ctx.logger.info("review-guard skipped: configured reviewers are the card executor", { companyId, issueId: issue.id });
+      return { applied: false, reason: "no-eligible-reviewers" };
+    }
     // Fail closed when unconfigured: never invent a reviewer.
     ctx.logger.info("review-guard skipped: no review agent IDs configured for company", { companyId, issueId: issue.id });
     return { applied: false, reason: "unconfigured" };
   }
-  const excluded = executorAgentIds(issue);
-  const agentIds = picked.filter((id) => !excluded.has(id));
-  if (agentIds.length === 0) {
-    // Fail closed: the executor must not review their own card, and no other
-    // configured reviewer remains. Never stamp a self-review stage.
-    ctx.logger.info("review-guard skipped: configured reviewers are the card executor", { companyId, issueId: issue.id });
+  if (needsSecurity && securityIds.length === 0) {
+    // Some reviewers exist, but the Security stage the tier requires has
+    // none of them: never silently downgrade a Sensitive head to QA-only.
+    ctx.logger.info("review-guard skipped: Sensitive head without an eligible Security reviewer", {
+      companyId,
+      issueId: issue.id,
+      tier: resolved.tier,
+    });
     return { applied: false, reason: "no-eligible-reviewers" };
   }
 
@@ -168,6 +380,7 @@ export async function ensureReviewPolicy(
       companyId,
       issueId: issue.id,
       stages: agentIds.length,
+      tier: resolved.tier,
     });
     return { applied: false, reason: "dry-run" };
   }
@@ -182,25 +395,25 @@ export async function ensureReviewPolicy(
   );
   const stageCount = next.executionPolicy?.stages?.length ?? agentIds.length;
 
-  // Audit-stamp once: if the state record is already there (event + sweep both
-  // raced the same card), skip the duplicate comment. The record is written
-  // as pending before the comment so a failed comment is retried by the next
-  // event/sweep (see the `hasLiveReviewStage` branch above).
+  // Audit-stamp once per tier: if the record already names this tier (event
+  // + sweep both raced the same card), skip the duplicate comment. The
+  // record is written as pending before the comment so a failed comment is
+  // retried by the next event/sweep (see the `hasLiveReviewStage` branch).
   let commented = false;
-  if (!prior) {
+  if (!prior || prior.tier !== resolved.tier) {
     await writeApplied(ctx, companyId, {
       ...applied,
-      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source },
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: false, source, tier: resolved.tier },
     });
     await ctx.issues.createComment(
       issue.id,
-      `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (config: ${source}).`,
+      `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`,
       companyId,
     );
     commented = true;
     await writeApplied(ctx, companyId, {
       ...applied,
-      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true, source },
+      [issue.id]: { at: new Date().toISOString(), stages: stageCount, commented: true, source, tier: resolved.tier },
     });
   }
 
@@ -209,8 +422,9 @@ export async function ensureReviewPolicy(
     issueId: issue.id,
     stages: stageCount,
     commented,
+    tier: resolved.tier,
   });
-  return { applied: true, stages: stageCount, commented };
+  return { applied: true, stages: stageCount, commented, tier: resolved.tier, upgraded: false };
 }
 
 /** Handle one `issue.created` / `issue.updated` event. Fail-closed on missing config, like the scans. */
@@ -244,7 +458,7 @@ export const SWEEP_PAGE = 100;
 export async function runReviewGuardSweep(
   ctx: PluginContext,
   companyId: string,
-  config: Pick<UpstreamConfig, "reviewGuardEnabled" | "reviewGuardDryRun" | "dryRun" | "defaultReviewAgentIds" | "reviewAgentIdsByProjectId">,
+  config: ReviewGuardConfig,
 ): Promise<{ checked: number; applied: number; skipped: Record<string, number> }> {
   const skipped: Record<string, number> = {};
   const tally = (reason: string) => {

@@ -1,0 +1,21 @@
+# Path-based risk tiers for the review-guard (TWO-5879).
+# QA reviews every change; Security is added for sensitive or unclassified
+# paths. Anything unmatched here — including new paths — tiers Sensitive
+# (fails closed). Sensitive wins when lists overlap.
+low:
+  - "**/*.md"
+  - "LICENSE"
+ordinary:
+  - "src/ui/**"
+  - "src/*.test.ts"
+  - "bin/**"
+sensitive:
+  - "src/review-guard.ts"
+  - "src/review-tiers.ts"
+  - "src/config.ts"
+  - "src/manifest.ts"
+  - "src/github*.ts"
+  - "src/*scan*.ts"
+  - ".github/**"
+  - "package*.json"
+  - "scripts/**"

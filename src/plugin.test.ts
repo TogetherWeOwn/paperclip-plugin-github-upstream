@@ -50,6 +50,8 @@ describe("plugin wiring", () => {
         "plugin.state.write",
         "events.subscribe",
         "ui.page.register",
+        "project.workspaces.read",
+        "execution.workspaces.read",
       ]),
     );
     const jobs = Object.fromEntries((manifest.jobs ?? []).map((j) => [j.jobKey, j.schedule]));
@@ -63,6 +65,10 @@ describe("plugin wiring", () => {
       "reviewGuardDryRun",
       "defaultReviewAgentIds",
       "reviewAgentIdsByProjectId",
+      "reviewQaAgentIds",
+      "reviewQaAgentIdsByProjectId",
+      "reviewSecurityAgentIds",
+      "reviewSecurityAgentIdsByProjectId",
       "appId",
       "installationId",
       "appPrivateKeySecretRef",

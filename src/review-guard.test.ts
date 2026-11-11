@@ -6,12 +6,16 @@ import plugin from "./plugin.js";
 import { resolveConfig } from "./config.js";
 import {
   buildReviewPolicy,
+  buildUpgradedPolicy,
   ensureReviewPolicy,
   hasLiveReviewStage,
   isReviewCodeCard,
+  pickQaAgentIds,
   pickReviewAgentIds,
+  pickSecurityAgentIds,
   runReviewGuardSweep,
 } from "./review-guard.js";
+import type { ResolvedTier } from "./review-tiers.js";
 
 const COMPANY = "c-1";
 const PROJECT = "p-1";
@@ -193,13 +197,33 @@ describe("review-guard events (real SDK contract)", () => {
   it("never stamps the executor as their own reviewer", async () => {
     const harness = await setup();
     const updates = spyUpdates(harness);
-    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+    const issue = seedIssue(harness, { assigneeAgentId: QA });
 
     await emitIssue(harness, "issue.created", issue.id);
 
     expect(updates).toHaveLength(1);
     const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
-    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([QA]);
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY]);
+  });
+
+  it("fails closed instead of downgrading to QA-only when the executor is the Security reviewer", async () => {
+    // No workspace checkout seeded, so the tier fails closed to Sensitive and
+    // the card needs Security; the only Security reviewer is the executor, so
+    // the guard must not stamp a QA-only policy.
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, { assigneeAgentId: SECURITY });
+
+    await emitIssue(harness, "issue.created", issue.id);
+    expect(updates).toHaveLength(0);
+
+    const outcome = await ensureReviewPolicy(
+      harness.ctx,
+      COMPANY,
+      (await harness.ctx.issues.get(issue.id, COMPANY)) as never,
+      resolveConfig(GUARD_CONFIG),
+    );
+    expect(outcome).toEqual({ applied: false, reason: "no-eligible-reviewers" });
   });
 
   it("fails closed (no stamp) when the executor is the only configured reviewer", async () => {
@@ -232,7 +256,12 @@ describe("review-guard events (real SDK contract)", () => {
   });
 
   it("dedupes duplicate configured reviewers into one stage", async () => {
-    const harness = await setup({ reviewGuardEnabled: true, defaultReviewAgentIds: [QA, QA] });
+    const harness = await setup({
+      reviewGuardEnabled: true,
+      defaultReviewAgentIds: [SECURITY, QA],
+      reviewSecurityAgentIds: [SECURITY],
+      reviewQaAgentIds: [QA, QA],
+    });
     const updates = spyUpdates(harness);
     const issue = seedIssue(harness);
 
@@ -240,7 +269,7 @@ describe("review-guard events (real SDK contract)", () => {
 
     expect(updates).toHaveLength(1);
     const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
-    expect(policy.stages).toHaveLength(1);
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY, QA]);
   });
 
   it("skips terminal cards (done/cancelled)", async () => {
@@ -300,7 +329,7 @@ describe("review-guard events (real SDK contract)", () => {
   it("uses the per-project override when configured", async () => {
     const harness = await setup({
       ...GUARD_CONFIG,
-      reviewAgentIdsByProjectId: { [PROJECT]: [EXTRA] },
+      reviewAgentIdsByProjectId: { [PROJECT]: [SECURITY, EXTRA] },
     });
     const updates = spyUpdates(harness);
     const issue = seedIssue(harness);
@@ -308,7 +337,7 @@ describe("review-guard events (real SDK contract)", () => {
     const comments = spyComments(harness);
     await emitIssue(harness, "issue.created", issue.id);
     const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
-    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([EXTRA]);
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY, EXTRA]);
     expect(comments).toHaveLength(1);
     expect(comments[0].body).toContain(`project override ${PROJECT}`);
   });
@@ -438,7 +467,7 @@ describe("review-guard sweep", () => {
     const comments = spyComments(harness);
     const bare = seedIssue(harness);
     seedIssue(harness, { status: "todo" });
-    seedIssue(harness, { executionPolicy: buildReviewPolicy([QA]) });
+    seedIssue(harness, { executionPolicy: buildReviewPolicy([SECURITY, QA]) });
     seedIssue(harness, { projectWorkspaceId: null });
 
     await harness.runJob(REVIEW_GUARD_JOB_KEY);
@@ -493,6 +522,10 @@ describe("review-guard config resolution", () => {
     expect(config.reviewGuardDryRun).toBe(false);
     expect(config.defaultReviewAgentIds).toEqual([]);
     expect(config.reviewAgentIdsByProjectId).toEqual({});
+    expect(config.reviewQaAgentIds).toEqual([]);
+    expect(config.reviewQaAgentIdsByProjectId).toEqual({});
+    expect(config.reviewSecurityAgentIds).toEqual([]);
+    expect(config.reviewSecurityAgentIdsByProjectId).toEqual({});
   });
 
   it("keeps explicit values, drops empty entries, only true enables", () => {
@@ -501,10 +534,163 @@ describe("review-guard config resolution", () => {
       reviewGuardDryRun: true,
       defaultReviewAgentIds: [QA, "", QA],
       reviewAgentIdsByProjectId: { [PROJECT]: [SECURITY], "": [QA], empty: [] },
+      reviewQaAgentIds: [EXTRA, EXTRA],
+      reviewSecurityAgentIdsByProjectId: { [PROJECT]: [SECURITY] },
     });
     expect(config.reviewGuardEnabled).toBe(false);
     expect(config.reviewGuardDryRun).toBe(true);
     expect(config.defaultReviewAgentIds).toEqual([QA]);
     expect(config.reviewAgentIdsByProjectId).toEqual({ [PROJECT]: [SECURITY] });
+    expect(config.reviewQaAgentIds).toEqual([EXTRA]);
+    expect(config.reviewSecurityAgentIdsByProjectId).toEqual({ [PROJECT]: [SECURITY] });
+  });
+});
+
+describe("review-guard role split (TWO-5879)", () => {
+  it("splits the legacy chain by position: first Security, rest QA", () => {
+    const config = resolveConfig({ defaultReviewAgentIds: [SECURITY, QA] });
+    expect(pickSecurityAgentIds(config, { projectId: PROJECT })).toEqual([SECURITY]);
+    expect(pickQaAgentIds(config, { projectId: PROJECT })).toEqual([QA]);
+    // Single-ID chain reads as QA-only; Security is unstaffed.
+    const single = resolveConfig({ defaultReviewAgentIds: [QA] });
+    expect(pickSecurityAgentIds(single, { projectId: PROJECT })).toEqual([]);
+    expect(pickQaAgentIds(single, { projectId: PROJECT })).toEqual([QA]);
+  });
+
+  it("lets explicit role lists win over the legacy split, per role", () => {
+    const config = resolveConfig({
+      defaultReviewAgentIds: [SECURITY, QA],
+      reviewQaAgentIds: [EXTRA],
+    });
+    expect(pickQaAgentIds(config, { projectId: PROJECT })).toEqual([EXTRA]);
+    // Security unset falls back to the legacy split for that role alone.
+    expect(pickSecurityAgentIds(config, { projectId: PROJECT })).toEqual([SECURITY]);
+  });
+
+  it("lets per-project role overrides win", () => {
+    const config = resolveConfig({
+      defaultReviewAgentIds: [SECURITY, QA],
+      reviewQaAgentIdsByProjectId: { [PROJECT]: [EXTRA] },
+    });
+    expect(pickQaAgentIds(config, { projectId: PROJECT })).toEqual([EXTRA]);
+    expect(pickQaAgentIds(config, { projectId: "other" })).toEqual([QA]);
+  });
+
+  it("prepends fresh Security stages ahead of untouched existing stages", () => {
+    const existing = buildReviewPolicy([QA]);
+    const upgraded = buildUpgradedPolicy(existing, [SECURITY]);
+    expect(upgraded.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY, QA]);
+    // The preserved stage keeps its id (and any approval recorded against it).
+    expect(upgraded.stages[1]?.id).toBe(existing.stages[0]?.id);
+    expect(upgraded.stages[0]?.id).not.toBe(existing.stages[0]?.id);
+  });
+});
+
+describe("review-guard tiering (TWO-5879)", () => {
+  const LOW: ResolvedTier = { tier: "low", reason: "2 changed paths classified low", changedPaths: ["README.md"], headSha: "abc" };
+  const ORDINARY: ResolvedTier = { tier: "ordinary", reason: "1 changed path classified ordinary", changedPaths: ["src/ui/x.tsx"], headSha: "abc" };
+  const SENSITIVE: ResolvedTier = { tier: "sensitive", reason: "sensitive path src/auth/x.ts (2 changed)", changedPaths: ["src/auth/x.ts"], headSha: "def" };
+  const UNKNOWN: ResolvedTier = { tier: "unknown", reason: "unmatched path src/new/x.ts", changedPaths: ["src/new/x.ts"], headSha: "def" };
+
+  it("stamps QA-only for low and ordinary, Security then QA for sensitive and unknown", async () => {
+    for (const [tiering, expected] of [
+      [LOW, [QA]],
+      [ORDINARY, [QA]],
+      [SENSITIVE, [SECURITY, QA]],
+      [UNKNOWN, [SECURITY, QA]],
+    ] as const) {
+      const harness = await setup();
+      const updates = spyUpdates(harness);
+      const comments = spyComments(harness);
+      const issue = seedIssue(harness);
+      const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+      const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, resolveConfig(GUARD_CONFIG), tiering);
+      expect(outcome.applied).toBe(true);
+      const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+      expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual(expected);
+      expect(comments[0].body).toContain(`tier ${tiering.tier}`);
+    }
+  });
+
+  it("marks the policy as upgraded when it prepends Security to a QA-only card", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const comments = spyComments(harness);
+    const qaStageId = randomUUID();
+    const issue = seedIssue(harness, {
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{ id: qaStageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: QA }] }],
+      },
+    });
+    const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+    const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, resolveConfig(GUARD_CONFIG), SENSITIVE);
+    expect(outcome).toEqual({ applied: true, stages: 2, commented: true, tier: "sensitive", upgraded: true });
+    const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY, QA]);
+    expect(policy.stages[1]?.id).toBe(qaStageId);
+    expect(comments[0].body).toContain("upgraded review policy");
+    expect(comments[0].body).toContain("src/auth/x.ts");
+
+    // Re-running on the same tier does not re-upgrade or re-comment.
+    const again = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, resolveConfig(GUARD_CONFIG), SENSITIVE);
+    expect(again).toEqual({ applied: false, reason: "has-stages" });
+    expect(updates).toHaveLength(1);
+    expect(comments).toHaveLength(1);
+  });
+
+  it("never downgrades a pending Security stage when a later head tiers lower", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness, { executionPolicy: buildReviewPolicy([SECURITY, QA]) });
+    const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+    const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, resolveConfig(GUARD_CONFIG), LOW);
+    expect(outcome).toEqual({ applied: false, reason: "has-stages" });
+    expect(updates).toHaveLength(0);
+  });
+
+  it("leaves a sensitive card unstamped when no Security reviewer is staffed", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness);
+    const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+    // QA-only legacy chain: the Sensitive tier cannot be staffed without Security.
+    const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, resolveConfig({ reviewGuardEnabled: true, defaultReviewAgentIds: [QA] }), SENSITIVE);
+    expect(outcome).toEqual({ applied: false, reason: "no-eligible-reviewers" });
+    expect(updates).toHaveLength(0);
+    // The same card on a low tier still stamps QA.
+    const lowOutcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, resolveConfig({ reviewGuardEnabled: true, defaultReviewAgentIds: [QA] }), LOW);
+    expect(lowOutcome.applied).toBe(true);
+  });
+
+  it("flags (never silently keeps QA-only) a Sensitive head whose QA-only card has no eligible Security reviewer", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const comments = spyComments(harness);
+    const issue = seedIssue(harness, { executionPolicy: buildReviewPolicy([QA]) });
+    const fresh = (await harness.ctx.issues.get(issue.id, COMPANY)) as never;
+    // QA-only legacy chain: no Security staffing exists at all.
+    const config = resolveConfig({ reviewGuardEnabled: true, defaultReviewAgentIds: [QA] });
+    const outcome = await ensureReviewPolicy(harness.ctx, COMPANY, fresh, config, SENSITIVE);
+    expect(outcome).toEqual({ applied: false, reason: "no-eligible-reviewers" });
+    expect(updates).toHaveLength(0);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("no eligible Security reviewer stage");
+    expect(comments[0].body).toContain("tier sensitive");
+    // A second call on the same tier does not re-flag.
+    const again = await ensureReviewPolicy(harness.ctx, COMPANY, (await harness.ctx.issues.get(issue.id, COMPANY)) as never, config, SENSITIVE);
+    expect(again).toEqual({ applied: false, reason: "no-eligible-reviewers" });
+    expect(comments).toHaveLength(1);
+  });
+
+  it("fails closed to Sensitive in production without a checkout", async () => {
+    const harness = await setup();
+    const updates = spyUpdates(harness);
+    const issue = seedIssue(harness);
+    await emitIssue(harness, "issue.created", issue.id);
+    const policy = (updates[0].patch as { executionPolicy: ReturnType<typeof buildReviewPolicy> }).executionPolicy;
+    // No workspace seeded: tier failed closed, so the full chain is stamped.
+    expect(policy.stages.map((s) => s.participants[0]?.agentId)).toEqual([SECURITY, QA]);
   });
 });
