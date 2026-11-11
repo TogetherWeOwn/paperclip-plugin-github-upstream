@@ -31,6 +31,22 @@ tiers:
     expect(parseReviewTierMap("version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n")).toEqual({ low: [], ordinary: [], sensitive: [] });
   });
 
+  it("accepts comments on v1 block keys and quoted items", () => {
+    expect(parseReviewTierMap(`version: 1
+default_tier: sensitive
+tiers:
+  low: # documentation
+    - "docs/**" # documentation
+  ordinary: []
+  sensitive: []
+`)).toEqual({ low: ["docs/**"], ordinary: [], sensitive: [] });
+  });
+
+  it("accepts consistently indented legacy block lists", () => {
+    expect(parseReviewTierMap("low:\n    - docs/**\n    - LICENSE\n")).toEqual({ low: ["docs/**", "LICENSE"], ordinary: [], sensitive: [] });
+    expect(() => parseReviewTierMap("low:\n    - docs/**\n  - LICENSE\n")).toThrow();
+  });
+
   it("rejects unknown versions and ambiguous or incomplete schemas", () => {
     const valid = "version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n";
     for (const invalid of [valid.replace("version: 1", "version: 2"), valid.replace("sensitive\ntiers", "low\ntiers"), valid.replace("  low: []\n", ""), valid + "low: []\n", valid.replace("  low: []", "  low: []\n    - docs/**"), "low: [docs/**]\n  - src/**\n", "low: [null]\n", "low:\n  - \"bad\n"]) {

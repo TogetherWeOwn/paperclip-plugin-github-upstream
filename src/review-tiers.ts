@@ -52,6 +52,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
   const map: ReviewTierMap = { low: [], ordinary: [], sensitive: [] };
   let current: keyof ReviewTierMap | null = null;
   let inlineList = false;
+  let blockIndent: number | null = null;
   let inTiers = false;
   const seen = new Set<string>();
   const lines = text.split(/\r?\n/);
@@ -60,7 +61,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
   let defaultSeen = false;
   let tiersSeen = false;
   for (let i = 0; i < lines.length; i += 1) {
-    const raw = lines[i] ?? "";
+    const raw = stripComment(lines[i] ?? "");
     const trimmed = raw.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
     if (versioned && !raw.startsWith(" ") && !raw.startsWith("\t")) {
@@ -86,7 +87,8 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       if (seen.has(key)) throw new Error(`invalid tier map: duplicate key "${key}"`);
       seen.add(key);
       current = key;
-      const inline = (keyMatch[2] ?? "").trim().replace(/\]\s+#.*$/, "]");
+      blockIndent = null;
+      const inline = (keyMatch[2] ?? "").trim();
       inlineList = inline !== "";
       if (inlineList) {
         for (const item of parseInlineList(inline)) map[key].push(validatePattern(item));
@@ -94,11 +96,13 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       continue;
     }
     // Block list item under the current key.
-    const itemMatch = (versioned ? /^    -\s+(.*)$/ : /^  -\s+(.*)$/).exec(raw);
-    if (!itemMatch || current === null || inlineList) {
+    const itemMatch = /^( +)-\s+(.*)$/.exec(raw);
+    const indent = itemMatch?.[1]?.length ?? 0;
+    if (!itemMatch || current === null || inlineList || (versioned ? indent !== 4 : indent < 1) || (blockIndent !== null && blockIndent !== indent)) {
       throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
     }
-    map[current].push(validatePattern(dequote(itemMatch[1] ?? "")));
+    blockIndent = indent;
+    map[current].push(validatePattern(dequote(itemMatch[2] ?? "")));
   }
   if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
   if (versioned && (!versionSeen || !defaultSeen || !tiersSeen || seen.size !== 3)) {
@@ -107,6 +111,21 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
   const total = map.low.length + map.ordinary.length + map.sensitive.length;
   if (!versioned && total === 0) throw new Error("invalid tier map: no patterns");
   return map;
+}
+
+function stripComment(line: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === "#" && (i === 0 || /\s/.test(line[i - 1] ?? ""))) {
+      return line.slice(0, i).trimEnd();
+    }
+  }
+  return line;
 }
 
 /** Split `["a", 'b', c]` (or a bare scalar) into de-quoted items. Throws on malformed flow. */
