@@ -2,6 +2,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { startWorkerRpcHost } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_RELEASE_REPOS } from "./config.js";
 import manifest, { AUDIT_JOB_KEY, ITEM_JOB_KEY, PARKED_JOB_KEY, RELEASE_JOB_KEY, REVIEW_GUARD_JOB_KEY } from "./manifest.js";
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -35,7 +36,10 @@ type HostCall = { method: string; params: Record<string, unknown> };
  * (`runJob`) carry only {jobKey, runId, trigger, scheduledAt} — no company
  * scope — exactly as the production host delivers them.
  */
-async function upstreamHost() {
+async function upstreamHost(opts: {
+  seedState?: Record<string, unknown>;
+  httpFetch?: (params: Record<string, unknown>) => unknown;
+} = {}) {
   // One worker per plugin: reset the module so each test gets a fresh worker
   // with no captured company carried over from the last test.
   vi.resetModules();
@@ -44,7 +48,7 @@ async function upstreamHost() {
   const stdout = new PassThrough();
   const lines = createInterface({ input: stdout });
   const calls: HostCall[] = [];
-  const state = new Map<string, unknown>();
+  const state = new Map<string, unknown>(Object.entries(opts.seedState ?? {}));
   const keyOf = (p: Record<string, unknown>) => `${p.scopeKind}:${p.scopeId}:${p.namespace}:${p.stateKey}`;
   const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   const reply = (id: string | number, result: unknown) =>
@@ -95,7 +99,7 @@ async function upstreamHost() {
             reply(id, TOKEN);
             return;
           case "http.fetch":
-            reply(id, { status: 404, headers: {}, body: "not found" });
+            reply(id, opts.httpFetch?.(params) ?? { status: 404, headers: {}, body: "not found" });
             return;
           case "events.subscribe":
             reply(id, null);
@@ -122,7 +126,7 @@ async function upstreamHost() {
     const value = state.get(`company:${companyId}:undefined:runs`);
     return Array.isArray(value) ? value : [];
   };
-  return { send, stop, calls, runsFor };
+  return { send, stop, calls, runsFor, stateOf: (key: string) => state.get(key) };
 }
 
 const initializeParams = {
@@ -226,6 +230,32 @@ describe("scheduled jobs over the real SDK/host contract (TWO-5876)", () => {
       expect(h.calls.some((c) => c.method === "companies.list")).toBe(false);
       expect(h.runsFor(COMPANY)).toHaveLength(1);
       expect(h.runsFor(OTHER)).toHaveLength(1);
+    } finally { h.stop(); }
+  });
+});
+
+describe("conditional 304 over the real SDK http.fetch rebuild (paperclipai/paperclip#13084)", () => {
+  it("counts the host's empty-body 304 as not-modified, not as an error, and keeps the stored ETag", async () => {
+    const seeded = { etag: '"e1"', tag: "v1", createdTag: "v1", checkedAt: "2026-11-10T00:00:00Z" };
+    const releases = Object.fromEntries(DEFAULT_RELEASE_REPOS.map((r) => [r.toLowerCase(), seeded]));
+    const h = await upstreamHost({
+      seedState: { [`company:${COMPANY}:undefined:releases`]: releases },
+      // Production host shape: a 304 is serialized with body "" (not null).
+      httpFetch: (params) => {
+        const headers = ((params.init as { headers?: Record<string, string> } | undefined)?.headers) ?? {};
+        const conditional = Object.keys(headers).some((k) => k.toLowerCase() === "if-none-match");
+        return conditional ? { status: 304, statusText: "Not Modified", headers: { etag: '"e1"' }, body: "" } : undefined;
+      },
+    });
+    try {
+      await h.send("initialize", "initialize", initializeParams);
+      await h.send("config", "configChanged", { config: pluginConfig, companyId: COMPANY });
+      await h.send("job", "runJob", jobParams(RELEASE_JOB_KEY));
+
+      expect(h.runsFor(COMPANY).at(-1)).toMatchObject({ job: "release-scan", notModified304: 2, errors: 0 });
+      expect(h.stateOf(`company:${COMPANY}:undefined:releases`)).toEqual(
+        Object.fromEntries(Object.keys(releases).map((k) => [k, expect.objectContaining({ etag: '"e1"', tag: "v1" })])),
+      );
     } finally { h.stop(); }
   });
 });

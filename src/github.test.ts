@@ -62,6 +62,40 @@ describe("redirect and origin pinning (F9)", () => {
   });
 });
 
+describe("SDK-rebuilt conditional 304 (paperclipai/paperclip#13084 shim)", () => {
+  // The installed SDK rebuilds every host reply as `new Response(body, {status})`
+  // with the host's empty-string body; for a 304 that constructor throws.
+  const sdkRebuilt = (status: number) =>
+    (async () => new Response("", { status })) as (url: string, init?: RequestInit) => Promise<Response>;
+  const url = `${GITHUB_API_BASE}/repos/a/b/releases/latest`;
+
+  it("maps the 304 TypeError on a conditional GET to not-modified and keeps the stored ETag", async () => {
+    const res = await githubGet(sdkRebuilt(304), "t", url, '"e1"');
+    expect(res).toMatchObject({ status: 304, notModified: true, etag: '"e1"', data: null, rateLimited: false });
+  });
+
+  it("rethrows it on an unconditional GET (no ETag sent, so a 304 cannot be legitimate)", async () => {
+    await expect(githubGet(sdkRebuilt(304), "t", url, null)).rejects.toThrow(TypeError);
+  });
+
+  it("rethrows other null-body statuses and other TypeErrors", async () => {
+    await expect(githubGet(sdkRebuilt(204), "t", url, '"e1"')).rejects.toThrow(/status code 204/);
+    const network = (async () => { throw new TypeError("fetch failed"); }) as (url: string, init?: RequestInit) => Promise<Response>;
+    await expect(githubGet(network, "t", url, '"e1"')).rejects.toThrow(/fetch failed/);
+  });
+
+  it("rethrows near-miss TypeErrors that only mention a 304", async () => {
+    for (const message of [
+      "Transport failed while processing status code 304; connection aborted",
+      "Response constructor: Invalid response status code 304.5",
+      "Response constructor: Invalid response status code 3040",
+    ]) {
+      const nearMiss = (async () => { throw new TypeError(message); }) as (url: string, init?: RequestInit) => Promise<Response>;
+      await expect(githubGet(nearMiss, "t", url, '"e1"')).rejects.toThrow(message);
+    }
+  });
+});
+
 describe("isGraphqlRateLimited", () => {
   it("detects RATE_LIMITED error payloads on a 200", () => {
     expect(isGraphqlRateLimited([{ message: "slow down", type: "RATE_LIMITED" }])).toBe(true);
