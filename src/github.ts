@@ -97,7 +97,8 @@ function toResult<T>(res: Response, data: T | null, etag: string | null): GitHub
  * REMOVE once the installed SDK rebuilds null-body statuses with a null body
  * (open fix PRs paperclipai/paperclip#13133 / #17282).
  */
-const SDK_NULL_BODY_304 = /status code 304\b/;
+// Exact undici constructor message only: any other TypeError that merely mentions a 304 must stay an error.
+const SDK_NULL_BODY_304 = /^Response constructor: Invalid response status code 304$/;
 export const isSdkNullBody304 = (err: unknown): boolean =>
   err instanceof TypeError && SDK_NULL_BODY_304.test(err.message);
 

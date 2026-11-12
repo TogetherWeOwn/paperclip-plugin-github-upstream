@@ -83,6 +83,17 @@ describe("SDK-rebuilt conditional 304 (paperclipai/paperclip#13084 shim)", () =>
     const network = (async () => { throw new TypeError("fetch failed"); }) as (url: string, init?: RequestInit) => Promise<Response>;
     await expect(githubGet(network, "t", url, '"e1"')).rejects.toThrow(/fetch failed/);
   });
+
+  it("rethrows near-miss TypeErrors that only mention a 304", async () => {
+    for (const message of [
+      "Transport failed while processing status code 304; connection aborted",
+      "Response constructor: Invalid response status code 304.5",
+      "Response constructor: Invalid response status code 3040",
+    ]) {
+      const nearMiss = (async () => { throw new TypeError(message); }) as (url: string, init?: RequestInit) => Promise<Response>;
+      await expect(githubGet(nearMiss, "t", url, '"e1"')).rejects.toThrow(message);
+    }
+  });
 });
 
 describe("isGraphqlRateLimited", () => {
