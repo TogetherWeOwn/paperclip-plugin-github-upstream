@@ -37,6 +37,7 @@ jobs:
           test -f dist/review-tier-map-v1.js
           test -f dist/review-tier-map-v1.d.ts
           if git grep -n -F 'review-tier-map-v1' -- . \
+            ':(exclude)src/*.test.ts' \
             ':(exclude)src/**/*.test.ts' \
             ':(exclude)src/review-tier-map-v1.ts' \
             ':(exclude).github/workflows/ci.yml'; then

@@ -26,8 +26,8 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
       current = null;
       inTiers = false;
-      if (/^version:\s*1\s*$/.test(raw) && !versionSeen) versionSeen = true;
-      else if (/^default_tier:\s*sensitive\s*$/.test(raw) && !defaultSeen) defaultSeen = true;
+      if (/^version:[ \t]+1\s*$/.test(raw) && !versionSeen) versionSeen = true;
+      else if (/^default_tier:[ \t]+sensitive\s*$/.test(raw) && !defaultSeen) defaultSeen = true;
       else if (/^tiers:\s*$/.test(raw) && !tiersSeen) { tiersSeen = true; inTiers = true; }
       else throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       continue;
@@ -36,7 +36,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
     const tierLine = versioned ? (inTiers && /^  [^ ]/.test(raw) ? raw.slice(2) : null) : (!raw.startsWith(" ") && !raw.startsWith("\t") ? raw : null);
     if (tierLine !== null) {
       if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
-      const keyMatch = /^([A-Za-z_-]+)\s*:\s*(.*)$/.exec(tierLine);
+      const keyMatch = /^([A-Za-z_-]+)\s*:(?:[ \t]+(.*))?$/.exec(tierLine);
       if (!keyMatch) throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       const key = keyMatch[1] ?? "";
       if (key !== "low" && key !== "ordinary" && key !== "sensitive") {
@@ -138,7 +138,7 @@ function dequote(value: string): string {
 
 /** A pattern is a repo-relative glob. Absolute paths, parents and backslashes never match — the map is invalid. */
 function validatePattern(pattern: string): string {
-  const normalized = pattern.trim().replace(/^\.\//, "");
+  const normalized = pattern.replace(/^\.\//, "");
   if (normalized === "") throw new Error("invalid tier map: empty pattern");
   if (isAbsolute(normalized) || normalized.includes("..") || normalized.includes("\\")) {
     throw new Error(`invalid tier map: unsafe pattern ${JSON.stringify(pattern)}`);

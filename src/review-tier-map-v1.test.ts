@@ -14,6 +14,15 @@ tiers:
     expect(parseReviewTierMap('low: ["docs/**"]\n')).toEqual({ low: ["docs/**"], ordinary: [], sensitive: [] });
     expect(parseReviewTierMap('version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n').low).toEqual([]);
   });
+  it("preserves spaces in quoted patterns and rejects missing mapping separation", () => {
+    expect(parseReviewTierMap(valid.replace('"docs/**"', '" docs/** "')).low).toEqual([" docs/** "]);
+    expect(parseReviewTierMap(valid.replace('  low: ["docs/**"]', "  low:\n    - ' docs/** '")).low).toEqual([" docs/** "]);
+    for (const input of [
+      valid.replace("version: 1", "version:1"),
+      valid.replace("default_tier: sensitive", "default_tier:sensitive"),
+      valid.replace('low: ["docs/**"]', 'low:["docs/**"]'),
+    ]) expect(() => parseReviewTierMap(input)).toThrow();
+  });
   it("rejects incomplete, ambiguous and unsupported inputs", () => {
     for (const input of [
       valid.replace("version: 1 # schema", "version: 2"),
