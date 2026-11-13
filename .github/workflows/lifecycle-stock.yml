@@ -1,0 +1,37 @@
+name: Stock lifecycle qualification (incomplete)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - qualification/**
+      - .github/workflows/lifecycle-stock.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test package extraction guards
+        run: python3 -m unittest discover -s qualification -p '*_test.py'
+      - name: Fetch immutable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/downloads"
+          gh api repos/TogetherWeOwn/paperclip-plugin-github-upstream/actions/artifacts/14073774410/zip > "$RUNNER_TEMP/downloads/candidate.zip"
+          gh api repos/TogetherWeOwn/paperclip-plugin-github-upstream/releases/assets/734088893 -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/downloads/rollback.tgz"
+      - name: Verify package pins and prepare isolated trees
+        run: python3 -I qualification/prepare_artifacts.py "$RUNNER_TEMP/downloads/candidate.zip" "$RUNNER_TEMP/downloads/rollback.tgz" "$RUNNER_TEMP/plugin-trees"
+      - name: Fail closed until stock lifecycle probe exists
+        run: |
+          printf '%s\n' 'Package preparation alone does not qualify install, state, recovery, or cleanup.'
+          exit 1
