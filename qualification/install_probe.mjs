@@ -59,3 +59,14 @@ assert.equal(plugin.packagePath, candidate);
 assert.equal(plugin.status, 'ready');
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
+
+const removedAgain = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
+assert.equal(removedAgain.id, pluginId);
+plugin = await api('/api/plugins/install', { packageName: '/qualification/rollback', isLocalPath: true });
+if (plugin.plugin) plugin = plugin.plugin;
+assert.equal(plugin.id, pluginId);
+assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
+assert.equal(plugin.packagePath, '/qualification/rollback');
+assert.equal(plugin.status, 'ready');
+assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+console.log(JSON.stringify({ stage: 'rollback-installed', pluginId, status: plugin.status, rollbackWitness }));
