@@ -45,6 +45,7 @@ jobs:
           docker pull "$STOCK_IMAGE"
           docker run --detach --name "$CONTAINER" --network none --pids-limit 2048 --memory 5g --cpus 2 \
             --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/candidate,target=/qualification/candidate,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/rollback,target=/qualification/rollback,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/node_modules,target=/qualification/node_modules,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/qualification,target=/qualification/driver,readonly" \
             --env PAPERCLIP_DEPLOYMENT_MODE=local_trusted --env PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
@@ -59,10 +60,24 @@ jobs:
           CONTAINER: github-upstream-qualification-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          docker info >/dev/null
+          volumes=()
           if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+            mounts=$(docker container inspect "$CONTAINER")
+            volume_names=$(jq -r '.[0].Mounts[] | select(.Type == "volume") | .Name' <<< "$mounts")
+            if [[ -n "$volume_names" ]]; then mapfile -t volumes <<< "$volume_names"; fi
             docker rm --force --volumes "$CONTAINER"
           fi
           if docker container inspect "$CONTAINER" >/dev/null 2>&1; then exit 1; fi
+          for volume in "${volumes[@]}"; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+              printf 'Container volume still exists: %s\n' "$volume" >&2
+              exit 1
+            fi
+          done
+          rm -rf -- "$RUNNER_TEMP/downloads" "$RUNNER_TEMP/plugin-trees"
+          test ! -e "$RUNNER_TEMP/downloads" && test ! -e "$RUNNER_TEMP/plugin-trees"
+          printf '%s\n' 'Container, attached volumes, downloads and extracted trees removed.'
       - name: Fail closed until stock lifecycle probe exists
         run: |
           printf '%s\n' 'Package preparation alone does not qualify install, state, recovery, or cleanup.'
