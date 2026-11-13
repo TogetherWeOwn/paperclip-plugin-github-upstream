@@ -14,7 +14,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
   let inTiers = false;
   const seen = new Set<string>();
   const lines = text.split(/\r?\n/);
-  const versioned = lines.some((line) => /^version\s*:/.test(line));
+  const versioned = lines.some((line) => /^version[ \t]*:/.test(line));
   let versionSeen = false;
   let defaultSeen = false;
   let tiersSeen = false;
@@ -26,9 +26,9 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
       current = null;
       inTiers = false;
-      if (/^version:[ \t]+1\s*$/.test(raw) && !versionSeen) versionSeen = true;
-      else if (/^default_tier:[ \t]+sensitive\s*$/.test(raw) && !defaultSeen) defaultSeen = true;
-      else if (/^tiers:\s*$/.test(raw) && !tiersSeen) { tiersSeen = true; inTiers = true; }
+      if (/^version:[ \t]+1[ \t]*$/.test(raw) && !versionSeen) versionSeen = true;
+      else if (/^default_tier:[ \t]+sensitive[ \t]*$/.test(raw) && !defaultSeen) defaultSeen = true;
+      else if (/^tiers:[ \t]*$/.test(raw) && !tiersSeen) { tiersSeen = true; inTiers = true; }
       else throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       continue;
     }
@@ -36,7 +36,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
     const tierLine = versioned ? (inTiers && /^  [^ ]/.test(raw) ? raw.slice(2) : null) : (!raw.startsWith(" ") && !raw.startsWith("\t") ? raw : null);
     if (tierLine !== null) {
       if (versioned && current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
-      const keyMatch = /^([A-Za-z_-]+)\s*:(?:[ \t]+(.*))?$/.exec(tierLine);
+      const keyMatch = /^([A-Za-z_-]+)[ \t]*:(?:[ \t]+(.*))?$/.exec(tierLine);
       if (!keyMatch) throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       const key = keyMatch[1] ?? "";
       if (key !== "low" && key !== "ordinary" && key !== "sensitive") {
@@ -54,7 +54,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       continue;
     }
     // Block list item under the current key.
-    const itemMatch = /^( +)-\s+(.*)$/.exec(raw);
+    const itemMatch = /^( +)-[ \t]+(.*)$/.exec(raw);
     const indent = itemMatch?.[1]?.length ?? 0;
     if (!itemMatch || current === null || inlineList || (versioned ? indent !== 4 : indent < 1) || (blockIndent !== null && blockIndent !== indent)) {
       throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);

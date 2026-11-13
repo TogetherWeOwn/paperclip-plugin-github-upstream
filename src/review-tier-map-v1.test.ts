@@ -75,6 +75,22 @@ tiers:
     expect(parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    - "${literal}" # comment`)).low).toEqual([literal]);
     expect(parseReviewTierMap(`low:\n  - '${literal}'\t# comment\n`).low).toEqual([literal]);
   });
+  it("limits grammar separators to spaces and tabs", () => {
+    for (const separator of [" ", "  "]) {
+      expect(() => parseReviewTierMap(`low:\n  -${separator}docs/**\n`)).toThrow();
+      expect(() => parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    -${separator}docs/**`))).toThrow();
+    }
+    for (const input of [
+      'low : [docs/**]\n',
+      valid.replace('  low:', '  low :'),
+      valid.replace('version: 1 # schema', 'version: 1 '),
+      valid.replace('version: 1 # schema', 'version : 1'),
+      valid.replace('default_tier: sensitive # default', 'default_tier: sensitive '),
+      valid.replace('tiers:', 'tiers: '),
+    ]) expect(() => parseReviewTierMap(input)).toThrow();
+    expect(parseReviewTierMap('low \t:\n  -\tdocs/**\n').low).toEqual(['docs/**']);
+    expect(parseReviewTierMap(valid.replace('version: 1 # schema', 'version:\t1\t').replace('  low: ["docs/**"]', '  low\t:\n    -\tdocs/**')).low).toEqual(['docs/**']);
+  });
   it("rejects duplicate v1 headers and absent tier lists", () => {
     for (const input of [
       valid + "version: 1\n",
