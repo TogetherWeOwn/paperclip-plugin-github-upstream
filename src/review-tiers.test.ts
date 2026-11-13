@@ -175,6 +175,28 @@ const tierForIssue = async (harness: ReturnType<typeof createTestHarness>, issue
 const newHarness = () => createTestHarness({ manifest, config: {} });
 
 describe("resolveReviewTier (real git checkout)", () => {
+  it("keeps canonical v1 maps fail-closed in the base runtime", async () => {
+    const repo = makeRepo(true);
+    try {
+      commitFile(repo, "README.md", "# docs\n");
+      expect(git(repo, ["diff", "--name-only", "main...HEAD"]).trim()).toBe("README.md");
+      withTierFile(repo, `version: 1
+default_tier: sensitive
+tiers:
+  low: ["**/*.md"]
+  ordinary: []
+  sensitive: []
+`);
+      const issue = { id: "i-1", companyId: COMPANY, projectId: PROJECT, projectWorkspaceId: WORKSPACE, status: "in_review" };
+      const result = await tierForIssue(newHarness(), issue, repo);
+      expect(result.tier).toBe("sensitive");
+      expect(result.reason).toContain("fail-closed: unreadable tier map");
+      expect(result.reason).toContain('unknown key "version"');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   it("tiers a docs-only change low and an auth change sensitive", async () => {
     const repo = makeRepo(true);
     try {
