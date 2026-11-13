@@ -190,7 +190,7 @@ export const buildUpgradedPolicy = (existing: IssueExecutionPolicy, securityAgen
 
 type AppliedRecord = Record<
   string,
-  { at: string; stages: number; commented?: boolean; source?: string; tier?: RiskTier; pendingBody?: string }
+  { at: string; stages: number; commented?: boolean; source?: string; tier?: RiskTier; pendingBody?: string; withheld?: boolean }
 >;
 
 type ReviewGuardConfig = Pick<
@@ -257,7 +257,15 @@ export async function ensureReviewPolicy(
   const qaIds = qaPicked.agentIds.filter((id) => !excluded.has(id));
 
   const applied = await readApplied(ctx, companyId);
-  const prior = applied[issue.id];
+  let prior = applied[issue.id];
+  // A withheld-staffing audit can still be pending when staffing becomes
+  // available or a reviewer is added manually; never lose that audit.
+  if (prior?.withheld && prior.commented === false && prior.pendingBody && !dryRun) {
+    await ctx.issues.createComment(issue.id, prior.pendingBody, companyId);
+    prior = { ...prior, at: new Date().toISOString(), commented: true };
+    applied[issue.id] = prior;
+    await writeApplied(ctx, companyId, applied);
+  }
   // Records stamped before tiering carry no tier: treat them as matching so
   // they neither re-comment nor block an upgrade check on security presence.
   const tierChanged = prior?.tier !== undefined && prior.tier !== resolved.tier;
@@ -311,7 +319,7 @@ export async function ensureReviewPolicy(
           tier: resolved.tier,
         });
         if (dryRun) return { applied: false, reason: "dry-run" };
-        if (!(prior?.tier === resolved.tier && prior.commented === true)) {
+        if (!(prior?.tier === resolved.tier && prior.commented === true && !prior.withheld)) {
           const body = `Review-guard: Sensitive head (tier ${resolved.tier}: ${resolved.reason}) has no eligible Security reviewer stage — card remains without Security review until one is staffed. Not downgraded to QA-only silently (config: ${source}).`;
           await writeApplied(ctx, companyId, {
             ...applied,
@@ -379,16 +387,28 @@ export async function ensureReviewPolicy(
   // Sensitive/unknown). A Sensitive head with no usable Security reviewer
   // fails closed — QA-only would silently skip security review.
   const agentIds = dedupe(needsSecurity ? [...securityIds, ...qaIds] : [...qaIds]);
+  const auditWithheld = async (): Promise<void> => {
+    if (dryRun || (prior?.withheld && prior.tier === resolved.tier && prior.commented)) return;
+    const body = prior?.withheld && prior.commented === false && prior.pendingBody
+      ? prior.pendingBody
+      : `Review-guard withheld review staffing: tier ${resolved.tier} (${resolved.reason}) requires eligible reviewers, including Security when required; no review policy was stamped (config: ${source}).`;
+    const record = { at: new Date().toISOString(), stages: 0, commented: false, source, tier: resolved.tier, pendingBody: body, withheld: true };
+    await writeApplied(ctx, companyId, { ...applied, [issue.id]: record });
+    await ctx.issues.createComment(issue.id, body, companyId);
+    await writeApplied(ctx, companyId, { ...applied, [issue.id]: { ...record, commented: true } });
+  };
   if (agentIds.length === 0) {
     const staffed = pickSecurityAgentIds(config, issue).length + pickQaAgentIds(config, issue).length > 0;
     if (staffed) {
       // Fail closed: the executor must not review their own card, and no
       // other configured reviewer remains. Never stamp a self-review stage.
       ctx.logger.info("review-guard skipped: configured reviewers are the card executor", { companyId, issueId: issue.id });
+      await auditWithheld();
       return { applied: false, reason: "no-eligible-reviewers" };
     }
     // Fail closed when unconfigured: never invent a reviewer.
     ctx.logger.info("review-guard skipped: no review agent IDs configured for company", { companyId, issueId: issue.id });
+    await auditWithheld();
     return { applied: false, reason: "unconfigured" };
   }
   if (needsSecurity && securityIds.length === 0) {
@@ -399,6 +419,7 @@ export async function ensureReviewPolicy(
       issueId: issue.id,
       tier: resolved.tier,
     });
+    await auditWithheld();
     return { applied: false, reason: "no-eligible-reviewers" };
   }
 
@@ -427,7 +448,7 @@ export async function ensureReviewPolicy(
   // record is written as pending before the comment so a failed comment is
   // retried by the next event/sweep (see the `hasLiveReviewStage` branch).
   let commented = false;
-  if (!prior || prior.tier !== resolved.tier) {
+  if (!prior || prior.withheld || prior.tier !== resolved.tier) {
     const body = `Default review policy applied by review-guard: ${stageCount} reviewer stage${stageCount === 1 ? "" : "s"} (tier ${resolved.tier}: ${resolved.reason}; config: ${source}).`;
     await writeApplied(ctx, companyId, {
       ...applied,

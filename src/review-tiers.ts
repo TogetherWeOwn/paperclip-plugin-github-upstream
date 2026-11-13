@@ -51,15 +51,34 @@ export const needsSecurityReview = (tier: RiskTier): boolean => tier === "sensit
 export function parseReviewTierMap(text: string): ReviewTierMap {
   const map: ReviewTierMap = { low: [], ordinary: [], sensitive: [] };
   let current: keyof ReviewTierMap | null = null;
+  let inlineList = false;
+  let blockIndent: number | null = null;
+  let inTiers = false;
   const seen = new Set<string>();
   const lines = text.split(/\r?\n/);
+  const versioned = lines.some((line) => /^version\s*:/.test(line));
+  let versionSeen = false;
+  let defaultSeen = false;
+  let tiersSeen = false;
   for (let i = 0; i < lines.length; i += 1) {
-    const raw = lines[i] ?? "";
+    const raw = stripComment(lines[i] ?? "");
     const trimmed = raw.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
-    // Top-level `key:` / `key: [inline]` at column 0.
-    if (!raw.startsWith(" ") && !raw.startsWith("\t")) {
-      const keyMatch = /^([A-Za-z_-]+)\s*:\s*(.*)$/.exec(raw);
+    if (versioned && !raw.startsWith(" ") && !raw.startsWith("\t")) {
+      if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
+      current = null;
+      inTiers = false;
+      if (/^version:\s*1\s*$/.test(raw) && !versionSeen) versionSeen = true;
+      else if (/^default_tier:\s*sensitive\s*$/.test(raw) && !defaultSeen) defaultSeen = true;
+      else if (/^tiers:\s*$/.test(raw) && !tiersSeen) { tiersSeen = true; inTiers = true; }
+      else throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
+      continue;
+    }
+    // Tier keys are top-level in legacy maps, nested under tiers in v1.
+    const tierLine = versioned ? (inTiers && /^  [^ ]/.test(raw) ? raw.slice(2) : null) : (!raw.startsWith(" ") && !raw.startsWith("\t") ? raw : null);
+    if (tierLine !== null) {
+      if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
+      const keyMatch = /^([A-Za-z_-]+)\s*:\s*(.*)$/.exec(tierLine);
       if (!keyMatch) throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       const key = keyMatch[1] ?? "";
       if (key !== "low" && key !== "ordinary" && key !== "sensitive") {
@@ -68,22 +87,45 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       if (seen.has(key)) throw new Error(`invalid tier map: duplicate key "${key}"`);
       seen.add(key);
       current = key;
+      blockIndent = null;
       const inline = (keyMatch[2] ?? "").trim();
-      if (inline !== "") {
+      inlineList = inline !== "";
+      if (inlineList) {
         for (const item of parseInlineList(inline)) map[key].push(validatePattern(item));
       }
       continue;
     }
     // Block list item under the current key.
-    const itemMatch = /^\s+-\s+(.*)$/.exec(raw);
-    if (!itemMatch || current === null) {
+    const itemMatch = /^( +)-\s+(.*)$/.exec(raw);
+    const indent = itemMatch?.[1]?.length ?? 0;
+    if (!itemMatch || current === null || inlineList || (versioned ? indent !== 4 : indent < 1) || (blockIndent !== null && blockIndent !== indent)) {
       throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
     }
-    map[current].push(validatePattern(dequote(itemMatch[1] ?? "")));
+    blockIndent = indent;
+    map[current].push(validatePattern(dequote(itemMatch[2] ?? "")));
+  }
+  if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
+  if (versioned && (!versionSeen || !defaultSeen || !tiersSeen || seen.size !== 3)) {
+    throw new Error("invalid tier map: incomplete v1 schema");
   }
   const total = map.low.length + map.ordinary.length + map.sensitive.length;
-  if (total === 0) throw new Error("invalid tier map: no patterns");
+  if (!versioned && total === 0) throw new Error("invalid tier map: no patterns");
   return map;
+}
+
+function stripComment(line: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === "#" && (i === 0 || /\s/.test(line[i - 1] ?? ""))) {
+      return line.slice(0, i).trimEnd();
+    }
+  }
+  return line;
 }
 
 /** Split `["a", 'b', c]` (or a bare scalar) into de-quoted items. Throws on malformed flow. */
@@ -101,9 +143,10 @@ function parseInlineList(inline: string): string[] {
   for (const ch of inner) {
     if (quote !== null) {
       if (ch === quote) quote = null;
-      else buf += ch;
+      buf += ch;
     } else if (ch === '"' || ch === "'") {
       quote = ch;
+      buf += ch;
     } else if (ch === ",") {
       items.push(dequote(buf));
       buf = "";
@@ -125,8 +168,11 @@ function dequote(value: string): string {
     const hash = v.indexOf(" #");
     if (hash !== -1) v = v.slice(0, hash).trim();
   }
-  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
-    v = v.slice(1, -1);
+  if (/^"[^"\\]*"$/.test(v) || /^'[^'\\]*'$/.test(v)) return v.slice(1, -1);
+  // Accept only a deliberately small, unambiguous YAML plain-scalar subset.
+  const yamlNumber = /^(?:0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*(?:\.[0-9_]*)?(?:e[-+]?[0-9]+)?|\.[0-9_]+(?:e[-+]?[0-9]+)?|\.(?:inf|nan))$/i;
+  if (!/^[A-Za-z0-9_.][A-Za-z0-9_./*?-]*$/.test(v) || /^(null|true|false|yes|no|on|off|~)$/i.test(v) || yamlNumber.test(v)) {
+    throw new Error(`invalid tier map: ambiguous scalar ${JSON.stringify(value)}`);
   }
   return v;
 }
@@ -296,6 +342,7 @@ export async function resolveReviewTier(
   if (paths.length === 0) return failClosed("fail-closed: empty diff (absence of evidence, not low risk)");
 
   const headSha = await gitHead(checkout);
+  if (!headSha) return failClosed("fail-closed: unreadable head");
   const { tier, gatedPaths, unmatchedPaths } = tierForPaths(map, paths);
   if (unmatchedPaths.length > 0) {
     return { tier, reason: `unmatched path ${unmatchedPaths.slice(0, 3).join(", ")}${unmatchedPaths.length > 3 ? ` +${unmatchedPaths.length - 3} more` : ""}`, changedPaths: paths, headSha };
@@ -303,7 +350,8 @@ export async function resolveReviewTier(
   if (gatedPaths.length > 0) {
     return { tier, reason: `sensitive path ${gatedPaths.slice(0, 3).join(", ")}${gatedPaths.length > 3 ? ` +${gatedPaths.length - 3} more` : ""} (${paths.length} changed)`, changedPaths: paths, headSha };
   }
-  return { tier, reason: `${paths.length} changed path${paths.length === 1 ? "" : "s"} classified ${tier}`, changedPaths: paths, headSha };
+  // Path classification cannot prove the absence of semantic content triggers.
+  return { tier: "sensitive", reason: `fail-closed: content triggers not established absent (path tier ${tier})`, changedPaths: paths, headSha };
 }
 
 /**
