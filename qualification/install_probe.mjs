@@ -5,9 +5,9 @@ import { readFileSync } from 'node:fs';
 const base = 'http://127.0.0.1:3100';
 const candidate = '/qualification/candidate';
 
-async function api(path, body) {
+async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   const response = await fetch(`${base}${path}`, {
-    method: body === undefined ? 'GET' : 'POST',
+    method,
     headers: body === undefined ? {} : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
     redirect: 'error',
@@ -45,4 +45,17 @@ assert.equal(plugin.status, 'ready');
 assert.equal(plugin.packagePath, candidate);
 const worker = await api(`/api/plugins/${plugin.id}/health`);
 assert.equal(worker.healthy, true);
-console.log(JSON.stringify({ stage: 'candidate-install-only', pluginId: plugin.id, witness, status: worker.status }));
+console.log(JSON.stringify({ stage: 'candidate-installed', pluginId: plugin.id, witness, status: worker.status }));
+
+const pluginId = plugin.id;
+const removed = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
+assert.equal(removed.id, pluginId);
+console.log(JSON.stringify({ stage: 'soft-uninstall', pluginId, status: removed.status }));
+plugin = await api('/api/plugins/install', { packageName: candidate, isLocalPath: true });
+if (plugin.plugin) plugin = plugin.plugin;
+assert.equal(plugin.id, pluginId);
+assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
+assert.equal(plugin.packagePath, candidate);
+assert.equal(plugin.status, 'ready');
+assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
