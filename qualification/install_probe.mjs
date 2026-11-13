@@ -32,7 +32,7 @@ async function ready() {
 const health = await ready();
 assert.equal(health.deploymentMode, 'local_trusted');
 assert.equal(health.deploymentExposure, 'private');
-assert.equal(process.env.PAPERCLIP_BUILD_VERSION, '2026.1106.0');
+assert.equal(process.env.PAPERCLIP_BUILD_VERSION, 'v2026.1106.0-0-gd69631b01b');
 const witness = createHash('sha256').update(readFileSync(`${candidate}/dist/github.js`)).digest('hex');
 assert.equal(witness, '15437fba205928e4491c7d859e70f25896747214f003844327507f64cf7fbc04');
 let plugin = await api('/api/plugins/install', { packageName: candidate, isLocalPath: true });
