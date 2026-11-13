@@ -20,7 +20,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
   let tiersSeen = false;
   for (let i = 0; i < lines.length; i += 1) {
     const raw = stripComment(lines[i] ?? "");
-    const trimmed = raw.trim();
+    const trimmed = raw.replace(/^[ \t]+|[ \t]+$/g, "");
     if (trimmed === "" || trimmed.startsWith("#")) continue;
     if (versioned && !raw.startsWith(" ") && !raw.startsWith("\t")) {
       if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
@@ -46,7 +46,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
       seen.add(key);
       current = key;
       blockIndent = null;
-      const inline = (keyMatch[2] ?? "").trim();
+      const inline = (keyMatch[2] ?? "").replace(/^[ \t]+|[ \t]+$/g, "");
       inlineList = inline !== "";
       if (inlineList) {
         for (const item of parseInlineList(inline)) map[key].push(validatePattern(item));
@@ -93,7 +93,7 @@ function parseInlineList(inline: string): string[] {
     throw new Error(`invalid tier map: expected a list for "${inline}"`);
   }
   if (!inline.endsWith("]")) throw new Error("invalid tier map: unterminated inline list");
-  const inner = inline.slice(1, -1).trim();
+  const inner = inline.slice(1, -1).replace(/^[ \t]+|[ \t]+$/g, "");
   if (inner === "") return [];
   const items: string[] = [];
   let buf = "";
@@ -120,11 +120,11 @@ function parseInlineList(inline: string): string[] {
 }
 
 function dequote(value: string): string {
-  let v = value.trim();
+  let v = value.replace(/^[ \t]+|[ \t]+$/g, "");
   // Strip a trailing inline comment outside quotes ( "path # note").
   if (!v.startsWith('"') && !v.startsWith("'")) {
     const hash = v.indexOf(" #");
-    if (hash !== -1) v = v.slice(0, hash).trim();
+    if (hash !== -1) v = v.slice(0, hash).replace(/[ \t]+$/, "");
   }
   if (/^"[^"\\]*"$/.test(v) || /^'[^'\\]*'$/.test(v)) return v.slice(1, -1);
   // Accept only a deliberately small, unambiguous YAML plain-scalar subset.

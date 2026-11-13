@@ -69,6 +69,9 @@ tiers:
     const literal = "docs/** #literal";
     expect(() => parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    - ${literal}`))).toThrow();
     expect(() => parseReviewTierMap(`low:\n  - ${literal}\n`)).toThrow();
+    expect(() => parseReviewTierMap('low:\n  - docs/**  # comment\n')).toThrow();
+    expect(() => parseReviewTierMap('low: [docs/** ]\n')).toThrow();
+    expect(() => parseReviewTierMap('low: [docs/**]\n #not a comment\n')).toThrow();
     expect(parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    - "${literal}" # comment`)).low).toEqual([literal]);
     expect(parseReviewTierMap(`low:\n  - '${literal}'\t# comment\n`).low).toEqual([literal]);
   });
