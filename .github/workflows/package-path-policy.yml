@@ -1,0 +1,37 @@
+name: package-path-policy
+on:
+  pull_request:
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  merge-result:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify event revision and test inventory policy
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          node --version
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          node --test scripts/package-path-policy.test.mjs
+  head:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify head revision and test inventory policy
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node --version
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          node --test scripts/package-path-policy.test.mjs
