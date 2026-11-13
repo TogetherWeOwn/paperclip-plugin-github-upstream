@@ -1,4 +1,4 @@
-import { isAbsolute } from "node:path";
+import { posix, win32 } from "node:path";
 
 export interface ReviewTierMap {
   low: string[];
@@ -35,7 +35,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
     // Tier keys are top-level in legacy maps, nested under tiers in v1.
     const tierLine = versioned ? (inTiers && /^  [^ ]/.test(raw) ? raw.slice(2) : null) : (!raw.startsWith(" ") && !raw.startsWith("\t") ? raw : null);
     if (tierLine !== null) {
-      if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
+      if (versioned && current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
       const keyMatch = /^([A-Za-z_-]+)\s*:(?:[ \t]+(.*))?$/.exec(tierLine);
       if (!keyMatch) throw new Error(`invalid tier map line ${i + 1}: ${JSON.stringify(raw)}`);
       const key = keyMatch[1] ?? "";
@@ -62,7 +62,7 @@ export function parseReviewTierMap(text: string): ReviewTierMap {
     blockIndent = indent;
     map[current].push(validatePattern(dequote(itemMatch[2] ?? "")));
   }
-  if (current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
+  if (versioned && current && !inlineList && map[current].length === 0) throw new Error("invalid tier map: no patterns in block list");
   if (versioned && (!versionSeen || !defaultSeen || !tiersSeen || seen.size !== 3)) {
     throw new Error("invalid tier map: incomplete v1 schema");
   }
@@ -140,7 +140,7 @@ function dequote(value: string): string {
 function validatePattern(pattern: string): string {
   const normalized = pattern.replace(/^\.\//, "");
   if (normalized === "") throw new Error("invalid tier map: empty pattern");
-  if (isAbsolute(normalized) || normalized.includes("..") || normalized.includes("\\")) {
+  if (posix.isAbsolute(normalized) || win32.isAbsolute(normalized) || normalized.includes("..") || normalized.includes("\\")) {
     throw new Error(`invalid tier map: unsafe pattern ${JSON.stringify(pattern)}`);
   }
   if (normalized.length > 512) throw new Error(`invalid tier map: pattern too long: ${JSON.stringify(pattern).slice(0, 80)}`);

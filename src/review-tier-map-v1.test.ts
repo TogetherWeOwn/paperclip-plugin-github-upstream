@@ -14,6 +14,13 @@ tiers:
     expect(parseReviewTierMap('low: ["docs/**"]\n')).toEqual({ low: ["docs/**"], ordinary: [], sensitive: [] });
     expect(parseReviewTierMap('version: 1\ndefault_tier: sensitive\ntiers:\n  low: []\n  ordinary: []\n  sensitive: []\n').low).toEqual([]);
   });
+  it("accepts empty legacy block tiers only when another tier has patterns", () => {
+    const expected = { low: [], ordinary: ["src/**"], sensitive: [] };
+    expect(parseReviewTierMap('low:\nordinary: ["src/**"]\nsensitive: []\n')).toEqual(expected);
+    expect(parseReviewTierMap('ordinary: ["src/**"]\nlow:\n')).toEqual(expected);
+    expect(() => parseReviewTierMap('low:\nordinary: []\nsensitive:\n')).toThrow();
+    expect(() => parseReviewTierMap(valid.replace('  sensitive: ["src/auth/**"]', '  sensitive:'))).toThrow();
+  });
   it("preserves spaces in quoted patterns and rejects missing mapping separation", () => {
     expect(parseReviewTierMap(valid.replace('"docs/**"', '" docs/** "')).low).toEqual([" docs/** "]);
     expect(parseReviewTierMap(valid.replace('  low: ["docs/**"]', "  low:\n    - ' docs/** '")).low).toEqual([" docs/** "]);
@@ -32,6 +39,8 @@ tiers:
       valid.replace('"docs/**"', "1.5"),
       valid.replace('"docs/**"', "2026-11-11"),
       valid.replace('"docs/**"', "../escape"),
+      valid.replace('"docs/**"', '"C:/private/**"'),
+      valid.replace('"docs/**"', '"/private/**"'),
       valid + '  low: ["other/**"]\n',
     ]) expect(() => parseReviewTierMap(input)).toThrow();
     expect(parseReviewTierMap(valid.replace('"docs/**"', '"1.5"')).low).toEqual(["1.5"]);
