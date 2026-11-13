@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 // This policy only checks inventory names. It does not inspect an archive or
-// approve a package; it must not be used to enable the packaging route.
+// approve a package; callers must perform the remaining validation separately.
 const required = ["package.json", "README.md", "LICENSE", "bin/github-upstream-dryrun.mjs",
   "dist/index.js", "dist/index.d.ts", "dist/manifest.js", "dist/worker.js", "dist/ui/index.js"];
 const distFile = /^dist\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+\.(?:js|js\.map|d\.ts|d\.ts\.map)(?![\s\S])/;
