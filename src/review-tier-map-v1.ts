@@ -79,8 +79,8 @@ function stripComment(line: string): string {
       if (ch === quote) quote = null;
     } else if (ch === '"' || ch === "'") {
       quote = ch;
-    } else if (ch === "#" && (i === 0 || /\s/.test(line[i - 1] ?? ""))) {
-      return line.slice(0, i).trimEnd();
+    } else if (ch === "#" && (i === 0 || /[ \t]/.test(line[i - 1] ?? ""))) {
+      return line.slice(0, i).replace(/[ \t]+$/, "");
     }
   }
   return line;

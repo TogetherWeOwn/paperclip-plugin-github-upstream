@@ -60,6 +60,18 @@ tiers:
     `.replace(/^    /gm, "");
     expect(parseReviewTierMap(input)).toEqual({ low: ["docs/**", "2026-11-11"], ordinary: ["src/ui/**"], sensitive: ["src/auth/**"] });
   });
+  it("recognizes only space and tab as comment separators", () => {
+    for (const separator of [" ", "\t"]) {
+      const item = `docs/**${separator}# comment`;
+      expect(parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    - ${item}`)).low).toEqual(["docs/**"]);
+      expect(parseReviewTierMap(`low:\n  - ${item}\n`).low).toEqual(["docs/**"]);
+    }
+    const literal = "docs/** #literal";
+    expect(() => parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    - ${literal}`))).toThrow();
+    expect(() => parseReviewTierMap(`low:\n  - ${literal}\n`)).toThrow();
+    expect(parseReviewTierMap(valid.replace('  low: ["docs/**"]', `  low:\n    - "${literal}" # comment`)).low).toEqual([literal]);
+    expect(parseReviewTierMap(`low:\n  - '${literal}'\t# comment\n`).low).toEqual([literal]);
+  });
   it("rejects duplicate v1 headers and absent tier lists", () => {
     for (const input of [
       valid + "version: 1\n",
