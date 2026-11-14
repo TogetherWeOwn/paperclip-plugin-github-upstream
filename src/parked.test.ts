@@ -598,6 +598,124 @@ describe("parked-blocker propagation (event path)", () => {
     expect(comments).toHaveLength(4);
   });
 
+  it("wakes again after an unpark + re-park at the same status:kind that both happened while disabled", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    // Park -> wake while enabled.
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Disable, then unpark and re-park at the SAME status/kind while
+    // disabled. The unpark event delivered while disabled must still
+    // close the window (housekeeping, no wake/comment), so the
+    // re-park is not mistaken for the same continuous park.
+    harness.setConfig({ parkedPropagationEnabled: false });
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "todo" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "backlog" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    expect(await harness.ctx.issues.listComments(dep.id, COMPANY)).toHaveLength(2);
+    // Re-enable: the next event mints a fresh occurrence from the
+    // re-parked root's updatedAt and wakes the dependent again.
+    harness.setConfig({ parkedPropagationEnabled: true });
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(2);
+    const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(2);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-delivered"))).toHaveLength(2);
+    expect(comments).toHaveLength(4);
+  });
+
+  it("wakes again after a backlog -> cancelled -> backlog round-trip while disabled", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Disable, then backlog -> cancelled -> backlog while disabled (no
+    // unpark). The kind-change event while disabled must close the stale
+    // backlog window (housekeeping only, no wake), so the return to
+    // backlog is not mistaken for the same continuous park on re-enable.
+    harness.setConfig({ parkedPropagationEnabled: false });
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "cancelled" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { status: "backlog" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    harness.setConfig({ parkedPropagationEnabled: true });
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(2);
+    const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(2);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-delivered"))).toHaveLength(2);
+  });
+
+  it("does not re-wake on an ordinary edit across a disable/enable cycle while continuously parked", async () => {
+    const harness = await setup();
+    const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
+    const dep = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "Dependent",
+      status: "blocked",
+      assigneeAgentId: AGENT,
+      blockedByIssueIds: [root.id],
+    });
+    let invokes = 0;
+    harness.ctx.agents.invoke = (async () => {
+      invokes += 1;
+      return { runId: "run-1" };
+    }) as typeof harness.ctx.agents.invoke;
+
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    // Disable and re-enable with NO intervening unpark. The root is
+    // still parked, so the disabled housekeeping must keep the
+    // window; the ordinary edit afterwards reuses it and does not
+    // re-wake.
+    harness.setConfig({ parkedPropagationEnabled: false });
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    harness.setConfig({ parkedPropagationEnabled: true });
+    await new Promise((r) => setTimeout(r, 5));
+    await harness.ctx.issues.update(root.id, { title: "Parked root (typo fixed)" }, COMPANY);
+    await emitRootUpdate(harness, root.id);
+    expect(invokes).toBe(1);
+    const comments = await harness.ctx.issues.listComments(dep.id, COMPANY);
+    expect(comments).toHaveLength(2);
+    expect(comments.filter((c) => c.body.includes("parked-blocker-audit"))).toHaveLength(1);
+  });
+
   it("remains retryable when a wake fails and plugin state is then lost (R2-2)", async () => {
     const harness = await setup();
     const root = await harness.ctx.issues.create({ companyId: COMPANY, title: "Parked root", status: "backlog" });
