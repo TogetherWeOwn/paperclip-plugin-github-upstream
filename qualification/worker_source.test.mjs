@@ -1,0 +1,135 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { verifySource, witnessWorkerSource } from './worker_source.mjs';
+
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+
+test('compiled source must match the archive digest and be lossless UTF-8', () => {
+  const path = 'dist/github.js';
+  const bytes = Buffer.from('export {};\n');
+  const inventory = { [path]: digest(bytes) };
+  verifySource(path, inventory, bytes, bytes.toString());
+  assert.throws(() => verifySource(path, {}, bytes, bytes.toString()), /absent from archive/);
+  assert.throws(() => verifySource(path, inventory, Buffer.from([0xff]), '�'), /not lossless UTF-8/);
+  assert.throws(() => verifySource(path, inventory, bytes, 'different'), /Compiled source differs/);
+  assert.throws(() => verifySource(path, inventory, Buffer.from('changed'), 'changed'), /Module digest differs/);
+});
+
+test('discovery refuses redirects', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-source-redirect-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.mock.method(process, 'kill', () => {});
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  let followed = false;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    now = 10_001;
+    if (options.redirect !== 'error') followed = true;
+    throw new Error('redirect');
+  });
+  await assert.rejects(witnessWorkerSource(123, root, {}), /deadline exceeded|exactly one inspector target/);
+  assert.equal(followed, false);
+});
+
+test('discovery stops reading an oversized response before attaching', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-source-limit-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.mock.method(process, 'kill', () => {});
+  let reads = 0;
+  let cancelled = false;
+  let attached = false;
+  const reader = {
+    read: async () => { reads++; return { done: false, value: new Uint8Array(32 * 1024) }; },
+    cancel: async () => { cancelled = true; },
+  };
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, body: { getReader: () => reader } }));
+  t.mock.method(globalThis, 'WebSocket', class { constructor() { attached = true; } });
+  await assert.rejects(witnessWorkerSource(123, root, {}), /discovery response too large/);
+  assert.equal(reads, 3);
+  assert.equal(cancelled, true);
+  assert.equal(attached, false);
+});
+
+test('inspector target, PID, source and required module are verified', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-source-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'dist'));
+  const path = join(root, 'dist/github.js');
+  const bytes = Buffer.from('export {};\n');
+  writeFileSync(path, bytes);
+  const worker = join(root, 'dist/worker.js');
+  const workerBytes = Buffer.from('export const worker = true;\n');
+  writeFileSync(worker, workerBytes);
+  const inventory = { 'dist/github.js': digest(bytes), 'dist/worker.js': digest(workerBytes) };
+  const alias = `${root}-alias`;
+  symlinkSync(root, alias);
+  t.after(() => rmSync(alias));
+  t.mock.method(process, 'kill', () => {});
+  let target = 'ws://example.com:9229/id';
+  let pid = 123;
+  let scripts = [pathToFileURL(path).href, pathToFileURL(worker).href];
+  let source = bytes.toString();
+  let closed = 0;
+  let expire = false;
+  let now = 0;
+  let sourceCalls = 0;
+  t.mock.method(Date, 'now', () => now);
+  let fetchOptions;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => { fetchOptions = options; return new Response(JSON.stringify([{ webSocketDebuggerUrl: target }])); });
+  class Socket extends EventTarget {
+    constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
+    send(data) {
+      const { id, method, params } = JSON.parse(data);
+      const message = payload => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(payload) }));
+      queueMicrotask(() => {
+        if (method === 'Debugger.enable') for (const script of scripts) message({ method: 'Debugger.scriptParsed', params: { url: script, scriptId: script } });
+        const result = method === 'Runtime.evaluate' ? { result: { value: pid } } : method === 'Debugger.getScriptSource' ? { scriptSource: params.scriptId.endsWith('/dist/worker.js') ? workerBytes.toString() : source } : {};
+        if (method === 'Debugger.getScriptSource') sourceCalls++;
+        message({ id, result });
+        if (expire && method === 'Debugger.enable') now += 10_001;
+      });
+    }
+    close() { closed++; this.dispatchEvent(new Event('close')); }
+  }
+  const original = globalThis.WebSocket;
+  globalThis.WebSocket = Socket;
+  t.after(() => { globalThis.WebSocket = original; });
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /127\.0\.0\.1/);
+  target = 'ws://127.0.0.1:9229/id';
+  pid = 456;
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /not the selected worker/);
+  pid = 123;
+  const witness = await witnessWorkerSource(123, alias, inventory);
+  assert.deepEqual(witness.modules, ['dist/github.js', 'dist/worker.js']);
+  assert.equal(fetchOptions.redirect, 'error');
+  assert.equal(witness.root, root);
+  scripts = [pathToFileURL(path).href, pathToFileURL(join(alias, 'dist/worker.js')).href];
+  const aliasWitness = await witnessWorkerSource(123, alias, inventory);
+  assert.deepEqual(aliasWitness.modules, ['dist/github.js', 'dist/worker.js']);
+  scripts = [pathToFileURL(path).href];
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /dist\/worker\.js/);
+  scripts.push(pathToFileURL(worker).href);
+  source = 'different';
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /Compiled source differs/);
+  source = bytes.toString();
+  writeFileSync(path, 'tampered');
+  source = 'tampered';
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /Module digest differs/);
+  rmSync(path);
+  assert.equal(spawnSync('mkfifo', [path]).status, 0);
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /Invalid module file/);
+  scripts = [];
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /not observed compiled/);
+  assert.equal(closed, 8);
+  scripts = [pathToFileURL(worker).href];
+  expire = true;
+  const previousCalls = sourceCalls;
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /deadline exceeded/);
+  assert.equal(sourceCalls, previousCalls);
+});
