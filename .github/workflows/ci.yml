@@ -31,6 +31,7 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: node --test scripts/retain-package.test.mjs
+      - run: node --test qualification/worker_source.test.mjs
       - name: Verify inert parser remains disconnected
         shell: bash
         run: |

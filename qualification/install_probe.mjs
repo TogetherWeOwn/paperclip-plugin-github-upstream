@@ -49,7 +49,7 @@ async function witnessProcess(pluginId, root, inventory) {
   assert(Number.isInteger(pid) && pid > 1, 'Missing worker PID');
   const identity = processIdentity(pid);
   assert(identity.argv.includes(`${root}/dist/worker.js`), 'Worker entrypoint mismatch');
-  await witnessWorkerSource(pid, root, inventory);
+  console.log(JSON.stringify(await witnessWorkerSource(pid, root, inventory)));
   assert.deepEqual(processIdentity(pid), identity, 'Worker identity changed during witness');
   return { pid, ...identity };
 }
