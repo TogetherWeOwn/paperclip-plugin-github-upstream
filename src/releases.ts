@@ -345,7 +345,8 @@ export function releaseCardBody(params: {
     );
   }
   lines.push(
-    "- Follow the `release-intake` company skill: research the notes, rebase carried patches by content, build and test, then raise the install confirmation.",
+    "- Follow the current `release-intake` company skill and its separate immutable frozen-candidate procedure.",
+    "- This mutable discovery intake is not an accepted frozen candidate; keep accepted candidate evidence separate and unchanged.",
     "",
     "Synced by togetherweown.github-upstream; this card was created because the tag is new.",
   );
