@@ -133,6 +133,28 @@ try {
   assert.equal(matches.length, 1);
   const jobId = matches[0].id;
   const jobPath = `/api/plugins/${pluginId}/jobs/${jobId}`;
+
+  // An idle drain suppresses background work, but may also block manual ingress.
+  // This experiment does not establish selective scheduler exclusion.
+  const drain = await api('/api/instance/task-drain', { purpose: 'idle', ttlMs: 120_000 });
+  assert.equal(drain.draining, true);
+  assert.equal(typeof drain.ownerId, 'string');
+  try {
+    const status = await api('/api/instance/task-drain');
+    assert.equal(status.draining, true);
+    assert.equal(status.ownerId, drain.ownerId);
+    const response = await fetch(`${base}${jobPath}/trigger`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      redirect: 'error', signal: AbortSignal.timeout(15_000),
+    });
+    assert.equal(response.status, 503, 'Idle drain unexpectedly admitted a manual trigger');
+    assert.equal((await response.json()).error, 'instance_preparing_to_sleep');
+    console.log(JSON.stringify({ stage: 'idle-drain-manual-trigger-refused', status: response.status }));
+  } finally {
+    await api(`/api/instance/task-drain?ownerId=${encodeURIComponent(drain.ownerId)}`, undefined, 'DELETE');
+  }
+  assert.equal((await api('/api/instance/task-drain')).draining, false);
+
   async function runScan(previous) {
   const triggered = await api(`${jobPath}/trigger`, {});
   assert.equal(triggered.jobId, jobId);
