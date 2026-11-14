@@ -48,6 +48,18 @@ assert.equal(worker.healthy, true);
 console.log(JSON.stringify({ stage: 'candidate-installed', pluginId: plugin.id, witness, status: worker.status }));
 
 const pluginId = plugin.id;
+const company = await api('/api/companies', { name: 'Disposable lifecycle probe' });
+assert.equal(typeof company.id, 'string');
+const config = { dryRun: true, releaseRepos: ['example/fixture'], maxCreatesPerTick: 0, maxWakesPerTick: 0 };
+const configPath = `/api/plugins/${pluginId}/config`;
+await api(configPath, { companyId: company.id, configJson: config });
+async function assertConfig() {
+  const stored = await api(`${configPath}?companyId=${encodeURIComponent(company.id)}`);
+  assert.equal(stored.companyId, company.id);
+  assert.deepEqual(stored.configJson, config);
+}
+await assertConfig();
+console.log(JSON.stringify({ stage: 'synthetic-config-saved', pluginId, companyId: company.id }));
 const removed = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
 assert.equal(removed.id, pluginId);
 console.log(JSON.stringify({ stage: 'soft-uninstall', pluginId, status: removed.status }));
@@ -58,6 +70,7 @@ assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
 assert.equal(plugin.packagePath, candidate);
 assert.equal(plugin.status, 'ready');
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+await assertConfig();
 console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
 
 const removedAgain = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
@@ -69,4 +82,5 @@ assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
 assert.equal(plugin.packagePath, '/qualification/rollback');
 assert.equal(plugin.status, 'ready');
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+await assertConfig();
 console.log(JSON.stringify({ stage: 'rollback-installed', pluginId, status: plugin.status, rollbackWitness }));
