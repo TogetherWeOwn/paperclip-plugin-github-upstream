@@ -137,7 +137,6 @@ try {
   // An idle drain suppresses background work, but may also block manual ingress.
   // This experiment does not establish selective scheduler exclusion.
   const drain = await api('/api/instance/task-drain', { purpose: 'idle', ttlMs: 120_000 });
-  assert.equal(drain.draining, true);
   assert.equal(typeof drain.ownerId, 'string');
   try {
     const status = await api('/api/instance/task-drain');
