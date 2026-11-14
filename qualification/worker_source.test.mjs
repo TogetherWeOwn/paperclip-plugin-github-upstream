@@ -37,6 +37,25 @@ test('discovery refuses redirects', async t => {
   assert.equal(followed, false);
 });
 
+test('discovery stops reading an oversized response before attaching', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-source-limit-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.mock.method(process, 'kill', () => {});
+  let reads = 0;
+  let cancelled = false;
+  let attached = false;
+  const reader = {
+    read: async () => { reads++; return { done: false, value: new Uint8Array(32 * 1024) }; },
+    cancel: async () => { cancelled = true; },
+  };
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, body: { getReader: () => reader } }));
+  t.mock.method(globalThis, 'WebSocket', class { constructor() { attached = true; } });
+  await assert.rejects(witnessWorkerSource(123, root, {}), /discovery response too large/);
+  assert.equal(reads, 3);
+  assert.equal(cancelled, true);
+  assert.equal(attached, false);
+});
+
 test('inspector target, PID, source and required module are verified', async t => {
   const root = mkdtempSync(join(tmpdir(), 'worker-source-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -62,7 +81,7 @@ test('inspector target, PID, source and required module are verified', async t =
   let sourceCalls = 0;
   t.mock.method(Date, 'now', () => now);
   let fetchOptions;
-  t.mock.method(globalThis, 'fetch', async (_url, options) => { fetchOptions = options; return { ok: true, json: async () => [{ webSocketDebuggerUrl: target }] }; });
+  t.mock.method(globalThis, 'fetch', async (_url, options) => { fetchOptions = options; return new Response(JSON.stringify([{ webSocketDebuggerUrl: target }])); });
   class Socket extends EventTarget {
     constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
     send(data) {

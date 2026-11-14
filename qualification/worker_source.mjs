@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const LIMIT = 10_000;
 const MAX_SOURCE = 8 * 1024 * 1024;
 const MAX_SCRIPTS = 10_000;
+const MAX_DISCOVERY = 64 * 1024;
 
 export function verifySource(relative, inventory, bytes, source) {
   assert(Object.hasOwn(inventory, relative), `Compiled module absent from archive inventory: ${relative}`);
@@ -38,10 +39,28 @@ export async function witnessWorkerSource(pid, root, inventory) {
   process.kill(pid, 'SIGUSR1');
   let targets;
   while (Date.now() < deadline) {
+    let response;
     try {
-      const response = await bounded(() => fetch('http://127.0.0.1:9229/json/list', { signal: AbortSignal.timeout(1000), redirect: 'error' }));
-      if (response.ok) { targets = await bounded(() => response.json()); break; }
+      response = await bounded(() => fetch('http://127.0.0.1:9229/json/list', { signal: AbortSignal.timeout(1000), redirect: 'error' }));
     } catch { /* The inspector may still be starting. */ }
+    if (response?.ok) {
+      assert(response.body, 'Inspector discovery response has no body');
+      const reader = response.body.getReader();
+      const chunks = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await bounded(() => reader.read());
+          if (done) break;
+          size += value.byteLength;
+          assert(size <= MAX_DISCOVERY, 'Inspector discovery response too large');
+          chunks.push(value);
+        }
+      } finally { reader.cancel().catch(() => {}); }
+      targets = JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+      break;
+    }
+    if (response?.body) response.body.cancel().catch(() => {});
     await bounded(() => new Promise(resolve => setTimeout(resolve, 100)));
   }
   assert(Array.isArray(targets) && targets.length === 1, 'Expected exactly one inspector target');
