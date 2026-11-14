@@ -1,10 +1,28 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 const base = 'http://127.0.0.1:3100';
 const candidate = '/qualification/candidate';
+const inventories = JSON.parse(readFileSync('/qualification/inventories.json', 'utf8'));
+
+function assertTree(root, expected) {
+  const actual = {};
+  function visit(relative = '') {
+    for (const entry of readdirSync(`${root}/${relative}`, { withFileTypes: true })) {
+      const path = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) visit(path);
+      else {
+        assert(entry.isFile(), `Unexpected non-file in package: ${path}`);
+        actual[path] = createHash('sha256').update(readFileSync(`${root}/${path}`)).digest('hex');
+      }
+    }
+  }
+  visit();
+  assert.deepEqual(Object.entries(actual).sort(), Object.entries(expected).sort());
+  console.log(JSON.stringify({ stage: 'package-tree-verified', root, files: Object.keys(actual).length }));
+}
 
 async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   const response = await fetch(`${base}${path}`, {
@@ -44,6 +62,7 @@ if (plugin.plugin) plugin = plugin.plugin;
 assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
 assert.equal(plugin.status, 'ready');
 assert.equal(plugin.packagePath, candidate);
+assertTree(plugin.packagePath, inventories.candidate);
 const worker = await api(`/api/plugins/${plugin.id}/health`);
 assert.equal(worker.healthy, true);
 console.log(JSON.stringify({ stage: 'candidate-installed', pluginId: plugin.id, witness, status: worker.status }));
@@ -114,6 +133,7 @@ assert.equal(plugin.id, pluginId);
 assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
 assert.equal(plugin.packagePath, candidate);
 assert.equal(plugin.status, 'ready');
+assertTree(plugin.packagePath, inventories.candidate);
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 await assertConfig();
 await assertRetainedState();
@@ -127,6 +147,7 @@ assert.equal(plugin.id, pluginId);
 assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
 assert.equal(plugin.packagePath, '/qualification/rollback');
 assert.equal(plugin.status, 'ready');
+assertTree(plugin.packagePath, inventories.rollback);
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 await assertConfig();
 await assertRetainedState();

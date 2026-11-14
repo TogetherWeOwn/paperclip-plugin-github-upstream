@@ -6,6 +6,7 @@ exist: this avoids mixing stale files with the trees the stock host will load.
 """
 import hashlib
 import io
+import json
 import os
 from pathlib import Path, PurePosixPath
 import sys
@@ -40,15 +41,19 @@ def extract_package(data, expected, destination):
         if not {"package/package.json", "package/dist/worker.js"} <= seen:
             raise ValueError("package lacks required entrypoints")
         destination.mkdir(parents=False, exist_ok=False)
+        inventory = {}
         for member in members:
             target = destination.joinpath(*member.name.split("/")[1:])
             target.parent.mkdir(parents=True, exist_ok=True)
             source = archive.extractfile(member)
             if source is None:
                 raise ValueError("missing package member content")
+            contents = source.read()
+            inventory[member.name.removeprefix("package/")] = hashlib.sha256(contents).hexdigest()
             with target.open("xb") as output:
-                output.write(source.read())
+                output.write(contents)
             os.chmod(target, 0o444)
+        return inventory
 
 
 def prepare(candidate_zip, rollback_tgz, output):
@@ -62,8 +67,11 @@ def prepare(candidate_zip, rollback_tgz, output):
     if root.exists():
         raise ValueError("output already exists")
     root.mkdir(parents=False)
-    extract_package(candidate, CANDIDATE_SHA256, root / "candidate")
-    extract_package(rollback, ROLLBACK_SHA256, root / "rollback")
+    inventories = {
+        "candidate": extract_package(candidate, CANDIDATE_SHA256, root / "candidate"),
+        "rollback": extract_package(rollback, ROLLBACK_SHA256, root / "rollback"),
+    }
+    (root / "inventories.json").write_text(json.dumps(inventories, sort_keys=True), encoding="utf8")
     print("Verified and extracted candidate and rollback SHA-256 pins")
 
 

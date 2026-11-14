@@ -46,6 +46,7 @@ jobs:
           docker run --detach --name "$CONTAINER" --network none --pids-limit 2048 --memory 5g --cpus 2 \
             --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/candidate,target=/qualification/candidate,readonly" \
             --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/rollback,target=/qualification/rollback,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/inventories.json,target=/qualification/inventories.json,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/node_modules,target=/qualification/node_modules,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/qualification,target=/qualification/driver,readonly" \
             --env PAPERCLIP_DEPLOYMENT_MODE=local_trusted --env PAPERCLIP_DEPLOYMENT_EXPOSURE=private \

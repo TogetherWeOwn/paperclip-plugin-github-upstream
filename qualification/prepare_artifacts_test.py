@@ -23,7 +23,11 @@ class ArtifactExtractionTest(unittest.TestCase):
         data = package([("package/package.json", b"{}"), ("package/dist/worker.js", b"worker")])
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "candidate"
-            extract_package(data, hashlib.sha256(data).hexdigest(), dest)
+            inventory = extract_package(data, hashlib.sha256(data).hexdigest(), dest)
+            self.assertEqual(inventory, {
+                "package.json": hashlib.sha256(b"{}").hexdigest(),
+                "dist/worker.js": hashlib.sha256(b"worker").hexdigest(),
+            })
             self.assertEqual((dest / "dist/worker.js").read_bytes(), b"worker")
             with self.assertRaises(FileExistsError):
                 extract_package(data, hashlib.sha256(data).hexdigest(), dest)
