@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -21,6 +21,22 @@ test('compiled source must match the archive digest and be lossless UTF-8', () =
   assert.throws(() => verifySource(path, inventory, Buffer.from('changed'), 'changed'), /Module digest differs/);
 });
 
+test('discovery refuses redirects', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-source-redirect-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.mock.method(process, 'kill', () => {});
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  let followed = false;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    now = 10_001;
+    if (options.redirect !== 'error') followed = true;
+    throw new Error('redirect');
+  });
+  await assert.rejects(witnessWorkerSource(123, root, {}), /deadline exceeded|exactly one inspector target/);
+  assert.equal(followed, false);
+});
+
 test('inspector target, PID, source and required module are verified', async t => {
   const root = mkdtempSync(join(tmpdir(), 'worker-source-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -29,27 +45,38 @@ test('inspector target, PID, source and required module are verified', async t =
   const bytes = Buffer.from('export {};\n');
   writeFileSync(path, bytes);
   const worker = join(root, 'dist/worker.js');
-  writeFileSync(worker, bytes);
-  const inventory = { 'dist/github.js': digest(bytes), 'dist/worker.js': digest(bytes) };
+  const workerBytes = Buffer.from('export const worker = true;\n');
+  writeFileSync(worker, workerBytes);
+  const inventory = { 'dist/github.js': digest(bytes), 'dist/worker.js': digest(workerBytes) };
+  const alias = `${root}-alias`;
+  symlinkSync(root, alias);
+  t.after(() => rmSync(alias));
   t.mock.method(process, 'kill', () => {});
   let target = 'ws://example.com:9229/id';
   let pid = 123;
   let scripts = [pathToFileURL(path).href, pathToFileURL(worker).href];
   let source = bytes.toString();
   let closed = 0;
-  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => [{ webSocketDebuggerUrl: target }] }));
+  let expire = false;
+  let now = 0;
+  let sourceCalls = 0;
+  t.mock.method(Date, 'now', () => now);
+  let fetchOptions;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => { fetchOptions = options; return { ok: true, json: async () => [{ webSocketDebuggerUrl: target }] }; });
   class Socket extends EventTarget {
     constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
     send(data) {
-      const { id, method } = JSON.parse(data);
+      const { id, method, params } = JSON.parse(data);
       const message = payload => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(payload) }));
       queueMicrotask(() => {
-        if (method === 'Debugger.enable') for (const script of scripts) message({ method: 'Debugger.scriptParsed', params: { url: script, scriptId: '1' } });
-        const result = method === 'Runtime.evaluate' ? { result: { value: pid } } : method === 'Debugger.getScriptSource' ? { scriptSource: source } : {};
+        if (method === 'Debugger.enable') for (const script of scripts) message({ method: 'Debugger.scriptParsed', params: { url: script, scriptId: script } });
+        const result = method === 'Runtime.evaluate' ? { result: { value: pid } } : method === 'Debugger.getScriptSource' ? { scriptSource: params.scriptId === pathToFileURL(worker).href ? workerBytes.toString() : source } : {};
+        if (method === 'Debugger.getScriptSource') sourceCalls++;
         message({ id, result });
+        if (expire && method === 'Debugger.enable') now += 10_001;
       });
     }
-    close() { closed++; }
+    close() { closed++; this.dispatchEvent(new Event('close')); }
   }
   const original = globalThis.WebSocket;
   globalThis.WebSocket = Socket;
@@ -59,8 +86,10 @@ test('inspector target, PID, source and required module are verified', async t =
   pid = 456;
   await assert.rejects(witnessWorkerSource(123, root, inventory), /not the selected worker/);
   pid = 123;
-  const witness = await witnessWorkerSource(123, root, inventory);
+  const witness = await witnessWorkerSource(123, alias, inventory);
   assert.deepEqual(witness.modules, ['dist/github.js', 'dist/worker.js']);
+  assert.equal(fetchOptions.redirect, 'error');
+  assert.equal(witness.root, root);
   scripts = [pathToFileURL(path).href];
   await assert.rejects(witnessWorkerSource(123, root, inventory), /dist\/worker\.js/);
   scripts.push(pathToFileURL(worker).href);
@@ -76,4 +105,9 @@ test('inspector target, PID, source and required module are verified', async t =
   scripts = [];
   await assert.rejects(witnessWorkerSource(123, root, inventory), /not observed compiled/);
   assert.equal(closed, 7);
+  scripts = [pathToFileURL(worker).href];
+  expire = true;
+  const previousCalls = sourceCalls;
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /deadline exceeded/);
+  assert.equal(sourceCalls, previousCalls);
 });

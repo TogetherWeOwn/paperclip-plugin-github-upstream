@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
-import { resolve, relative as relativePath, isAbsolute } from 'node:path';
+import { open, realpath } from 'node:fs/promises';
+import { relative as relativePath, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const LIMIT = 10_000;
@@ -22,26 +22,26 @@ export function verifySource(relative, inventory, bytes, source) {
 export async function witnessWorkerSource(pid, root, inventory) {
   assert(Number.isSafeInteger(pid) && pid > 1);
   assert(isAbsolute(root), 'Artifact root must be absolute');
-  root = resolve(root);
   const deadline = Date.now() + LIMIT;
-  const bounded = async promise => {
+  const bounded = async operation => {
     const remaining = deadline - Date.now();
     assert(remaining > 0, 'Inspector deadline exceeded');
     let timer;
     try {
-      return await Promise.race([promise, new Promise((_, reject) => {
+      return await Promise.race([operation(), new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('Inspector deadline exceeded')), remaining);
       })]);
     } finally { clearTimeout(timer); }
   };
+  root = await bounded(() => realpath(root));
   process.kill(pid, 'SIGUSR1');
   let targets;
   while (Date.now() < deadline) {
     try {
-      const response = await bounded(fetch('http://127.0.0.1:9229/json/list', { signal: AbortSignal.timeout(1000) }));
-      if (response.ok) { targets = await bounded(response.json()); break; }
+      const response = await bounded(() => fetch('http://127.0.0.1:9229/json/list', { signal: AbortSignal.timeout(1000), redirect: 'error' }));
+      if (response.ok) { targets = await bounded(() => response.json()); break; }
     } catch { /* The inspector may still be starting. */ }
-    await bounded(new Promise(resolve => setTimeout(resolve, 100)));
+    await bounded(() => new Promise(resolve => setTimeout(resolve, 100)));
   }
   assert(Array.isArray(targets) && targets.length === 1, 'Expected exactly one inspector target');
   const url = new URL(targets[0].webSocketDebuggerUrl);
@@ -80,14 +80,15 @@ export async function witnessWorkerSource(pid, root, inventory) {
     socket.addEventListener('open', resolve, { once: true });
     socket.addEventListener('error', () => reject(new Error('Inspector connection failed')), { once: true });
   });
-  const call = (method, params = {}) => bounded(new Promise((resolve, reject) => {
+  opened.catch(() => {});
+  const call = (method, params = {}) => bounded(() => new Promise((resolve, reject) => {
     if (failure) return reject(failure);
     const id = ++nextId;
     pending.set(id, { resolve, reject });
     try { socket.send(JSON.stringify({ id, method, params })); } catch (error) { pending.delete(id); reject(error); }
   }));
   try {
-    await bounded(opened);
+    await bounded(() => opened);
     const identity = await call('Runtime.evaluate', { expression: 'process.pid', returnByValue: true });
     assert.equal(identity?.result?.value, pid, 'Inspector target is not the selected worker');
     await call('Debugger.enable');
@@ -97,13 +98,13 @@ export async function witnessWorkerSource(pid, root, inventory) {
       const path = fileURLToPath(script.url);
       const relative = relativePath(root, path);
       if (!relative || relative === '..' || relative.startsWith('../') || isAbsolute(relative)) continue;
-      const handle = await bounded(open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW));
+      const handle = await bounded(() => open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW));
       let bytes;
       try {
-        const stat = await bounded(handle.stat());
+        const stat = await bounded(() => handle.stat());
         assert(stat.isFile() && stat.size <= MAX_SOURCE, `Invalid module file: ${relative}`);
         const buffer = Buffer.alloc(MAX_SOURCE + 1);
-        const { bytesRead } = await bounded(handle.read(buffer, 0, buffer.length, 0));
+        const { bytesRead } = await bounded(() => handle.read(buffer, 0, buffer.length, 0));
         assert(bytesRead <= MAX_SOURCE, `Module too large: ${relative}`);
         bytes = buffer.subarray(0, bytesRead);
       } finally { await handle.close(); }
