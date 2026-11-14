@@ -21,6 +21,8 @@ jobs:
           persist-credentials: false
       - name: Test package extraction guards
         run: python3 -m unittest discover -s qualification -p '*_test.py'
+      - name: Test worker source guards
+        run: node --test qualification/worker_source.test.mjs
       - name: Fetch immutable packages
         env:
           GH_TOKEN: ${{ github.token }}

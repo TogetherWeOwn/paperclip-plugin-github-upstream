@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+export function verifySource(relative, inventory, bytes, source) {
+  assert(Object.hasOwn(inventory, relative), `Compiled module absent from archive inventory: ${relative}`);
+  const text = bytes.toString('utf8');
+  assert(Buffer.from(text, 'utf8').equals(bytes), `Module is not lossless UTF-8: ${relative}`);
+  assert.equal(source, text, `Compiled source differs: ${relative}`);
+}
+
 // Attach only to the worker in the network-isolated disposable host. This is a
 // compiled-source witness, not evidence that every function was executed.
 export async function witnessWorkerSource(pid, root, inventory) {
@@ -59,12 +66,9 @@ export async function witnessWorkerSource(pid, root, inventory) {
       const path = fileURLToPath(script.url);
       if (!path.startsWith(`${root}/`)) continue;
       const relative = path.slice(root.length + 1);
-      assert(Object.hasOwn(inventory, relative), `Compiled module absent from archive inventory: ${relative}`);
       const bytes = readFileSync(path);
-      const text = bytes.toString('utf8');
-      assert(Buffer.from(text, 'utf8').equals(bytes), `Module is not lossless UTF-8: ${relative}`);
       const source = await call('Debugger.getScriptSource', { scriptId: script.scriptId });
-      assert.equal(source.scriptSource, text, `Compiled source differs: ${relative}`);
+      verifySource(relative, inventory, bytes, source.scriptSource);
       matched.add(relative);
     }
     assert(matched.has('dist/github.js'), 'Distinctive artifact module was not observed compiled');

@@ -133,6 +133,7 @@ try {
   assert.equal(matches.length, 1);
   const jobId = matches[0].id;
   const jobPath = `/api/plugins/${pluginId}/jobs/${jobId}`;
+  async function runScan(previous) {
   const triggered = await api(`${jobPath}/trigger`, {});
   assert.equal(triggered.jobId, jobId);
   assert.equal(typeof triggered.runId, 'string');
@@ -146,10 +147,13 @@ try {
   assert.equal(run?.status, 'succeeded', 'Specific triggered job did not succeed');
   const saved = await readRuns();
   assert(Array.isArray(saved) && saved.length > 0);
-  assert.notDeepEqual(saved, before, 'Job did not produce new state');
+  assert.deepEqual(saved.slice(0, -1), previous ?? [], 'Job did not preserve prior state');
   assert.equal(saved.at(-1).job, 'item-scan');
   assert(saved.at(-1).errors > 0, 'Expected credential-free scan error witness');
-  console.log(JSON.stringify({ stage: 'nonempty-state-saved', pluginId, companyId: company.id, runId: triggered.runId }));
+  console.log(JSON.stringify({ stage: 'scan-state-appended', pluginId, companyId: company.id, runId: triggered.runId }));
+  return saved;
+  }
+  let saved = await runScan(before);
   const assertRetainedState = async () => assert.deepEqual(await readRuns(), saved);
 
 const removed = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
@@ -167,6 +171,7 @@ assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 workerIdentity = await witnessProcess(pluginId, candidate, inventories.candidate);
 await assertConfig();
 await assertRetainedState();
+saved = await runScan(saved);
 console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
 
 const removedAgain = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
@@ -183,6 +188,7 @@ assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 await witnessProcess(pluginId, '/qualification/rollback', inventories.rollback);
 await assertConfig();
 await assertRetainedState();
+await runScan(saved);
 console.log(JSON.stringify({ stage: 'rollback-installed', pluginId, status: plugin.status, rollbackWitness }));
 } finally {
   await db.end({ timeout: 5 });
