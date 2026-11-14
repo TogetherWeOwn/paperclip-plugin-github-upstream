@@ -1,0 +1,39 @@
+name: artifact-preparation
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  merge-result:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify event revision and test artifact extraction
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          python3 --version
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 -B qualification/prepare_artifacts_test.py
+  head:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify head revision and test artifact extraction
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 --version
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 -B qualification/prepare_artifacts_test.py
