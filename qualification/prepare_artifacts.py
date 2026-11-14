@@ -62,7 +62,10 @@ def prepare(candidate_zip, rollback_tgz, output):
         if len(matches) != 1 or matches[0].file_size > MAX_ARCHIVE:
             raise ValueError("candidate zip has no unique bounded package")
         candidate = archive.read(matches[0])
-    rollback = Path(rollback_tgz).read_bytes()
+    with Path(rollback_tgz).open("rb") as source:
+        rollback = source.read(MAX_ARCHIVE + 1)
+    if len(rollback) > MAX_ARCHIVE:
+        raise ValueError("package digest or size mismatch")
     root = Path(output)
     if root.exists():
         raise ValueError("output already exists")
