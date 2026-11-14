@@ -1,0 +1,216 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { witnessWorkerSource } from './worker_source.mjs';
+
+const base = 'http://127.0.0.1:3100';
+const candidate = '/qualification/candidate';
+const inventories = JSON.parse(readFileSync('/qualification/inventories.json', 'utf8'));
+
+function assertTree(root, expected) {
+  const actual = {};
+  function visit(relative = '') {
+    for (const entry of readdirSync(`${root}/${relative}`, { withFileTypes: true })) {
+      const path = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) visit(path);
+      else {
+        assert(entry.isFile(), `Unexpected non-file in package: ${path}`);
+        actual[path] = createHash('sha256').update(readFileSync(`${root}/${path}`)).digest('hex');
+      }
+    }
+  }
+  visit();
+  assert.deepEqual(Object.entries(actual).sort(), Object.entries(expected).sort());
+  console.log(JSON.stringify({ stage: 'package-tree-verified', root, files: Object.keys(actual).length }));
+}
+
+async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
+  const response = await fetch(`${base}${path}`, {
+    method,
+    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    redirect: 'error',
+    signal: AbortSignal.timeout(15_000),
+  });
+  assert(response.ok, `${path}: HTTP ${response.status}`);
+  return response.json();
+}
+
+function processIdentity(pid) {
+  const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+  return { start: fields[19], argv: readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0') };
+}
+
+async function witnessProcess(pluginId, root, inventory) {
+  const dashboard = await api(`/api/plugins/${pluginId}/dashboard`);
+  const pid = dashboard.worker?.pid;
+  assert(Number.isInteger(pid) && pid > 1, 'Missing worker PID');
+  const identity = processIdentity(pid);
+  assert(identity.argv.includes(`${root}/dist/worker.js`), 'Worker entrypoint mismatch');
+  console.log(JSON.stringify(await witnessWorkerSource(pid, root, inventory)));
+  assert.deepEqual(processIdentity(pid), identity, 'Worker identity changed during witness');
+  return { pid, ...identity };
+}
+
+function assertStopped(worker) {
+  try {
+    const current = processIdentity(worker.pid);
+    assert.notEqual(current.start, worker.start, 'Previous worker still alive');
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;
+  }
+}
+
+async function ready() {
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    try {
+      const health = await api('/api/health');
+      if (health.status === 'ok') return health;
+    } catch { /* Host may still be starting. */ }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  throw new Error('Stock host readiness deadline exceeded');
+}
+
+const health = await ready();
+assert.equal(health.deploymentMode, 'local_trusted');
+assert.equal(health.deploymentExposure, 'private');
+assert.equal(process.env.PAPERCLIP_BUILD_VERSION, 'v2026.1106.0-0-gd69631b01b');
+const witness = createHash('sha256').update(readFileSync(`${candidate}/dist/github.js`)).digest('hex');
+assert.equal(witness, '15437fba205928e4491c7d859e70f25896747214f003844327507f64cf7fbc04');
+const rollbackWitness = createHash('sha256').update(readFileSync('/qualification/rollback/dist/github.js')).digest('hex');
+assert.equal(rollbackWitness, 'b7e0a4f3ae621d299da249a0db02b9496cd243ccdd421a60bdc536cdaf460a8f');
+assert.notEqual(witness, rollbackWitness);
+let plugin = await api('/api/plugins/install', { packageName: candidate, isLocalPath: true });
+if (plugin.plugin) plugin = plugin.plugin;
+assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
+assert.equal(plugin.status, 'ready');
+assert.equal(plugin.packagePath, candidate);
+assertTree(plugin.packagePath, inventories.candidate);
+const worker = await api(`/api/plugins/${plugin.id}/health`);
+assert.equal(worker.healthy, true);
+let workerIdentity = await witnessProcess(plugin.id, candidate, inventories.candidate);
+console.log(JSON.stringify({ stage: 'candidate-installed', pluginId: plugin.id, witness, status: worker.status }));
+
+const pluginId = plugin.id;
+const company = await api('/api/companies', { name: 'Disposable lifecycle probe' });
+assert.equal(typeof company.id, 'string');
+const config = { dryRun: true, releaseRepos: ['example/fixture'], maxCreatesPerTick: 0, maxWakesPerTick: 0 };
+const configPath = `/api/plugins/${pluginId}/config`;
+await api(configPath, { companyId: company.id, configJson: config });
+async function assertConfig() {
+  const stored = await api(`${configPath}?companyId=${encodeURIComponent(company.id)}`);
+  assert.equal(stored.companyId, company.id);
+  assert.deepEqual(stored.configJson, config);
+}
+await assertConfig();
+console.log(JSON.stringify({ stage: 'synthetic-config-saved', pluginId, companyId: company.id }));
+
+// Connect only to this disposable container's embedded database, never a configured external database.
+assert.equal(process.env.DATABASE_URL, undefined);
+const dbDir = '/paperclip/instances/default/db';
+const pidFile = readFileSync(`${dbDir}/postmaster.pid`, 'utf8').split('\n');
+assert.equal(pidFile[1], dbDir);
+const port = Number(pidFile[3]);
+assert(Number.isInteger(port) && port > 0 && port < 65536);
+const postgres = createRequire('/app/packages/db/package.json')('postgres');
+const db = postgres({ host: '127.0.0.1', port, database: 'paperclip', username: 'paperclip', password: 'paperclip', max: 1, connect_timeout: 5 });
+async function readRuns() {
+  return db.begin('read only', async sql => {
+    const rows = await sql`select value_json from plugin_state where plugin_id = ${pluginId} and scope_kind = 'company' and scope_id = ${company.id} and namespace = 'default' and state_key = 'runs'`;
+    assert(rows.length <= 1);
+    return rows[0]?.value_json ?? null;
+  });
+}
+try {
+  const before = await readRuns();
+  assert(before === null || Array.isArray(before));
+  const jobs = await api(`/api/plugins/${pluginId}/jobs`);
+  const matches = jobs.filter(job => job.jobKey === 'item-scan');
+  assert.equal(matches.length, 1);
+  const jobId = matches[0].id;
+  const jobPath = `/api/plugins/${pluginId}/jobs/${jobId}`;
+
+  // An idle drain suppresses background work, but may also block manual ingress.
+  // This experiment does not establish selective scheduler exclusion.
+  const drain = await api('/api/instance/task-drain', { purpose: 'idle', ttlMs: 120_000 });
+  assert.equal(typeof drain.ownerId, 'string');
+  try {
+    const status = await api('/api/instance/task-drain');
+    assert.equal(status.draining, true);
+    assert.equal(status.ownerId, drain.ownerId);
+    const response = await fetch(`${base}${jobPath}/trigger`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      redirect: 'error', signal: AbortSignal.timeout(15_000),
+    });
+    assert.equal(response.status, 503, 'Idle drain unexpectedly admitted a manual trigger');
+    assert.equal((await response.json()).error, 'instance_preparing_to_sleep');
+    console.log(JSON.stringify({ stage: 'idle-drain-manual-trigger-refused', status: response.status }));
+  } finally {
+    await api(`/api/instance/task-drain?ownerId=${encodeURIComponent(drain.ownerId)}`, undefined, 'DELETE');
+  }
+  assert.equal((await api('/api/instance/task-drain')).draining, false);
+
+  async function runScan(previous) {
+  const triggered = await api(`${jobPath}/trigger`, {});
+  assert.equal(triggered.jobId, jobId);
+  assert.equal(typeof triggered.runId, 'string');
+  let run;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    run = (await api(`${jobPath}/runs?limit=100`)).find(entry => entry.id === triggered.runId);
+    if (run && ['succeeded', 'failed'].includes(run.status)) break;
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  assert.equal(run?.status, 'succeeded', 'Specific triggered job did not succeed');
+  const saved = await readRuns();
+  assert(Array.isArray(saved) && saved.length > 0);
+  assert.deepEqual(saved.slice(0, -1), previous ?? [], 'Job did not preserve prior state');
+  assert.equal(saved.at(-1).job, 'item-scan');
+  assert(saved.at(-1).errors > 0, 'Expected credential-free scan error witness');
+  console.log(JSON.stringify({ stage: 'scan-state-appended', pluginId, companyId: company.id, runId: triggered.runId }));
+  return saved;
+  }
+  let saved = await runScan(before);
+  const assertRetainedState = async () => assert.deepEqual(await readRuns(), saved);
+
+const removed = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
+assert.equal(removed.id, pluginId);
+assertStopped(workerIdentity);
+console.log(JSON.stringify({ stage: 'soft-uninstall', pluginId, status: removed.status }));
+plugin = await api('/api/plugins/install', { packageName: candidate, isLocalPath: true });
+if (plugin.plugin) plugin = plugin.plugin;
+assert.equal(plugin.id, pluginId);
+assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
+assert.equal(plugin.packagePath, candidate);
+assert.equal(plugin.status, 'ready');
+assertTree(plugin.packagePath, inventories.candidate);
+assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+workerIdentity = await witnessProcess(pluginId, candidate, inventories.candidate);
+await assertConfig();
+await assertRetainedState();
+saved = await runScan(saved);
+console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
+
+const removedAgain = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
+assert.equal(removedAgain.id, pluginId);
+assertStopped(workerIdentity);
+plugin = await api('/api/plugins/install', { packageName: '/qualification/rollback', isLocalPath: true });
+if (plugin.plugin) plugin = plugin.plugin;
+assert.equal(plugin.id, pluginId);
+assert.equal(plugin.pluginKey, 'togetherweown.github-upstream');
+assert.equal(plugin.packagePath, '/qualification/rollback');
+assert.equal(plugin.status, 'ready');
+assertTree(plugin.packagePath, inventories.rollback);
+assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+await witnessProcess(pluginId, '/qualification/rollback', inventories.rollback);
+await assertConfig();
+await assertRetainedState();
+await runScan(saved);
+console.log(JSON.stringify({ stage: 'rollback-installed', pluginId, status: plugin.status, rollbackWitness }));
+} finally {
+  await db.end({ timeout: 5 });
+}

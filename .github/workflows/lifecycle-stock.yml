@@ -1,0 +1,87 @@
+name: Stock lifecycle qualification (incomplete)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - qualification/**
+      - .github/workflows/lifecycle-stock.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test package extraction guards
+        run: python3 -m unittest discover -s qualification -p '*_test.py'
+      - name: Test worker source guards
+        run: node --test qualification/worker_source.test.mjs
+      - name: Fetch immutable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/downloads"
+          gh api repos/TogetherWeOwn/paperclip-plugin-github-upstream/actions/artifacts/14073774410/zip > "$RUNNER_TEMP/downloads/candidate.zip"
+          gh api repos/TogetherWeOwn/paperclip-plugin-github-upstream/releases/assets/734088893 -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/downloads/rollback.tgz"
+      - name: Verify package pins and prepare isolated trees
+        run: python3 -I qualification/prepare_artifacts.py "$RUNNER_TEMP/downloads/candidate.zip" "$RUNNER_TEMP/downloads/rollback.tgz" "$RUNNER_TEMP/plugin-trees"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install pinned SDK dependencies without hooks
+        run: npm ci --ignore-scripts
+      - name: Start isolated stock host
+        env:
+          STOCK_IMAGE: ghcr.io/paperclipai/paperclip@sha256:12ae7579165cbf11d8db71ef69cf01ff48660383e78541b6b2eba38939fa30c9
+          CONTAINER: github-upstream-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker pull "$STOCK_IMAGE"
+          docker run --detach --name "$CONTAINER" --network none --pids-limit 2048 --memory 5g --cpus 2 \
+            --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/candidate,target=/qualification/candidate,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/rollback,target=/qualification/rollback,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/plugin-trees/inventories.json,target=/qualification/inventories.json,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/node_modules,target=/qualification/node_modules,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/qualification,target=/qualification/driver,readonly" \
+            --env PAPERCLIP_DEPLOYMENT_MODE=local_trusted --env PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+            --env HOST=127.0.0.1 --env SERVE_UI=true --env HEARTBEAT_SCHEDULER_ENABLED=false "$STOCK_IMAGE"
+      - name: Probe candidate install on stock host
+        env:
+          CONTAINER: github-upstream-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker exec "$CONTAINER" node /qualification/driver/install_probe.mjs
+      - name: Remove disposable host
+        if: always()
+        env:
+          CONTAINER: github-upstream-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker info >/dev/null
+          volumes=()
+          if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+            mounts=$(docker container inspect "$CONTAINER")
+            volume_names=$(jq -r '.[0].Mounts[] | select(.Type == "volume") | .Name' <<< "$mounts")
+            if [[ -n "$volume_names" ]]; then mapfile -t volumes <<< "$volume_names"; fi
+            docker rm --force --volumes "$CONTAINER"
+          fi
+          if docker container inspect "$CONTAINER" >/dev/null 2>&1; then exit 1; fi
+          for volume in "${volumes[@]}"; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+              printf 'Container volume still exists: %s\n' "$volume" >&2
+              exit 1
+            fi
+          done
+          rm -rf -- "$RUNNER_TEMP/downloads" "$RUNNER_TEMP/plugin-trees"
+          test ! -e "$RUNNER_TEMP/downloads" && test ! -e "$RUNNER_TEMP/plugin-trees"
+          printf '%s\n' 'Container, attached volumes, downloads and extracted trees removed.'
+      - name: Fail closed until stock lifecycle probe exists
+        run: |
+          printf '%s\n' 'Package preparation alone does not qualify install, state, recovery, or cleanup.'
+          exit 1
