@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { witnessWorkerSource } from './worker_source.mjs';
 
 const base = 'http://127.0.0.1:3100';
 const candidate = '/qualification/candidate';
@@ -36,6 +37,32 @@ async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   return response.json();
 }
 
+function processIdentity(pid) {
+  const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+  return { start: fields[19], argv: readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0') };
+}
+
+async function witnessProcess(pluginId, root, inventory) {
+  const dashboard = await api(`/api/plugins/${pluginId}/dashboard`);
+  const pid = dashboard.worker?.pid;
+  assert(Number.isInteger(pid) && pid > 1, 'Missing worker PID');
+  const identity = processIdentity(pid);
+  assert(identity.argv.includes(`${root}/dist/worker.js`), 'Worker entrypoint mismatch');
+  await witnessWorkerSource(pid, root, inventory);
+  assert.deepEqual(processIdentity(pid), identity, 'Worker identity changed during witness');
+  return { pid, ...identity };
+}
+
+function assertStopped(worker) {
+  try {
+    const current = processIdentity(worker.pid);
+    assert.notEqual(current.start, worker.start, 'Previous worker still alive');
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;
+  }
+}
+
 async function ready() {
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
@@ -65,6 +92,7 @@ assert.equal(plugin.packagePath, candidate);
 assertTree(plugin.packagePath, inventories.candidate);
 const worker = await api(`/api/plugins/${plugin.id}/health`);
 assert.equal(worker.healthy, true);
+let workerIdentity = await witnessProcess(plugin.id, candidate, inventories.candidate);
 console.log(JSON.stringify({ stage: 'candidate-installed', pluginId: plugin.id, witness, status: worker.status }));
 
 const pluginId = plugin.id;
@@ -126,6 +154,7 @@ try {
 
 const removed = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
 assert.equal(removed.id, pluginId);
+assertStopped(workerIdentity);
 console.log(JSON.stringify({ stage: 'soft-uninstall', pluginId, status: removed.status }));
 plugin = await api('/api/plugins/install', { packageName: candidate, isLocalPath: true });
 if (plugin.plugin) plugin = plugin.plugin;
@@ -135,12 +164,14 @@ assert.equal(plugin.packagePath, candidate);
 assert.equal(plugin.status, 'ready');
 assertTree(plugin.packagePath, inventories.candidate);
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+workerIdentity = await witnessProcess(pluginId, candidate, inventories.candidate);
 await assertConfig();
 await assertRetainedState();
 console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
 
 const removedAgain = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
 assert.equal(removedAgain.id, pluginId);
+assertStopped(workerIdentity);
 plugin = await api('/api/plugins/install', { packageName: '/qualification/rollback', isLocalPath: true });
 if (plugin.plugin) plugin = plugin.plugin;
 assert.equal(plugin.id, pluginId);
@@ -149,6 +180,7 @@ assert.equal(plugin.packagePath, '/qualification/rollback');
 assert.equal(plugin.status, 'ready');
 assertTree(plugin.packagePath, inventories.rollback);
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
+await witnessProcess(pluginId, '/qualification/rollback', inventories.rollback);
 await assertConfig();
 await assertRetainedState();
 console.log(JSON.stringify({ stage: 'rollback-installed', pluginId, status: plugin.status, rollbackWitness }));
