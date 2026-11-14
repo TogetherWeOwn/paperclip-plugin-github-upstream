@@ -4,8 +4,10 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import mock_open, patch
+import zipfile
 
-from prepare_artifacts import extract_package
+from prepare_artifacts import MAX_ARCHIVE, PACKAGE, extract_package, prepare
 
 
 def package(entries):
@@ -41,6 +43,20 @@ class ArtifactExtractionTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 extract_package(data, hashlib.sha256(data).hexdigest(), Path(tmp) / "bad-path")
             self.assertFalse((Path(tmp) / "escape").exists())
+
+    def test_rollback_read_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate.zip"
+            with zipfile.ZipFile(candidate, "w") as archive:
+                archive.writestr(PACKAGE, b"candidate")
+            rollback = root / "rollback.tgz"
+            opened = mock_open(read_data=b"x" * (MAX_ARCHIVE + 1))
+            with patch.object(Path, "open", opened):
+                with self.assertRaises(ValueError):
+                    prepare(candidate, rollback, root / "output")
+            opened().read.assert_called_once_with(MAX_ARCHIVE + 1)
+            self.assertFalse((root / "output").exists())
 
     def test_rejects_duplicate_members(self):
         data = package([("package/package.json", b"{}"), ("package/dist/worker.js", b"a"),
