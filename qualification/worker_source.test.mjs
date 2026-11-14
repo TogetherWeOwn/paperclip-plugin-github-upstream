@@ -70,7 +70,7 @@ test('inspector target, PID, source and required module are verified', async t =
       const message = payload => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(payload) }));
       queueMicrotask(() => {
         if (method === 'Debugger.enable') for (const script of scripts) message({ method: 'Debugger.scriptParsed', params: { url: script, scriptId: script } });
-        const result = method === 'Runtime.evaluate' ? { result: { value: pid } } : method === 'Debugger.getScriptSource' ? { scriptSource: params.scriptId === pathToFileURL(worker).href ? workerBytes.toString() : source } : {};
+        const result = method === 'Runtime.evaluate' ? { result: { value: pid } } : method === 'Debugger.getScriptSource' ? { scriptSource: params.scriptId.endsWith('/dist/worker.js') ? workerBytes.toString() : source } : {};
         if (method === 'Debugger.getScriptSource') sourceCalls++;
         message({ id, result });
         if (expire && method === 'Debugger.enable') now += 10_001;
@@ -90,6 +90,9 @@ test('inspector target, PID, source and required module are verified', async t =
   assert.deepEqual(witness.modules, ['dist/github.js', 'dist/worker.js']);
   assert.equal(fetchOptions.redirect, 'error');
   assert.equal(witness.root, root);
+  scripts = [pathToFileURL(path).href, pathToFileURL(join(alias, 'dist/worker.js')).href];
+  const aliasWitness = await witnessWorkerSource(123, alias, inventory);
+  assert.deepEqual(aliasWitness.modules, ['dist/github.js', 'dist/worker.js']);
   scripts = [pathToFileURL(path).href];
   await assert.rejects(witnessWorkerSource(123, root, inventory), /dist\/worker\.js/);
   scripts.push(pathToFileURL(worker).href);
@@ -104,7 +107,7 @@ test('inspector target, PID, source and required module are verified', async t =
   await assert.rejects(witnessWorkerSource(123, root, inventory), /Invalid module file/);
   scripts = [];
   await assert.rejects(witnessWorkerSource(123, root, inventory), /not observed compiled/);
-  assert.equal(closed, 7);
+  assert.equal(closed, 8);
   scripts = [pathToFileURL(worker).href];
   expire = true;
   const previousCalls = sourceCalls;

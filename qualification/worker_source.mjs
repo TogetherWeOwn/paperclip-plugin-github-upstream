@@ -33,6 +33,7 @@ export async function witnessWorkerSource(pid, root, inventory) {
       })]);
     } finally { clearTimeout(timer); }
   };
+  const suppliedRoot = root;
   root = await bounded(() => realpath(root));
   process.kill(pid, 'SIGUSR1');
   let targets;
@@ -96,8 +97,10 @@ export async function witnessWorkerSource(pid, root, inventory) {
     for (const script of scripts) {
       if (typeof script.url !== 'string' || !script.url.startsWith('file:')) continue;
       const path = fileURLToPath(script.url);
-      const relative = relativePath(root, path);
-      if (!relative || relative === '..' || relative.startsWith('../') || isAbsolute(relative)) continue;
+      const inside = relative => relative && relative !== '..' && !relative.startsWith('../') && !isAbsolute(relative);
+      let relative = relativePath(root, path);
+      if (!inside(relative)) relative = relativePath(suppliedRoot, path);
+      if (!inside(relative)) continue;
       const handle = await bounded(() => open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW));
       let bytes;
       try {
