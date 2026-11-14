@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { resolve, relative as relativePath, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -96,14 +97,23 @@ export async function witnessWorkerSource(pid, root, inventory) {
       const path = fileURLToPath(script.url);
       const relative = relativePath(root, path);
       if (!relative || relative === '..' || relative.startsWith('../') || isAbsolute(relative)) continue;
-      assert(statSync(path).size <= MAX_SOURCE, `Module too large: ${relative}`);
-      const bytes = readFileSync(path);
-      assert(bytes.length <= MAX_SOURCE, `Module too large: ${relative}`);
+      const handle = await bounded(open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW));
+      let bytes;
+      try {
+        const stat = await bounded(handle.stat());
+        assert(stat.isFile() && stat.size <= MAX_SOURCE, `Invalid module file: ${relative}`);
+        const buffer = Buffer.alloc(MAX_SOURCE + 1);
+        const { bytesRead } = await bounded(handle.read(buffer, 0, buffer.length, 0));
+        assert(bytesRead <= MAX_SOURCE, `Module too large: ${relative}`);
+        bytes = buffer.subarray(0, bytesRead);
+      } finally { await handle.close(); }
       const source = await call('Debugger.getScriptSource', { scriptId: script.scriptId });
       verifySource(relative, inventory, bytes, source.scriptSource);
       matched.add(relative);
     }
-    assert(matched.has('dist/github.js'), 'Distinctive artifact module was not observed compiled');
+    for (const required of ['dist/github.js', 'dist/worker.js']) {
+      assert(matched.has(required), `Required artifact module was not observed compiled: ${required}`);
+    }
     return { stage: 'worker-source-verified', pid, root, modules: [...matched].sort() };
   } finally {
     socket.close();

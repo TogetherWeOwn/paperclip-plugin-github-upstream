@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,11 +28,13 @@ test('inspector target, PID, source and required module are verified', async t =
   const path = join(root, 'dist/github.js');
   const bytes = Buffer.from('export {};\n');
   writeFileSync(path, bytes);
-  const inventory = { 'dist/github.js': digest(bytes) };
+  const worker = join(root, 'dist/worker.js');
+  writeFileSync(worker, bytes);
+  const inventory = { 'dist/github.js': digest(bytes), 'dist/worker.js': digest(bytes) };
   t.mock.method(process, 'kill', () => {});
   let target = 'ws://example.com:9229/id';
   let pid = 123;
-  let script = pathToFileURL(path).href;
+  let scripts = [pathToFileURL(path).href, pathToFileURL(worker).href];
   let source = bytes.toString();
   let closed = 0;
   t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => [{ webSocketDebuggerUrl: target }] }));
@@ -41,7 +44,7 @@ test('inspector target, PID, source and required module are verified', async t =
       const { id, method } = JSON.parse(data);
       const message = payload => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(payload) }));
       queueMicrotask(() => {
-        if (method === 'Debugger.enable' && script) message({ method: 'Debugger.scriptParsed', params: { url: script, scriptId: '1' } });
+        if (method === 'Debugger.enable') for (const script of scripts) message({ method: 'Debugger.scriptParsed', params: { url: script, scriptId: '1' } });
         const result = method === 'Runtime.evaluate' ? { result: { value: pid } } : method === 'Debugger.getScriptSource' ? { scriptSource: source } : {};
         message({ id, result });
       });
@@ -57,14 +60,20 @@ test('inspector target, PID, source and required module are verified', async t =
   await assert.rejects(witnessWorkerSource(123, root, inventory), /not the selected worker/);
   pid = 123;
   const witness = await witnessWorkerSource(123, root, inventory);
-  assert.deepEqual(witness.modules, ['dist/github.js']);
+  assert.deepEqual(witness.modules, ['dist/github.js', 'dist/worker.js']);
+  scripts = [pathToFileURL(path).href];
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /dist\/worker\.js/);
+  scripts.push(pathToFileURL(worker).href);
   source = 'different';
   await assert.rejects(witnessWorkerSource(123, root, inventory), /Compiled source differs/);
   source = bytes.toString();
   writeFileSync(path, 'tampered');
   source = 'tampered';
   await assert.rejects(witnessWorkerSource(123, root, inventory), /Module digest differs/);
-  script = null;
+  rmSync(path);
+  assert.equal(spawnSync('mkfifo', [path]).status, 0);
+  await assert.rejects(witnessWorkerSource(123, root, inventory), /Invalid module file/);
+  scripts = [];
   await assert.rejects(witnessWorkerSource(123, root, inventory), /not observed compiled/);
-  assert.equal(closed, 5);
+  assert.equal(closed, 7);
 });
