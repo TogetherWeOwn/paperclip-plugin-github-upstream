@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 const base = 'http://127.0.0.1:3100';
 const candidate = '/qualification/candidate';
@@ -60,6 +61,50 @@ async function assertConfig() {
 }
 await assertConfig();
 console.log(JSON.stringify({ stage: 'synthetic-config-saved', pluginId, companyId: company.id }));
+
+// Connect only to this disposable container's embedded database, never a configured external database.
+assert.equal(process.env.DATABASE_URL, undefined);
+const dbDir = '/paperclip/instances/default/db';
+const pidFile = readFileSync(`${dbDir}/postmaster.pid`, 'utf8').split('\n');
+assert.equal(pidFile[1], dbDir);
+const port = Number(pidFile[3]);
+assert(Number.isInteger(port) && port > 0 && port < 65536);
+const postgres = createRequire('/app/packages/db/package.json')('postgres');
+const db = postgres({ host: '127.0.0.1', port, database: 'paperclip', username: 'paperclip', password: 'paperclip', max: 1, connect_timeout: 5 });
+async function readRuns() {
+  return db.begin('read only', async sql => {
+    const rows = await sql`select value_json from plugin_state where plugin_id = ${pluginId} and scope_kind = 'company' and scope_id = ${company.id} and namespace = 'default' and state_key = 'runs'`;
+    assert(rows.length <= 1);
+    return rows[0]?.value_json ?? null;
+  });
+}
+try {
+  const before = await readRuns();
+  assert(before === null || Array.isArray(before));
+  const jobs = await api(`/api/plugins/${pluginId}/jobs`);
+  const matches = jobs.filter(job => job.jobKey === 'item-scan');
+  assert.equal(matches.length, 1);
+  const jobId = matches[0].id;
+  const jobPath = `/api/plugins/${pluginId}/jobs/${jobId}`;
+  const triggered = await api(`${jobPath}/trigger`, {});
+  assert.equal(triggered.jobId, jobId);
+  assert.equal(typeof triggered.runId, 'string');
+  let run;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    run = (await api(`${jobPath}/runs?limit=100`)).find(entry => entry.id === triggered.runId);
+    if (run && ['succeeded', 'failed'].includes(run.status)) break;
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  assert.equal(run?.status, 'succeeded', 'Specific triggered job did not succeed');
+  const saved = await readRuns();
+  assert(Array.isArray(saved) && saved.length > 0);
+  assert.notDeepEqual(saved, before, 'Job did not produce new state');
+  assert.equal(saved.at(-1).job, 'item-scan');
+  assert(saved.at(-1).errors > 0, 'Expected credential-free scan error witness');
+  console.log(JSON.stringify({ stage: 'nonempty-state-saved', pluginId, companyId: company.id, runId: triggered.runId }));
+  const assertRetainedState = async () => assert.deepEqual(await readRuns(), saved);
+
 const removed = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
 assert.equal(removed.id, pluginId);
 console.log(JSON.stringify({ stage: 'soft-uninstall', pluginId, status: removed.status }));
@@ -71,6 +116,7 @@ assert.equal(plugin.packagePath, candidate);
 assert.equal(plugin.status, 'ready');
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 await assertConfig();
+await assertRetainedState();
 console.log(JSON.stringify({ stage: 'candidate-reinstalled', pluginId, status: plugin.status }));
 
 const removedAgain = await api(`/api/plugins/${pluginId}`, undefined, 'DELETE');
@@ -83,4 +129,8 @@ assert.equal(plugin.packagePath, '/qualification/rollback');
 assert.equal(plugin.status, 'ready');
 assert.equal((await api(`/api/plugins/${pluginId}/health`)).healthy, true);
 await assertConfig();
+await assertRetainedState();
 console.log(JSON.stringify({ stage: 'rollback-installed', pluginId, status: plugin.status, rollbackWitness }));
+} finally {
+  await db.end({ timeout: 5 });
+}
